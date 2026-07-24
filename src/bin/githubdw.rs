@@ -33,6 +33,24 @@ enum Command {
     Search {
         /// Search terms (trigram fulltext; 3+ character substrings match)
         query: String,
+        /// Search only pull requests
+        #[arg(long)]
+        pull_requests: bool,
+        /// Search only issues
+        #[arg(long)]
+        issues: bool,
+        /// Search only comments
+        #[arg(long)]
+        comments: bool,
+        /// Restrict to one repository ("owner/name")
+        #[arg(long)]
+        repo: Option<String>,
+        /// Maximum results
+        #[arg(long, default_value_t = 20)]
+        limit: u32,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Query pull requests with filters
     Query(Box<QueryArguments>),
@@ -807,7 +825,51 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
             }
             Ok(())
         }
-        Command::Search { .. } | Command::Mcp => {
+        Command::Search {
+            query,
+            pull_requests,
+            issues,
+            comments,
+            repo,
+            limit,
+            json,
+        } => {
+            let warehouse = open_warehouse(command_line.db)?;
+            let scope = match (pull_requests, issues, comments) {
+                (true, false, false) => githubdw::search::SearchScope::PullRequests,
+                (false, true, false) => githubdw::search::SearchScope::Issues,
+                (false, false, true) => githubdw::search::SearchScope::Comments,
+                (false, false, false) => githubdw::search::SearchScope::All,
+                _ => {
+                    return Err(githubdw::Error::InvalidArgument(
+                        "pick at most one of --pull-requests / --issues / --comments".into(),
+                    ));
+                }
+            };
+            let options = githubdw::search::SearchOptions {
+                scope,
+                repository: repo.map(|value| value.to_lowercase()),
+                limit,
+            };
+            let hits = githubdw::search::search(warehouse.connection(), &query, &options)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&hits)?);
+            } else if hits.is_empty() {
+                println!("no matches");
+            } else {
+                for hit in hits {
+                    println!(
+                        "{}\t{}\t{}\t{}",
+                        hit.key,
+                        hit.kind,
+                        hit.title.as_deref().unwrap_or("-"),
+                        hit.snippet.replace('\n', " ")
+                    );
+                }
+            }
+            Ok(())
+        }
+        Command::Mcp => {
             // Ensure the database exists/migrates even for stub commands.
             let _warehouse = open_warehouse(command_line.db)?;
             eprintln!("this command is not implemented yet");
