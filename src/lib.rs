@@ -15,6 +15,7 @@ pub mod error;
 pub mod fetch;
 mod githubdw;
 pub mod groups;
+pub mod mcp;
 pub mod metrics;
 pub mod period;
 pub mod query;

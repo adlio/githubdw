@@ -870,12 +870,9 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
             Ok(())
         }
         Command::Mcp => {
-            // Ensure the database exists/migrates even for stub commands.
-            let _warehouse = open_warehouse(command_line.db)?;
-            eprintln!("this command is not implemented yet");
-            Err(githubdw::Error::InvalidArgument(
-                "not implemented in this milestone".into(),
-            ))
+            let warehouse = open_warehouse(command_line.db)?;
+            let runtime = tokio::runtime::Runtime::new()?;
+            runtime.block_on(githubdw::mcp::serve_stdio(warehouse))
         }
     }
 }
