@@ -7,9 +7,7 @@ use rusqlite::Connection;
 use crate::error::Result;
 use crate::fetch::GhClient;
 use crate::fetch::issues::{self, REPOSITORY_ISSUES_QUERY};
-use crate::fetch::pull_requests::{
-    self, ActorReference, PullRequestData, REPOSITORY_PULL_REQUESTS_QUERY,
-};
+use crate::fetch::pull_requests::{self, ActorReference, PullRequestData};
 use crate::storage::issue_repository;
 use crate::storage::monitor_repository;
 use crate::storage::repository::{self, PullRequestRow};
@@ -166,15 +164,26 @@ impl<'a> Syncer<'a> {
         let mut page_cursor: Option<String> = None;
         let mut max_updated_at: Option<String> = updated_cursor.map(str::to_string);
         let mut item_index: i64 = 0;
+        // Adaptive page size: heavy PRs (many files/comments/checks) can
+        // overflow GitHub's response stream; halve and retry on failure.
+        let mut page_size: u32 = 25;
 
         'pages: loop {
+            let query = pull_requests::repository_pull_requests_query(page_size);
             let mut variables: Vec<(&str, &str)> = vec![("owner", owner), ("name", name)];
             if let Some(cursor) = page_cursor.as_deref() {
                 variables.push(("cursor", cursor));
             }
-            let data = self
-                .client
-                .graphql(REPOSITORY_PULL_REQUESTS_QUERY, &variables)?;
+            let data = match self.client.graphql(&query, &variables) {
+                Ok(data) => data,
+                Err(error) if page_size > 1 => {
+                    // Degrade and retry the same page with a smaller window.
+                    page_size = (page_size / 2).max(1);
+                    let _ = error;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let page = pull_requests::parse_pull_request_page(&data)?;
             summary.pages_fetched += 1;
 

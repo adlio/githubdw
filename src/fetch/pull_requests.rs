@@ -6,7 +6,13 @@ use crate::error::{Error, Result};
 
 /// GraphQL query for a repository's pull requests with nested reviews,
 /// review-thread comments, conversation comments, files, and check runs.
-pub const REPOSITORY_PULL_REQUESTS_QUERY: &str = r#"
+/// `page_size` tunes the outer page: large repos with heavy PRs can overflow
+/// GitHub's response stream at 25, so the syncer degrades adaptively.
+pub fn repository_pull_requests_query(page_size: u32) -> String {
+    REPOSITORY_PULL_REQUESTS_QUERY_TEMPLATE.replace("{PAGE_SIZE}", &page_size.to_string())
+}
+
+const REPOSITORY_PULL_REQUESTS_QUERY_TEMPLATE: &str = r#"
 query($owner: String!, $name: String!, $cursor: String) {
   rateLimit { limit cost remaining resetAt }
   repository(owner: $owner, name: $name) {
@@ -16,7 +22,7 @@ query($owner: String!, $name: String!, $cursor: String) {
     isPrivate
     defaultBranchRef { name }
     createdAt
-    pullRequests(first: 25, after: $cursor,
+    pullRequests(first: {PAGE_SIZE}, after: $cursor,
                  orderBy: {field: UPDATED_AT, direction: DESC}) {
       pageInfo { hasNextPage endCursor }
       nodes {
