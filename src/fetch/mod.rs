@@ -1,5 +1,6 @@
 //! Fetch layer: runs the `gh` CLI as a subprocess and decodes JSON.
 
+pub mod issues;
 pub mod pull_requests;
 pub mod rate_limit;
 

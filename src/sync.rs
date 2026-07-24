@@ -6,9 +6,11 @@ use rusqlite::Connection;
 
 use crate::error::Result;
 use crate::fetch::GhClient;
+use crate::fetch::issues::{self, REPOSITORY_ISSUES_QUERY};
 use crate::fetch::pull_requests::{
     self, ActorReference, PullRequestData, REPOSITORY_PULL_REQUESTS_QUERY,
 };
+use crate::storage::issue_repository;
 use crate::storage::monitor_repository;
 use crate::storage::repository::{self, PullRequestRow};
 use crate::storage::sync_state_repository as sync_state;
@@ -117,6 +119,19 @@ impl<'a> Syncer<'a> {
                 entity_key,
                 cursor_before.as_deref(),
                 options,
+                &mut summary,
+            )?;
+        }
+
+        if !options.pull_requests_only {
+            let issue_cursor =
+                sync_state::last_updated_cursor(self.connection, "repo_issues", repository_name)?;
+            self.sync_issues(
+                owner,
+                name,
+                repository_name,
+                entity_key,
+                issue_cursor.as_deref(),
                 &mut summary,
             )?;
         }
@@ -427,6 +442,166 @@ impl<'a> Syncer<'a> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn sync_issues(
+        &mut self,
+        owner: &str,
+        name: &str,
+        repository_name: &str,
+        entity_key: &str,
+        updated_cursor: Option<&str>,
+        summary: &mut SyncSummary,
+    ) -> Result<()> {
+        let timezone = time_dimension::configured_timezone(self.connection)?;
+        let core_hours = time_dimension::configured_core_hours(self.connection);
+        let bot_suffix = repository::bot_login_suffix(self.connection);
+
+        // Ensure the repo dimension exists even in --issues-only mode.
+        let repo_key = repository::upsert_repository(
+            self.connection,
+            repository_name,
+            None,
+            false,
+            false,
+            None,
+            None,
+        )?;
+
+        let mut page_cursor: Option<String> = None;
+        let mut max_updated_at: Option<String> = updated_cursor.map(str::to_string);
+        let mut item_index: i64 = 0;
+
+        'pages: loop {
+            let mut variables: Vec<(&str, &str)> = vec![("owner", owner), ("name", name)];
+            if let Some(cursor) = page_cursor.as_deref() {
+                variables.push(("cursor", cursor));
+            }
+            let data = self.client.graphql(REPOSITORY_ISSUES_QUERY, &variables)?;
+            let page = issues::parse_issue_page(&data)?;
+            summary.pages_fetched += 1;
+
+            let page_is_empty = page.issues.is_empty();
+            for issue in &page.issues {
+                if let Some(cursor) = updated_cursor
+                    && issue.updated_at.as_str() <= cursor
+                {
+                    break 'pages;
+                }
+
+                item_index += 1;
+                let item_id = format!("{repo_key}#issue-{}", issue.number);
+                match self.upsert_one_issue(&repo_key, issue, timezone, core_hours, &bot_suffix) {
+                    Ok(()) => summary.issues_synced += 1,
+                    Err(error) => summary.failed.push((item_id.clone(), error.to_string())),
+                }
+                if max_updated_at
+                    .as_deref()
+                    .is_none_or(|max| issue.updated_at.as_str() > max)
+                {
+                    max_updated_at = Some(issue.updated_at.clone());
+                }
+                sync_state::update_lock_progress(
+                    self.connection,
+                    entity_key,
+                    item_index,
+                    &item_id,
+                    summary.pull_requests_synced + summary.issues_synced,
+                    summary.skipped,
+                    summary.failed.len() as i64,
+                )?;
+            }
+
+            if !page.has_next_page || page_is_empty {
+                break;
+            }
+            page_cursor = page.end_cursor;
+            if page_cursor.is_none() {
+                break;
+            }
+        }
+
+        sync_state::advance_cursor(
+            self.connection,
+            "repo_issues",
+            repository_name,
+            max_updated_at.as_deref(),
+        )?;
+        Ok(())
+    }
+
+    fn upsert_one_issue(
+        &mut self,
+        repo_key: &str,
+        issue: &issues::IssueData,
+        timezone: chrono_tz::Tz,
+        core_hours: (u32, u32),
+        bot_suffix: &str,
+    ) -> Result<()> {
+        let conn = self.connection;
+
+        let author_key = match issue.author.as_ref() {
+            Some(actor) => Some(repository::ensure_entity(conn, actor, bot_suffix)?),
+            None => Some(repository::ensure_ghost_entity(conn)?),
+        };
+        let created_keys = time_dimension::ensure_keys_for_timestamp(
+            conn,
+            &issue.created_at,
+            timezone,
+            core_hours,
+        )?;
+
+        if let Some(milestone) = issue.milestone.as_ref() {
+            issue_repository::upsert_milestone(conn, repo_key, milestone)?;
+        }
+
+        issue_repository::upsert_issue(
+            conn,
+            repo_key,
+            issue,
+            author_key.as_deref(),
+            Some(&created_keys.date_key),
+        )?;
+
+        let mut label_ids = Vec::new();
+        for label in &issue.labels {
+            issue_repository::upsert_label(conn, repo_key, label)?;
+            label_ids.push(label.id.clone());
+        }
+        issue_repository::replace_issue_labels(conn, &issue.id, &label_ids)?;
+
+        let mut assignee_keys = Vec::new();
+        for assignee in &issue.assignees {
+            assignee_keys.push(repository::ensure_entity(conn, assignee, bot_suffix)?);
+        }
+        issue_repository::replace_issue_assignees(conn, &issue.id, &assignee_keys)?;
+
+        for comment in &issue.comments {
+            let comment_author = match comment.author.as_ref() {
+                Some(actor) => repository::ensure_entity(conn, actor, bot_suffix)?,
+                None => repository::ensure_ghost_entity(conn)?,
+            };
+            let comment_keys = time_dimension::ensure_keys_for_timestamp(
+                conn,
+                &comment.created_at,
+                timezone,
+                core_hours,
+            )?;
+            repository::upsert_issue_comment(
+                conn,
+                &comment.id,
+                "issue",
+                &issue.id,
+                &comment_author,
+                None,
+                comment.body.as_deref(),
+                &comment.created_at,
+                &comment_keys.date_key,
+                &comment_keys.time_key,
+            )?;
+        }
+        Ok(())
+    }
+
     fn resolve_actor(&self, actor: Option<&ActorReference>, bot_suffix: &str) -> Result<String> {
         match actor {
             Some(actor) => repository::ensure_entity(self.connection, actor, bot_suffix),
@@ -508,6 +683,7 @@ mod tests {
         let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
         let options = SyncOptions {
             skip_diffs: true,
+            pull_requests_only: true,
             ..Default::default()
         };
         let mut syncer = Syncer::new(warehouse.connection(), &mut client);
@@ -559,6 +735,7 @@ mod tests {
         let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
         let options = SyncOptions {
             skip_diffs: true,
+            pull_requests_only: true,
             ..Default::default()
         };
 
@@ -573,5 +750,105 @@ mod tests {
             assert_eq!(second.pull_requests_synced, 0, "no-op on unchanged data");
             assert!(second.up_to_date);
         }
+    }
+
+    fn issue_page_response(has_next: bool, cursor: Option<&str>, numbers: &[i64]) -> String {
+        let nodes: Vec<_> = numbers
+            .iter()
+            .map(|number| {
+                json!({
+                    "id": format!("ISS{number}"),
+                    "number": number,
+                    "title": format!("Issue {number}"),
+                    "body": "issue body",
+                    "state": "OPEN",
+                    "stateReason": null,
+                    "createdAt": "2026-02-01T12:00:00Z",
+                    "updatedAt": format!("2026-02-{:02}T12:00:00Z", number),
+                    "closedAt": null,
+                    "author": {"login": "octocat", "__typename": "User"},
+                    "milestone": {
+                        "id": "MILE1", "number": 1, "title": "v1.0",
+                        "description": null, "state": "OPEN",
+                        "dueOn": null, "createdAt": "2026-01-01T00:00:00Z"
+                    },
+                    "labels": {"nodes": [{
+                        "id": "LAB1", "name": "bug", "color": "d73a4a", "description": ""
+                    }]},
+                    "assignees": {"nodes": [{"login": "hubot", "__typename": "User"}]},
+                    "comments": {"nodes": [{
+                        "id": format!("ICOM{number}"), "body": "on it",
+                        "createdAt": "2026-02-02T08:00:00Z",
+                        "author": {"login": "hubot", "__typename": "User"}
+                    }]}
+                })
+            })
+            .collect();
+        json!({
+            "data": {
+                "rateLimit": {"limit": 5000, "cost": 1, "remaining": 4999, "resetAt": "2099-01-01T00:00:00Z"},
+                "repository": {
+                    "nameWithOwner": "octocat/hello",
+                    "issues": {
+                        "pageInfo": {"hasNextPage": has_next, "endCursor": cursor},
+                        "nodes": nodes
+                    }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn syncs_issues_with_labels_and_comments() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        let transport = FixtureTransport::new(vec![
+            Ok(issue_page_response(true, Some("IC1"), &[1, 2])),
+            Ok(issue_page_response(false, None, &[3])),
+        ]);
+        let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
+        let options = SyncOptions {
+            issues_only: true,
+            ..Default::default()
+        };
+        let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+        let summary = syncer.sync_repository("octocat/hello", &options).unwrap();
+
+        assert_eq!(summary.issues_synced, 3);
+        assert_eq!(summary.pages_fetched, 2);
+
+        let conn = warehouse.connection();
+        let issue_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM issues", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(issue_count, 3);
+        let label_links: i64 = conn
+            .query_row("SELECT COUNT(*) FROM issue_labels", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(label_links, 3);
+        let assignees: i64 = conn
+            .query_row("SELECT COUNT(*) FROM issue_assignees", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(assignees, 3);
+        let comments: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fact_issue_comments WHERE parent_type = 'issue'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(comments, 3);
+        let milestones: i64 = conn
+            .query_row("SELECT COUNT(*) FROM milestones", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(milestones, 1);
+        let fts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM issues_fts WHERE issues_fts MATCH 'ssue'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(fts, 3, "issues_fts populated via trigger");
     }
 }

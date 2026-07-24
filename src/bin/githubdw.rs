@@ -214,7 +214,7 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
                     let mut syncer =
                         githubdw::sync::Syncer::new(warehouse.connection(), &mut client);
                     let summary = syncer.sync_repository(&repository, &options)?;
-                    if summary.up_to_date {
+                    if summary.up_to_date && summary.issues_synced == 0 {
                         println!("{repository}: already up to date");
                     } else {
                         println!(
