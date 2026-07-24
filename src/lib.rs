@@ -1,4 +1,5 @@
 //! # githubdw
+#![recursion_limit = "256"]
 //!
 //! A local, SQLite-based data warehouse for GitHub repositories.
 //!
@@ -11,8 +12,10 @@
 //! entirely delegated to `gh auth`. GitHub Enterprise works via `GH_HOST`.
 
 pub mod error;
+pub mod fetch;
 mod githubdw;
 pub mod storage;
+pub mod sync;
 
 pub use error::{Error, Result};
 pub use githubdw::GithubDW;

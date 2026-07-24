@@ -66,6 +66,15 @@ enum SyncCommand {
         /// Limit the sync window to the last N days
         #[arg(long)]
         days: Option<u32>,
+        /// Skip fetching per-file patch text (fast mode)
+        #[arg(long)]
+        skip_diffs: bool,
+        /// Sync only pull requests
+        #[arg(long)]
+        pull_requests_only: bool,
+        /// Sync only issues
+        #[arg(long)]
+        issues_only: bool,
     },
     /// Sync every enabled monitored source
     All,
@@ -184,11 +193,180 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
             }
             Ok(())
         }
-        Command::Sync { .. }
-        | Command::Search { .. }
+        Command::Sync { command } => {
+            let warehouse = open_warehouse(command_line.db)?;
+            match command {
+                SyncCommand::Repo {
+                    repository,
+                    days,
+                    skip_diffs,
+                    pull_requests_only,
+                    issues_only,
+                } => {
+                    let mut client = githubdw::fetch::GhClient::new();
+                    client.preflight()?;
+                    let options = githubdw::sync::SyncOptions {
+                        days,
+                        skip_diffs,
+                        pull_requests_only,
+                        issues_only,
+                    };
+                    let mut syncer =
+                        githubdw::sync::Syncer::new(warehouse.connection(), &mut client);
+                    let summary = syncer.sync_repository(&repository, &options)?;
+                    if summary.up_to_date {
+                        println!("{repository}: already up to date");
+                    } else {
+                        println!(
+                            "{repository}: synced {} pull requests, {} issues ({} pages, {} failed)",
+                            summary.pull_requests_synced,
+                            summary.issues_synced,
+                            summary.pages_fetched,
+                            summary.failed.len()
+                        );
+                    }
+                    for (item, error) in &summary.failed {
+                        eprintln!("failed {item}: {error}");
+                    }
+                }
+                SyncCommand::All => {
+                    let mut client = githubdw::fetch::GhClient::new();
+                    client.preflight()?;
+                    let sources =
+                        githubdw::storage::monitor_repository::list(warehouse.connection())?;
+                    let repos: Vec<_> = sources
+                        .into_iter()
+                        .filter(|source| source.sync_enabled && source.source_type == "repo")
+                        .collect();
+                    if repos.is_empty() {
+                        println!(
+                            "no enabled monitored repositories — use `githubdw monitor add-repo`"
+                        );
+                    }
+                    for source in repos {
+                        let options = githubdw::sync::SyncOptions::default();
+                        let mut syncer =
+                            githubdw::sync::Syncer::new(warehouse.connection(), &mut client);
+                        match syncer.sync_repository(&source.identifier, &options) {
+                            Ok(summary) => println!(
+                                "{}: {} PRs, {} issues",
+                                source.identifier,
+                                summary.pull_requests_synced,
+                                summary.issues_synced
+                            ),
+                            Err(error) => eprintln!("{}: {error}", source.identifier),
+                        }
+                    }
+                }
+                SyncCommand::Watch => {
+                    /// One live lock row: entity, started, current index/id, counters.
+                    type LockRow = (String, String, i64, Option<String>, i64, i64, i64);
+                    /// One recent job row: entity, status, started, completed, synced.
+                    type JobRow = (String, String, String, Option<String>, i64);
+                    let connection = warehouse.connection();
+                    let mut statement = connection.prepare(
+                        "SELECT entity_key, started_at, current_item, current_item_id,
+                                synced, skipped, failed
+                         FROM sync_locks ORDER BY started_at",
+                    )?;
+                    let rows: Vec<LockRow> = statement
+                        .query_map([], |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                            ))
+                        })?
+                        .collect::<std::result::Result<_, _>>()?;
+                    if rows.is_empty() {
+                        println!("no sync in progress");
+                        let mut jobs = connection.prepare(
+                            "SELECT entity_key, status, started_at, completed_at, synced
+                             FROM sync_jobs ORDER BY started_at DESC LIMIT 5",
+                        )?;
+                        let job_rows: Vec<JobRow> = jobs
+                            .query_map([], |row| {
+                                Ok((
+                                    row.get(0)?,
+                                    row.get(1)?,
+                                    row.get(2)?,
+                                    row.get(3)?,
+                                    row.get(4)?,
+                                ))
+                            })?
+                            .collect::<std::result::Result<_, _>>()?;
+                        for (entity, status, started, completed, synced) in job_rows {
+                            println!(
+                                "{entity}: {status} (started {started}, finished {}, {synced} synced)",
+                                completed.unwrap_or_else(|| "-".into())
+                            );
+                        }
+                    }
+                    for (entity, started, current, current_id, synced, skipped, failed) in rows {
+                        println!(
+                            "{entity}: item {current} ({}) since {started} — {synced} synced, {skipped} skipped, {failed} failed",
+                            current_id.unwrap_or_else(|| "-".into())
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Monitor { command } => {
+            let warehouse = open_warehouse(command_line.db)?;
+            let connection = warehouse.connection();
+            match command {
+                MonitorCommand::AddRepo { repository } => {
+                    githubdw::storage::monitor_repository::add_repo(connection, &repository)?;
+                    println!("monitoring repo {}", repository.to_lowercase());
+                }
+                MonitorCommand::AddUser { login } => {
+                    githubdw::storage::monitor_repository::add_user(connection, &login)?;
+                    println!("monitoring user {}", login.to_lowercase());
+                }
+                MonitorCommand::AddOrg { org } => {
+                    githubdw::storage::monitor_repository::add_org(connection, &org)?;
+                    println!("monitoring org {}", org.to_lowercase());
+                }
+                MonitorCommand::List => {
+                    let sources = githubdw::storage::monitor_repository::list(connection)?;
+                    if sources.is_empty() {
+                        println!("nothing monitored yet");
+                    }
+                    for source in sources {
+                        println!(
+                            "{}\t{}\t{}\tlast sync: {}",
+                            source.source_type,
+                            source.identifier,
+                            if source.sync_enabled {
+                                "enabled"
+                            } else {
+                                "disabled"
+                            },
+                            source.last_sync_at.unwrap_or_else(|| "never".into())
+                        );
+                    }
+                }
+                MonitorCommand::Remove { source } => {
+                    let removed =
+                        githubdw::storage::monitor_repository::remove(connection, &source)?;
+                    if removed == 0 {
+                        return Err(githubdw::Error::NotFound(format!(
+                            "monitored source '{source}'"
+                        )));
+                    }
+                    println!("removed {source}");
+                }
+            }
+            Ok(())
+        }
+        Command::Search { .. }
         | Command::Query
         | Command::Metrics { .. }
-        | Command::Monitor { .. }
         | Command::Group
         | Command::Mcp => {
             // Ensure the database exists/migrates even for stub commands.
