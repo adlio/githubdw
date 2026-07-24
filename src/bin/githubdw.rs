@@ -35,7 +35,7 @@ enum Command {
         query: String,
     },
     /// Query pull requests with filters
-    Query,
+    Query(Box<QueryArguments>),
     /// Metrics with period-over-period deltas
     Metrics {
         #[command(subcommand)]
@@ -47,7 +47,10 @@ enum Command {
         command: MonitorCommand,
     },
     /// Manage custom user and repository groups
-    Group,
+    Group {
+        #[command(subcommand)]
+        command: GroupCommand,
+    },
     /// Read or write configuration values
     Config {
         #[command(subcommand)]
@@ -55,6 +58,52 @@ enum Command {
     },
     /// Run the MCP (Model Context Protocol) stdio server
     Mcp,
+}
+
+#[derive(clap::Args)]
+struct QueryArguments {
+    /// Filter by author login
+    #[arg(long)]
+    author: Option<String>,
+    /// Filter by reviewer login
+    #[arg(long)]
+    reviewer: Option<String>,
+    /// Filter by repository ("owner/name")
+    #[arg(long)]
+    repo: Option<String>,
+    /// Filter by organization (repo owner)
+    #[arg(long)]
+    org: Option<String>,
+    /// Filter by group (user- or repo-group)
+    #[arg(long)]
+    group: Option<String>,
+    /// Filter by label name
+    #[arg(long)]
+    label: Option<String>,
+    /// Filter by state (open|merged|closed)
+    #[arg(long)]
+    state: Option<String>,
+    /// Shorthand for --state merged
+    #[arg(long)]
+    merged: bool,
+    /// Period filter (2026-Q1, 2026-01, 2026-W02, last-30, this-quarter, ...)
+    #[arg(long)]
+    period: Option<String>,
+    /// Inclusive start date (YYYY-MM-DD)
+    #[arg(long)]
+    since: Option<String>,
+    /// Inclusive end date (YYYY-MM-DD)
+    #[arg(long)]
+    until: Option<String>,
+    /// Maximum rows
+    #[arg(long)]
+    limit: Option<u32>,
+    /// Row offset
+    #[arg(long)]
+    offset: Option<u32>,
+    /// Output format
+    #[arg(long, default_value = "table")]
+    output: String,
 }
 
 #[derive(Subcommand)]
@@ -88,12 +137,82 @@ enum MetricsCommand {
     User {
         /// GitHub login
         login: String,
+        /// Period (default: this-quarter)
+        #[arg(long, default_value = "this-quarter")]
+        period: String,
+        /// Leaderboard size
+        #[arg(long, default_value_t = 5)]
+        top: u32,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
     },
     /// Metrics for a single repository
     Repo {
         /// Repository in "owner/name" form
         repository: String,
+        /// Period (default: this-quarter)
+        #[arg(long, default_value = "this-quarter")]
+        period: String,
+        /// Leaderboard size
+        #[arg(long, default_value_t = 5)]
+        top: u32,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
     },
+    /// Metrics for a custom group
+    Group {
+        /// Group name
+        name: String,
+        /// Period (default: this-quarter)
+        #[arg(long, default_value = "this-quarter")]
+        period: String,
+        /// Emit JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum GroupCommand {
+    /// Manage user groups
+    User {
+        #[command(subcommand)]
+        action: GroupAction,
+    },
+    /// Manage repository groups
+    Repo {
+        #[command(subcommand)]
+        action: GroupAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum GroupAction {
+    /// Create a group
+    Create {
+        name: String,
+        /// Optional description
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Delete a group
+    Delete { name: String },
+    /// Show a group's members
+    Show { name: String },
+    /// List all groups
+    List,
+    /// Add members to a group
+    Add {
+        name: String,
+        /// Members (logins or owner/name repos)
+        members: Vec<String>,
+    },
+    /// Remove members from a group
+    Remove { name: String, members: Vec<String> },
+    /// Replace a group's member set
+    Set { name: String, members: Vec<String> },
 }
 
 #[derive(Subcommand)]
@@ -138,6 +257,27 @@ enum ConfigCommand {
     },
     /// List all configuration values
     List,
+}
+
+fn parse_date_argument(text: &str) -> githubdw::Result<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(text, "%Y-%m-%d")
+        .map_err(|error| githubdw::Error::InvalidArgument(format!("bad date '{text}': {error}")))
+}
+
+fn print_grouped(rows: Vec<(String, u64)>) {
+    for (group, count) in rows {
+        println!("{group}\t{count}");
+    }
+}
+
+fn print_leaderboard(title: &str, rows: &[githubdw::metrics::EntityMetric]) {
+    if rows.is_empty() {
+        return;
+    }
+    println!("  {title}:");
+    for row in rows {
+        println!("    {}", row.render());
+    }
 }
 
 fn open_warehouse(db: Option<PathBuf>) -> githubdw::Result<GithubDW> {
@@ -364,11 +504,310 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
             }
             Ok(())
         }
-        Command::Search { .. }
-        | Command::Query
-        | Command::Metrics { .. }
-        | Command::Group
-        | Command::Mcp => {
+        Command::Query(arguments) => {
+            let QueryArguments {
+                author,
+                reviewer,
+                repo,
+                org,
+                group,
+                label,
+                state,
+                merged,
+                period,
+                since,
+                until,
+                limit,
+                offset,
+                output,
+            } = *arguments;
+            let warehouse = open_warehouse(command_line.db)?;
+            let connection = warehouse.connection();
+            let mut builder = githubdw::QueryBuilder::new(connection);
+            if let Some(author) = author.as_deref() {
+                builder = builder.author(author);
+            }
+            if let Some(reviewer) = reviewer.as_deref() {
+                builder = builder.reviewer(reviewer);
+            }
+            if let Some(repo) = repo.as_deref() {
+                builder = builder.repo(repo);
+            }
+            if let Some(org) = org.as_deref() {
+                builder = builder.org(org);
+            }
+            if let Some(group_name) = group.as_deref() {
+                match githubdw::groups::kind_of(connection, group_name)? {
+                    githubdw::groups::GroupKind::User => {
+                        let members = githubdw::groups::members(
+                            connection,
+                            githubdw::groups::GroupKind::User,
+                            group_name,
+                        )?;
+                        builder = builder.authors(&members);
+                    }
+                    githubdw::groups::GroupKind::Repo => {
+                        let members = githubdw::groups::members(
+                            connection,
+                            githubdw::groups::GroupKind::Repo,
+                            group_name,
+                        )?;
+                        builder = builder.repos(&members);
+                    }
+                }
+            }
+            if let Some(label) = label.as_deref() {
+                builder = builder.label(label);
+            }
+            if merged {
+                builder = builder.merged();
+            }
+            if let Some(state) = state.as_deref() {
+                let parsed = match state.to_lowercase().as_str() {
+                    "open" => githubdw::PrState::Open,
+                    "merged" => githubdw::PrState::Merged,
+                    "closed" => githubdw::PrState::Closed,
+                    other => {
+                        return Err(githubdw::Error::InvalidArgument(format!(
+                            "unknown state '{other}'"
+                        )));
+                    }
+                };
+                builder = builder.state(parsed);
+            }
+            if let Some(period_text) = period.as_deref() {
+                let parsed = githubdw::Period::parse(period_text)?;
+                match parsed {
+                    githubdw::Period::Rolling(..) => {
+                        let (start, end) = parsed.date_range();
+                        builder = builder.between(start, end);
+                    }
+                    other => builder = builder.period(other),
+                }
+            }
+            if let Some(since) = since.as_deref() {
+                builder = builder.since(parse_date_argument(since)?);
+            }
+            if let Some(until) = until.as_deref() {
+                builder = builder.until(parse_date_argument(until)?);
+            }
+            if let Some(limit) = limit {
+                builder = builder.limit(limit);
+            }
+            if let Some(offset) = offset {
+                builder = builder.offset(offset);
+            }
+
+            match output.as_str() {
+                "count" => println!("{}", builder.count()?),
+                "count-by-author" => print_grouped(builder.count_by_author()?),
+                "count-by-repo" => print_grouped(builder.count_by_repo()?),
+                "count-by-state" => print_grouped(builder.count_by_state()?),
+                "count-by-period" => print_grouped(builder.count_by_period()?),
+                "json" => println!("{}", builder.to_json()?),
+                "csv" => print!("{}", builder.to_csv()?),
+                "table" => {
+                    let rows = builder.pull_requests()?;
+                    let total = rows.len();
+                    for row in rows.iter().take(25) {
+                        println!(
+                            "{}\t{}\t{}\t{}\t{}",
+                            row.pr_key,
+                            row.state,
+                            row.author,
+                            row.created_at,
+                            row.title.as_deref().unwrap_or("")
+                        );
+                    }
+                    if total > 25 {
+                        println!("… and {} more", total - 25);
+                    }
+                }
+                other => {
+                    return Err(githubdw::Error::InvalidArgument(format!(
+                        "unknown output format '{other}'"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        Command::Metrics { command } => {
+            let warehouse = open_warehouse(command_line.db)?;
+            let connection = warehouse.connection();
+            let engine = githubdw::metrics::MetricsEngine::new(connection);
+            match command {
+                MetricsCommand::User {
+                    login,
+                    period,
+                    top,
+                    json,
+                } => {
+                    let period = githubdw::Period::parse(&period)?;
+                    let metrics = engine.user_metrics(&login, &period)?;
+                    let aggregations = engine.user_aggregations(&login, &period, top)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "metrics": metrics,
+                                "aggregations": aggregations,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "User {} — {} (vs {})",
+                            metrics.login, metrics.period_key, metrics.previous_period_key
+                        );
+                        println!("  PRs opened:       {}", metrics.prs_opened.render());
+                        println!("  PRs merged:       {}", metrics.prs_merged.render());
+                        println!("  Reviews given:    {}", metrics.reviews_given.render());
+                        println!("  Reviews received: {}", metrics.reviews_received.render());
+                        println!("  Comments given:   {}", metrics.comments_given.render());
+                        println!("  Lines added:      {}", metrics.lines_added.render());
+                        println!("  Lines removed:    {}", metrics.lines_removed.render());
+                        print_leaderboard("Top repos", &aggregations.top_repos);
+                        print_leaderboard("Top reviewers", &aggregations.top_reviewers);
+                        print_leaderboard(
+                            "Top reviewed authors",
+                            &aggregations.top_reviewed_authors,
+                        );
+                    }
+                }
+                MetricsCommand::Repo {
+                    repository,
+                    period,
+                    top,
+                    json,
+                } => {
+                    let period = githubdw::Period::parse(&period)?;
+                    let metrics = engine.repo_metrics(&repository, &period)?;
+                    let aggregations = engine.repo_aggregations(&repository, &period, top)?;
+                    if json {
+                        println!(
+                            "{}",
+                            serde_json::to_string_pretty(&serde_json::json!({
+                                "metrics": metrics,
+                                "aggregations": aggregations,
+                            }))?
+                        );
+                    } else {
+                        println!(
+                            "Repo {} — {} (vs {})",
+                            metrics.repository, metrics.period_key, metrics.previous_period_key
+                        );
+                        println!("  PRs opened:  {}", metrics.prs_opened.render());
+                        println!("  PRs merged:  {}", metrics.prs_merged.render());
+                        println!("  Reviews:     {}", metrics.total_reviews.render());
+                        println!("  Comments:    {}", metrics.total_comments.render());
+                        if let Some(rate) = metrics.check_failure_rate {
+                            println!("  Check failure rate: {:.1}%", rate * 100.0);
+                        }
+                        print_leaderboard("Top contributors", &aggregations.top_contributors);
+                        print_leaderboard("Top mergers", &aggregations.top_mergers);
+                        print_leaderboard("Top reviewers", &aggregations.top_reviewers);
+                        print_leaderboard("Top commenters", &aggregations.top_commenters);
+                    }
+                }
+                MetricsCommand::Group { name, period, json } => {
+                    let period = githubdw::Period::parse(&period)?;
+                    let kind = githubdw::groups::kind_of(connection, &name)?;
+                    let group_metrics = match kind {
+                        githubdw::groups::GroupKind::User => {
+                            let members = githubdw::groups::members(
+                                connection,
+                                githubdw::groups::GroupKind::User,
+                                &name,
+                            )?;
+                            engine.user_group_metrics(&name, &members, &period)?
+                        }
+                        githubdw::groups::GroupKind::Repo => {
+                            let members = githubdw::groups::members(
+                                connection,
+                                githubdw::groups::GroupKind::Repo,
+                                &name,
+                            )?;
+                            engine.repo_group_metrics(&name, &members, &period)?
+                        }
+                    };
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&group_metrics)?);
+                    } else {
+                        println!(
+                            "Group {} ({} group, {} members) — {} (vs {})",
+                            group_metrics.group_name,
+                            group_metrics.kind,
+                            group_metrics.member_count,
+                            group_metrics.period_key,
+                            group_metrics.previous_period_key
+                        );
+                        println!("  PRs opened: {}", group_metrics.prs_opened.render());
+                        println!("  PRs merged: {}", group_metrics.prs_merged.render());
+                        if let Some(reviews) = &group_metrics.reviews_given {
+                            println!("  Reviews given (to non-members): {}", reviews.render());
+                        }
+                        if let Some(reviews) = &group_metrics.total_reviews {
+                            println!("  Reviews: {}", reviews.render());
+                        }
+                        if let Some(comments) = &group_metrics.total_comments {
+                            println!("  Comments: {}", comments.render());
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        Command::Group { command } => {
+            let warehouse = open_warehouse(command_line.db)?;
+            let connection = warehouse.connection();
+            let (kind, action) = match command {
+                GroupCommand::User { action } => (githubdw::groups::GroupKind::User, action),
+                GroupCommand::Repo { action } => (githubdw::groups::GroupKind::Repo, action),
+            };
+            match action {
+                GroupAction::Create { name, description } => {
+                    githubdw::groups::create_group(
+                        connection,
+                        kind,
+                        &name,
+                        description.as_deref(),
+                    )?;
+                    println!("created group {name}");
+                }
+                GroupAction::Delete { name } => {
+                    githubdw::groups::delete_group(connection, kind, &name)?;
+                    println!("deleted group {name}");
+                }
+                GroupAction::Show { name } => {
+                    for member in githubdw::groups::members(connection, kind, &name)? {
+                        println!("{member}");
+                    }
+                }
+                GroupAction::List => {
+                    for (name, description, count) in
+                        githubdw::groups::list_groups(connection, kind)?
+                    {
+                        println!(
+                            "{name}\t{count} members\t{}",
+                            description.unwrap_or_default()
+                        );
+                    }
+                }
+                GroupAction::Add { name, members } => {
+                    githubdw::groups::add_members(connection, kind, &name, &members)?;
+                    println!("added {} member(s) to {name}", members.len());
+                }
+                GroupAction::Remove { name, members } => {
+                    githubdw::groups::remove_members(connection, kind, &name, &members)?;
+                    println!("removed {} member(s) from {name}", members.len());
+                }
+                GroupAction::Set { name, members } => {
+                    githubdw::groups::set_members(connection, kind, &name, &members)?;
+                    println!("set {name} to {} member(s)", members.len());
+                }
+            }
+            Ok(())
+        }
+        Command::Search { .. } | Command::Mcp => {
             // Ensure the database exists/migrates even for stub commands.
             let _warehouse = open_warehouse(command_line.db)?;
             eprintln!("this command is not implemented yet");

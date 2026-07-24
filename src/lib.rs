@@ -14,8 +14,14 @@
 pub mod error;
 pub mod fetch;
 mod githubdw;
+pub mod groups;
+pub mod metrics;
+pub mod period;
+pub mod query;
 pub mod storage;
 pub mod sync;
 
 pub use error::{Error, Result};
 pub use githubdw::GithubDW;
+pub use period::Period;
+pub use query::{PrState, QueryBuilder};
