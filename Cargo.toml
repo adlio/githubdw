@@ -3,6 +3,7 @@ name = "githubdw"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
+readme = "README.md"
 description = "Local SQLite data warehouse for GitHub repositories: sync PRs, reviews, and issues; query, metrics, fulltext search, and MCP server"
 repository = "https://github.com/adlio/githubdw"
 keywords = ["github", "sqlite", "data-warehouse", "metrics", "mcp"]
