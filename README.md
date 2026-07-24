@@ -1,6 +1,8 @@
 # githubdw
 
 [![CI](https://github.com/adlio/githubdw/actions/workflows/ci.yml/badge.svg)](https://github.com/adlio/githubdw/actions/workflows/ci.yml)
+[![codecov](https://codecov.io/gh/adlio/githubdw/branch/main/graph/badge.svg)](https://codecov.io/gh/adlio/githubdw)
+[![crates.io](https://img.shields.io/crates/v/githubdw.svg)](https://crates.io/crates/githubdw)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 A local, SQLite-based data warehouse for GitHub repositories, written in Rust.
