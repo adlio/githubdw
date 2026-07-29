@@ -1,14 +1,26 @@
 //! MCP server (stdio): exposes the warehouse to AI assistants via rmcp.
+//!
+//! Tool registration is written out by hand rather than using rmcp's
+//! `#[tool]` / `#[tool_router]` / `#[tool_handler]` macros. Those macros only
+//! exist in rmcp 2.x, and this crate pins rmcp 0.12 so that it stays resolvable
+//! from vendored/mirrored registries that lag crates.io. The tool names,
+//! descriptions, and JSON contract are unchanged.
 
 pub mod params;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
-use serde_json::json;
+use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
+use rmcp::handler::server::tool::ToolCallContext;
+use rmcp::model::{
+    CallToolRequestParam, CallToolResult, Content, Implementation, ListToolsResult,
+    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool,
+};
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::{ErrorData as McpError, ServerHandler};
+use serde_json::{Map, json};
 
 use crate::GithubDW;
 use crate::groups::{self, GroupKind};
@@ -25,10 +37,6 @@ use params::*;
 #[derive(Clone)]
 pub struct GithubDwServer {
     warehouse: Arc<Mutex<GithubDW>>,
-    #[expect(
-        dead_code,
-        reason = "the tool_handler macro accesses this router field"
-    )]
     tool_router: ToolRouter<Self>,
 }
 
@@ -43,28 +51,114 @@ fn invalid_params(message: impl Into<String>) -> McpError {
 /// Pretty-print a JSON value into a single text content block.
 fn json_result(value: serde_json::Value) -> Result<CallToolResult, McpError> {
     let text = serde_json::to_string_pretty(&value).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    Ok(CallToolResult::success(vec![Content::text(text)]))
 }
 
-#[tool_router]
+/// Build a `Tool` descriptor with a schemars-derived input schema.
+fn tool<T: schemars::JsonSchema + 'static>(name: &'static str, description: &'static str) -> Tool {
+    Tool {
+        name: name.into(),
+        title: None,
+        description: Some(description.into()),
+        input_schema: rmcp::handler::server::common::schema_for_type::<T>(),
+        output_schema: None,
+        annotations: None,
+        icons: None,
+        meta: None,
+    }
+}
+
+/// Deserialize a tool call's arguments into its parameter struct.
+///
+/// `arguments` is optional in the MCP spec, so an absent map must behave like
+/// `{}` — defaulting to `Value::Null` instead would reject calls to tools whose
+/// parameters are all optional (e.g. `manage_monitors` with no action).
+fn parse_params<T: serde::de::DeserializeOwned>(
+    args: Option<&Map<String, serde_json::Value>>,
+) -> Result<T, McpError> {
+    let value = serde_json::Value::Object(args.cloned().unwrap_or_default());
+    serde_json::from_value(value).map_err(|e| invalid_params(format!("invalid params: {e}")))
+}
+
+/// Shorthand for the boxed, `Send` future the tool router expects. Every tool
+/// body here is synchronous warehouse work, so the result is computed eagerly
+/// and wrapped — no lock guard is ever held across an await point.
+type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<CallToolResult, McpError>> + Send + 'a>>;
+
+fn ready(result: Result<CallToolResult, McpError>) -> ToolFuture<'static> {
+    Box::pin(std::future::ready(result))
+}
+
 impl GithubDwServer {
     pub fn new(warehouse: GithubDW) -> Self {
         Self {
             warehouse: Arc::new(Mutex::new(warehouse)),
-            tool_router: Self::tool_router(),
+            tool_router: Self::build_tool_router(),
         }
     }
 
-    #[tool(
-        description = "Query pull requests from the local warehouse. Filter by author, \
-        reviewer, repo, org, user/repo group, state (open/merged/closed), label, and \
-        period. Use output='count' for totals or 'count_by_author'/'count_by_repo'/\
-        'count_by_state'/'count_by_period' for breakdowns."
-    )]
-    async fn query_pull_requests(
+    fn build_tool_router() -> ToolRouter<Self> {
+        let mut router = ToolRouter::<Self>::new();
+        router.add_route(ToolRoute::<Self>::new_dyn(
+            tool::<QueryParams>(
+                "query_pull_requests",
+                "Query pull requests from the local warehouse. Filter by author, \
+                 reviewer, repo, org, user/repo group, state (open/merged/closed), label, and \
+                 period. Use output='count' for totals or 'count_by_author'/'count_by_repo'/\
+                 'count_by_state'/'count_by_period' for breakdowns.",
+            ),
+            |ctx: ToolCallContext<'_, Self>| {
+                ready(ctx.service.query_pull_requests(ctx.arguments.as_ref()))
+            },
+        ));
+        router.add_route(ToolRoute::<Self>::new_dyn(
+            tool::<MetricsParams>(
+                "get_metrics",
+                "Period-over-period metrics for a user, repo, user_group, or \
+                 repo_group. Returns PR counts, reviews, comments, and churn with deltas vs. \
+                 the previous period, plus ranked leaderboards.",
+            ),
+            |ctx: ToolCallContext<'_, Self>| ready(ctx.service.get_metrics(ctx.arguments.as_ref())),
+        ));
+        router.add_route(ToolRoute::<Self>::new_dyn(
+            tool::<SearchParams>(
+                "search",
+                "Full-text search across synced pull request and issue titles, \
+                 bodies, and comments (SQLite FTS5 trigram — substrings of 3+ characters match).",
+            ),
+            |ctx: ToolCallContext<'_, Self>| ready(ctx.service.search(ctx.arguments.as_ref())),
+        ));
+        router.add_route(ToolRoute::<Self>::new_dyn(
+            tool::<MonitorParams>(
+                "manage_monitors",
+                "List, add, or remove monitored users, repos, and orgs. \
+                 action='list' (default) shows everything currently tracked.",
+            ),
+            |ctx: ToolCallContext<'_, Self>| {
+                ready(ctx.service.manage_monitors(ctx.arguments.as_ref()))
+            },
+        ));
+        router.add_route(ToolRoute::<Self>::new_dyn(
+            tool::<SyncParams>(
+                "trigger_sync",
+                "Fetch fresh pull-request and issue data for a repository from \
+                 the GitHub API into the local database. Specify days to bound the window. \
+                 Requires an authenticated gh CLI.",
+            ),
+            |ctx: ToolCallContext<'_, Self>| {
+                ready(ctx.service.trigger_sync(ctx.arguments.as_ref()))
+            },
+        ));
+        router
+    }
+
+    // ─── Tool implementations ────────────────────────────────────────────────
+
+    fn query_pull_requests(
         &self,
-        Parameters(params): Parameters<QueryParams>,
+        args: Option<&Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        let params: QueryParams = parse_params(args)?;
         let warehouse = self.warehouse.lock().map_err(internal_error)?;
         let connection = warehouse.connection();
         let mut builder = QueryBuilder::new(connection);
@@ -157,15 +251,11 @@ impl GithubDwServer {
         json_result(response)
     }
 
-    #[tool(
-        description = "Period-over-period metrics for a user, repo, user_group, or \
-        repo_group. Returns PR counts, reviews, comments, and churn with deltas vs. \
-        the previous period, plus ranked leaderboards."
-    )]
-    async fn get_metrics(
+    fn get_metrics(
         &self,
-        Parameters(params): Parameters<MetricsParams>,
+        args: Option<&Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        let params: MetricsParams = parse_params(args)?;
         let warehouse = self.warehouse.lock().map_err(internal_error)?;
         let connection = warehouse.connection();
         let period =
@@ -215,14 +305,11 @@ impl GithubDwServer {
         json_result(response)
     }
 
-    #[tool(
-        description = "Full-text search across synced pull request and issue titles, \
-        bodies, and comments (SQLite FTS5 trigram — substrings of 3+ characters match)."
-    )]
-    async fn search(
+    fn search(
         &self,
-        Parameters(params): Parameters<SearchParams>,
+        args: Option<&Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        let params: SearchParams = parse_params(args)?;
         let warehouse = self.warehouse.lock().map_err(internal_error)?;
         let scope = match params.scope.as_deref().unwrap_or("all") {
             "all" => SearchScope::All,
@@ -245,14 +332,11 @@ impl GithubDwServer {
         json_result(json!({ "_meta": { "result_count": hits.len() }, "results": hits }))
     }
 
-    #[tool(
-        description = "List, add, or remove monitored users, repos, and orgs. \
-        action='list' (default) shows everything currently tracked."
-    )]
-    async fn manage_monitors(
+    fn manage_monitors(
         &self,
-        Parameters(params): Parameters<MonitorParams>,
+        args: Option<&Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        let params: MonitorParams = parse_params(args)?;
         let warehouse = self.warehouse.lock().map_err(internal_error)?;
         let connection = warehouse.connection();
         let action = params.action.as_deref().unwrap_or("list");
@@ -312,15 +396,11 @@ impl GithubDwServer {
         }
     }
 
-    #[tool(
-        description = "Fetch fresh pull-request and issue data for a repository from \
-        the GitHub API into the local database. Specify days to bound the window. \
-        Requires an authenticated gh CLI."
-    )]
-    async fn trigger_sync(
+    fn trigger_sync(
         &self,
-        Parameters(params): Parameters<SyncParams>,
+        args: Option<&Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        let params: SyncParams = parse_params(args)?;
         if params.entity_type != "repo" {
             return Err(invalid_params(format!(
                 "unknown entity_type '{}', only 'repo' is supported",
@@ -353,21 +433,49 @@ impl GithubDwServer {
     }
 }
 
-#[tool_handler]
 impl ServerHandler for GithubDwServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "githubdw is a local SQLite warehouse of GitHub pull requests, reviews, \
+        ServerInfo {
+            protocol_version: Default::default(),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation::from_build_env(),
+            instructions: Some(
+                "githubdw is a local SQLite warehouse of GitHub pull requests, reviews, \
                  comments, and issues. Use query_pull_requests for filtered listings and \
                  counts, get_metrics for period-over-period analytics and leaderboards, \
                  search for full-text lookup, manage_monitors to control what is tracked, \
-                 and trigger_sync to refresh data from GitHub.",
-        )
+                 and trigger_sync to refresh data from GitHub."
+                    .into(),
+            ),
+        }
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        std::future::ready(Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            next_cursor: None,
+            meta: None,
+        }))
+    }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParam,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+        let ctx = ToolCallContext::new(self, request, context);
+        self.tool_router.call(ctx)
     }
 }
 
 /// Run the stdio MCP server until the client disconnects.
 pub async fn serve_stdio(warehouse: GithubDW) -> crate::Result<()> {
+    use rmcp::ServiceExt;
+
     let server = GithubDwServer::new(warehouse);
     let service = server
         .serve(rmcp::transport::stdio())
@@ -378,4 +486,317 @@ pub async fn serve_stdio(warehouse: GithubDW) -> crate::Result<()> {
         .await
         .map_err(|error| crate::Error::Config(format!("MCP wait failed: {error}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server over an empty in-memory warehouse.
+    fn server() -> GithubDwServer {
+        GithubDwServer::new(GithubDW::open_in_memory().unwrap())
+    }
+
+    /// Build a tool-arguments map from a JSON object literal.
+    fn args(value: serde_json::Value) -> Map<String, serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => map,
+            other => panic!("expected a JSON object, got {other}"),
+        }
+    }
+
+    /// Extract the text of a successful single-block tool result.
+    fn text_of(result: CallToolResult) -> String {
+        let block = result.content.first().expect("one content block").clone();
+        block.as_text().expect("a text block").text.clone()
+    }
+
+    // ─── Router wiring ───────────────────────────────────────────────────────
+
+    #[test]
+    fn router_registers_every_tool_with_a_schema() {
+        let tools = server().tool_router.list_all();
+        let mut names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "get_metrics",
+                "manage_monitors",
+                "query_pull_requests",
+                "search",
+                "trigger_sync",
+            ]
+        );
+        for tool in &tools {
+            assert!(
+                tool.description.as_ref().is_some_and(|d| !d.is_empty()),
+                "{} is missing a description",
+                tool.name
+            );
+            assert!(
+                tool.input_schema.contains_key("properties"),
+                "{} is missing schema properties",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn server_info_advertises_tools_and_instructions() {
+        let info = server().get_info();
+        assert!(info.capabilities.tools.is_some(), "tools not advertised");
+        let instructions = info.instructions.expect("instructions");
+        assert!(instructions.contains("githubdw"));
+    }
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_params_defaults_when_arguments_are_absent() {
+        let params: QueryParams = parse_params(None).expect("defaults");
+        assert!(params.author.is_none());
+        assert!(params.output.is_none());
+    }
+
+    #[test]
+    fn parse_params_reads_supplied_fields() {
+        let map = args(json!({ "author": "alice", "output": "count" }));
+        let params: QueryParams = parse_params(Some(&map)).expect("parsed");
+        assert_eq!(params.author.as_deref(), Some("alice"));
+        assert_eq!(params.output.as_deref(), Some("count"));
+    }
+
+    #[test]
+    fn parse_params_rejects_wrong_types() {
+        let map = args(json!({ "author": 42 }));
+        let parsed: Result<QueryParams, _> = parse_params(Some(&map));
+        assert!(parsed.is_err(), "expected a type error");
+    }
+
+    #[test]
+    fn json_result_pretty_prints_into_a_text_block() {
+        let result = json_result(json!({ "count": 7 })).expect("result");
+        let text = text_of(result);
+        assert!(text.contains("\"count\""));
+        assert!(text.contains('\n'), "expected pretty-printed JSON");
+    }
+
+    // ─── query_pull_requests ─────────────────────────────────────────────────
+
+    #[test]
+    fn query_counts_zero_on_an_empty_warehouse() {
+        let map = args(json!({ "output": "count" }));
+        let text = text_of(server().query_pull_requests(Some(&map)).expect("ok"));
+        assert!(text.contains("\"count\": 0"), "got {text}");
+    }
+
+    #[test]
+    fn query_returns_an_empty_list_with_meta() {
+        let text = text_of(server().query_pull_requests(None).expect("ok"));
+        assert!(text.contains("\"result_count\": 0"), "got {text}");
+        assert!(text.contains("pull_requests"));
+    }
+
+    #[test]
+    fn query_supports_every_breakdown_output() {
+        for output in [
+            "count_by_author",
+            "count_by_repo",
+            "count_by_state",
+            "count_by_period",
+        ] {
+            let map = args(json!({ "output": output }));
+            let text = text_of(
+                server()
+                    .query_pull_requests(Some(&map))
+                    .unwrap_or_else(|e| panic!("{output} failed: {e}")),
+            );
+            assert!(text.contains("results"), "{output} -> {text}");
+        }
+    }
+
+    #[test]
+    fn query_rejects_an_unknown_output() {
+        let map = args(json!({ "output": "nonsense" }));
+        let error = server().query_pull_requests(Some(&map)).expect_err("error");
+        assert!(error.message.contains("unknown output"), "{error:?}");
+    }
+
+    #[test]
+    fn query_rejects_an_unknown_state() {
+        let map = args(json!({ "state": "nonsense" }));
+        let error = server().query_pull_requests(Some(&map)).expect_err("error");
+        assert!(error.message.contains("unknown state"), "{error:?}");
+    }
+
+    #[test]
+    fn query_accepts_the_documented_states() {
+        for state in ["open", "merged", "closed", "MERGED"] {
+            let map = args(json!({ "state": state, "output": "count" }));
+            assert!(
+                server().query_pull_requests(Some(&map)).is_ok(),
+                "state {state} rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn query_rejects_an_unparseable_period() {
+        let map = args(json!({ "period": "not-a-period" }));
+        assert!(server().query_pull_requests(Some(&map)).is_err());
+    }
+
+    #[test]
+    fn query_accepts_calendar_and_rolling_periods() {
+        for period in ["2026-Q1", "last-30"] {
+            let map = args(json!({ "period": period, "output": "count" }));
+            assert!(
+                server().query_pull_requests(Some(&map)).is_ok(),
+                "period {period} rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn query_rejects_an_unknown_group() {
+        let map = args(json!({ "group": "no-such-group" }));
+        assert!(server().query_pull_requests(Some(&map)).is_err());
+    }
+
+    // ─── get_metrics ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn metrics_returns_user_and_repo_shapes() {
+        for entity in ["user", "repo"] {
+            let map =
+                args(json!({ "entity_type": entity, "name": "someone", "period": "2026-Q1" }));
+            let text = text_of(
+                server()
+                    .get_metrics(Some(&map))
+                    .unwrap_or_else(|e| panic!("{entity} failed: {e}")),
+            );
+            assert!(text.contains("metrics"), "{entity} -> {text}");
+            assert!(text.contains("aggregations"), "{entity} -> {text}");
+        }
+    }
+
+    #[test]
+    fn metrics_rejects_an_unknown_entity_type() {
+        let map = args(json!({ "entity_type": "planet", "name": "x", "period": "2026-Q1" }));
+        let error = server().get_metrics(Some(&map)).expect_err("error");
+        assert!(error.message.contains("unknown entity_type"), "{error:?}");
+    }
+
+    #[test]
+    fn metrics_rejects_an_invalid_period() {
+        let map = args(json!({ "entity_type": "user", "name": "x", "period": "nope" }));
+        assert!(server().get_metrics(Some(&map)).is_err());
+    }
+
+    #[test]
+    fn metrics_rejects_an_unknown_group() {
+        for entity in ["user_group", "repo_group"] {
+            let map = args(json!({ "entity_type": entity, "name": "ghost", "period": "2026-Q1" }));
+            assert!(
+                server().get_metrics(Some(&map)).is_err(),
+                "{entity} should reject a missing group"
+            );
+        }
+    }
+
+    // ─── search ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn search_returns_no_hits_on_an_empty_warehouse() {
+        let map = args(json!({ "query": "anything" }));
+        let text = text_of(server().search(Some(&map)).expect("ok"));
+        assert!(text.contains("\"result_count\": 0"), "got {text}");
+    }
+
+    #[test]
+    fn search_accepts_every_scope() {
+        for scope in ["all", "pull_requests", "issues", "comments"] {
+            let map = args(json!({ "query": "abc", "scope": scope }));
+            assert!(
+                server().search(Some(&map)).is_ok(),
+                "scope {scope} rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn search_rejects_an_unknown_scope() {
+        let map = args(json!({ "query": "abc", "scope": "everywhere" }));
+        let error = server().search(Some(&map)).expect_err("error");
+        assert!(error.message.contains("unknown scope"), "{error:?}");
+    }
+
+    // ─── manage_monitors ─────────────────────────────────────────────────────
+
+    #[test]
+    fn monitors_list_is_empty_by_default() {
+        let text = text_of(server().manage_monitors(None).expect("ok"));
+        for key in ["users", "repos", "orgs"] {
+            assert!(text.contains(key), "missing {key} in {text}");
+        }
+    }
+
+    #[test]
+    fn monitors_add_then_list_then_remove_round_trips() {
+        let server = server();
+
+        let add = args(json!({ "action": "add", "entity_type": "repo", "name": "adlio/githubdw" }));
+        assert!(server.manage_monitors(Some(&add)).is_ok());
+
+        let listed = text_of(server.manage_monitors(None).expect("list"));
+        assert!(listed.contains("adlio/githubdw"), "got {listed}");
+
+        let remove =
+            args(json!({ "action": "remove", "entity_type": "repo", "name": "adlio/githubdw" }));
+        assert!(server.manage_monitors(Some(&remove)).is_ok());
+
+        let after = text_of(server.manage_monitors(None).expect("list"));
+        assert!(!after.contains("adlio/githubdw"), "got {after}");
+    }
+
+    #[test]
+    fn monitors_add_requires_entity_type_and_name() {
+        let server = server();
+        let missing_type = args(json!({ "action": "add", "name": "x" }));
+        assert!(server.manage_monitors(Some(&missing_type)).is_err());
+        let missing_name = args(json!({ "action": "add", "entity_type": "user" }));
+        assert!(server.manage_monitors(Some(&missing_name)).is_err());
+    }
+
+    #[test]
+    fn monitors_reject_unknown_entity_type_and_action() {
+        let server = server();
+        let bad_type = args(json!({ "action": "add", "entity_type": "planet", "name": "x" }));
+        let error = server.manage_monitors(Some(&bad_type)).expect_err("error");
+        assert!(error.message.contains("unknown entity_type"), "{error:?}");
+
+        let bad_action = args(json!({ "action": "explode" }));
+        let error = server
+            .manage_monitors(Some(&bad_action))
+            .expect_err("error");
+        assert!(error.message.contains("unknown action"), "{error:?}");
+    }
+
+    #[test]
+    fn monitors_removing_an_untracked_name_errors() {
+        let map = args(json!({ "action": "remove", "entity_type": "repo", "name": "no/such" }));
+        let error = server().manage_monitors(Some(&map)).expect_err("error");
+        assert!(error.message.contains("not monitored"), "{error:?}");
+    }
+
+    // ─── trigger_sync ────────────────────────────────────────────────────────
+
+    #[test]
+    fn sync_rejects_a_non_repo_entity_type() {
+        // Guard runs before any network/gh access, so this stays hermetic.
+        let map = args(json!({ "entity_type": "user", "name": "alice" }));
+        let error = server().trigger_sync(Some(&map)).expect_err("error");
+        assert!(error.message.contains("only 'repo'"), "{error:?}");
+    }
 }

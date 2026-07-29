@@ -19,7 +19,10 @@ thiserror = "2.0"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 dirs = "6.0"
-rmcp = { version = "2.2.0", features = ["server", "transport-io"] }
+# Pinned to 0.12 (not 2.x) so this crate stays resolvable from vendored or
+# mirrored crates.io registries, which can lag upstream by weeks. The MCP tool
+# contract is identical; see src/mcp/mod.rs for the hand-written tool router.
+rmcp = { version = "0.12", features = ["server", "transport-io"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 schemars = "1.2.1"
 
