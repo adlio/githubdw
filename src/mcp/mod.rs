@@ -1,14 +1,26 @@
 //! MCP server (stdio): exposes the warehouse to AI assistants via rmcp.
+//!
+//! Tool registration is written out by hand rather than using rmcp's
+//! `#[tool]` / `#[tool_router]` / `#[tool_handler]` macros. Those macros only
+//! exist in rmcp 2.x, and this crate pins rmcp 0.12 so that it stays resolvable
+//! from vendored/mirrored registries that lag crates.io. The tool names,
+//! descriptions, and JSON contract are unchanged.
 
 pub mod params;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
-use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
-use rmcp::{ErrorData as McpError, ServerHandler, ServiceExt, tool, tool_handler, tool_router};
-use serde_json::json;
+use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
+use rmcp::handler::server::tool::ToolCallContext;
+use rmcp::model::{
+    CallToolRequestParam, CallToolResult, Content, Implementation, ListToolsResult,
+    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool,
+};
+use rmcp::service::{RequestContext, RoleServer};
+use rmcp::{ErrorData as McpError, ServerHandler};
+use serde_json::{Map, json};
 
 use crate::GithubDW;
 use crate::groups::{self, GroupKind};
@@ -25,10 +37,6 @@ use params::*;
 #[derive(Clone)]
 pub struct GithubDwServer {
     warehouse: Arc<Mutex<GithubDW>>,
-    #[expect(
-        dead_code,
-        reason = "the tool_handler macro accesses this router field"
-    )]
     tool_router: ToolRouter<Self>,
 }
 
@@ -43,28 +51,113 @@ fn invalid_params(message: impl Into<String>) -> McpError {
 /// Pretty-print a JSON value into a single text content block.
 fn json_result(value: serde_json::Value) -> Result<CallToolResult, McpError> {
     let text = serde_json::to_string_pretty(&value).map_err(internal_error)?;
-    Ok(CallToolResult::success(vec![ContentBlock::text(text)]))
+    Ok(CallToolResult::success(vec![Content::text(text)]))
 }
 
-#[tool_router]
+/// Build a `Tool` descriptor with a schemars-derived input schema.
+fn tool<T: schemars::JsonSchema + 'static>(name: &'static str, description: &'static str) -> Tool {
+    Tool {
+        name: name.into(),
+        title: None,
+        description: Some(description.into()),
+        input_schema: rmcp::handler::server::common::schema_for_type::<T>(),
+        output_schema: None,
+        annotations: None,
+        icons: None,
+        meta: None,
+    }
+}
+
+/// Deserialize a tool call's arguments into its parameter struct.
+fn parse_params<T: serde::de::DeserializeOwned>(
+    args: Option<&Map<String, serde_json::Value>>,
+) -> Result<T, McpError> {
+    let value = args
+        .cloned()
+        .map(serde_json::Value::Object)
+        .unwrap_or_default();
+    serde_json::from_value(value).map_err(|e| invalid_params(format!("invalid params: {e}")))
+}
+
+/// Shorthand for the boxed, `Send` future the tool router expects. Every tool
+/// body here is synchronous warehouse work, so the result is computed eagerly
+/// and wrapped — no lock guard is ever held across an await point.
+type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<CallToolResult, McpError>> + Send + 'a>>;
+
+fn ready(result: Result<CallToolResult, McpError>) -> ToolFuture<'static> {
+    Box::pin(std::future::ready(result))
+}
+
 impl GithubDwServer {
     pub fn new(warehouse: GithubDW) -> Self {
         Self {
             warehouse: Arc::new(Mutex::new(warehouse)),
-            tool_router: Self::tool_router(),
+            tool_router: Self::build_tool_router(),
         }
     }
 
-    #[tool(
-        description = "Query pull requests from the local warehouse. Filter by author, \
-        reviewer, repo, org, user/repo group, state (open/merged/closed), label, and \
-        period. Use output='count' for totals or 'count_by_author'/'count_by_repo'/\
-        'count_by_state'/'count_by_period' for breakdowns."
-    )]
-    async fn query_pull_requests(
+    fn build_tool_router() -> ToolRouter<Self> {
+        let mut router = ToolRouter::<Self>::new();
+        router.add_route(ToolRoute::<Self>::new_dyn(
+            tool::<QueryParams>(
+                "query_pull_requests",
+                "Query pull requests from the local warehouse. Filter by author, \
+                 reviewer, repo, org, user/repo group, state (open/merged/closed), label, and \
+                 period. Use output='count' for totals or 'count_by_author'/'count_by_repo'/\
+                 'count_by_state'/'count_by_period' for breakdowns.",
+            ),
+            |ctx: ToolCallContext<'_, Self>| {
+                ready(ctx.service.query_pull_requests(ctx.arguments.as_ref()))
+            },
+        ));
+        router.add_route(ToolRoute::<Self>::new_dyn(
+            tool::<MetricsParams>(
+                "get_metrics",
+                "Period-over-period metrics for a user, repo, user_group, or \
+                 repo_group. Returns PR counts, reviews, comments, and churn with deltas vs. \
+                 the previous period, plus ranked leaderboards.",
+            ),
+            |ctx: ToolCallContext<'_, Self>| ready(ctx.service.get_metrics(ctx.arguments.as_ref())),
+        ));
+        router.add_route(ToolRoute::<Self>::new_dyn(
+            tool::<SearchParams>(
+                "search",
+                "Full-text search across synced pull request and issue titles, \
+                 bodies, and comments (SQLite FTS5 trigram — substrings of 3+ characters match).",
+            ),
+            |ctx: ToolCallContext<'_, Self>| ready(ctx.service.search(ctx.arguments.as_ref())),
+        ));
+        router.add_route(ToolRoute::<Self>::new_dyn(
+            tool::<MonitorParams>(
+                "manage_monitors",
+                "List, add, or remove monitored users, repos, and orgs. \
+                 action='list' (default) shows everything currently tracked.",
+            ),
+            |ctx: ToolCallContext<'_, Self>| {
+                ready(ctx.service.manage_monitors(ctx.arguments.as_ref()))
+            },
+        ));
+        router.add_route(ToolRoute::<Self>::new_dyn(
+            tool::<SyncParams>(
+                "trigger_sync",
+                "Fetch fresh pull-request and issue data for a repository from \
+                 the GitHub API into the local database. Specify days to bound the window. \
+                 Requires an authenticated gh CLI.",
+            ),
+            |ctx: ToolCallContext<'_, Self>| {
+                ready(ctx.service.trigger_sync(ctx.arguments.as_ref()))
+            },
+        ));
+        router
+    }
+
+    // ─── Tool implementations ────────────────────────────────────────────────
+
+    fn query_pull_requests(
         &self,
-        Parameters(params): Parameters<QueryParams>,
+        args: Option<&Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        let params: QueryParams = parse_params(args)?;
         let warehouse = self.warehouse.lock().map_err(internal_error)?;
         let connection = warehouse.connection();
         let mut builder = QueryBuilder::new(connection);
@@ -157,15 +250,11 @@ impl GithubDwServer {
         json_result(response)
     }
 
-    #[tool(
-        description = "Period-over-period metrics for a user, repo, user_group, or \
-        repo_group. Returns PR counts, reviews, comments, and churn with deltas vs. \
-        the previous period, plus ranked leaderboards."
-    )]
-    async fn get_metrics(
+    fn get_metrics(
         &self,
-        Parameters(params): Parameters<MetricsParams>,
+        args: Option<&Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        let params: MetricsParams = parse_params(args)?;
         let warehouse = self.warehouse.lock().map_err(internal_error)?;
         let connection = warehouse.connection();
         let period =
@@ -215,14 +304,11 @@ impl GithubDwServer {
         json_result(response)
     }
 
-    #[tool(
-        description = "Full-text search across synced pull request and issue titles, \
-        bodies, and comments (SQLite FTS5 trigram — substrings of 3+ characters match)."
-    )]
-    async fn search(
+    fn search(
         &self,
-        Parameters(params): Parameters<SearchParams>,
+        args: Option<&Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        let params: SearchParams = parse_params(args)?;
         let warehouse = self.warehouse.lock().map_err(internal_error)?;
         let scope = match params.scope.as_deref().unwrap_or("all") {
             "all" => SearchScope::All,
@@ -245,14 +331,11 @@ impl GithubDwServer {
         json_result(json!({ "_meta": { "result_count": hits.len() }, "results": hits }))
     }
 
-    #[tool(
-        description = "List, add, or remove monitored users, repos, and orgs. \
-        action='list' (default) shows everything currently tracked."
-    )]
-    async fn manage_monitors(
+    fn manage_monitors(
         &self,
-        Parameters(params): Parameters<MonitorParams>,
+        args: Option<&Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        let params: MonitorParams = parse_params(args)?;
         let warehouse = self.warehouse.lock().map_err(internal_error)?;
         let connection = warehouse.connection();
         let action = params.action.as_deref().unwrap_or("list");
@@ -312,15 +395,11 @@ impl GithubDwServer {
         }
     }
 
-    #[tool(
-        description = "Fetch fresh pull-request and issue data for a repository from \
-        the GitHub API into the local database. Specify days to bound the window. \
-        Requires an authenticated gh CLI."
-    )]
-    async fn trigger_sync(
+    fn trigger_sync(
         &self,
-        Parameters(params): Parameters<SyncParams>,
+        args: Option<&Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
+        let params: SyncParams = parse_params(args)?;
         if params.entity_type != "repo" {
             return Err(invalid_params(format!(
                 "unknown entity_type '{}', only 'repo' is supported",
@@ -353,21 +432,49 @@ impl GithubDwServer {
     }
 }
 
-#[tool_handler]
 impl ServerHandler for GithubDwServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
-            "githubdw is a local SQLite warehouse of GitHub pull requests, reviews, \
+        ServerInfo {
+            protocol_version: Default::default(),
+            capabilities: ServerCapabilities::builder().enable_tools().build(),
+            server_info: Implementation::from_build_env(),
+            instructions: Some(
+                "githubdw is a local SQLite warehouse of GitHub pull requests, reviews, \
                  comments, and issues. Use query_pull_requests for filtered listings and \
                  counts, get_metrics for period-over-period analytics and leaderboards, \
                  search for full-text lookup, manage_monitors to control what is tracked, \
-                 and trigger_sync to refresh data from GitHub.",
-        )
+                 and trigger_sync to refresh data from GitHub."
+                    .into(),
+            ),
+        }
+    }
+
+    fn list_tools(
+        &self,
+        _request: Option<PaginatedRequestParam>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        std::future::ready(Ok(ListToolsResult {
+            tools: self.tool_router.list_all(),
+            next_cursor: None,
+            meta: None,
+        }))
+    }
+
+    fn call_tool(
+        &self,
+        request: CallToolRequestParam,
+        context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CallToolResult, McpError>> + Send + '_ {
+        let ctx = ToolCallContext::new(self, request, context);
+        self.tool_router.call(ctx)
     }
 }
 
 /// Run the stdio MCP server until the client disconnects.
 pub async fn serve_stdio(warehouse: GithubDW) -> crate::Result<()> {
+    use rmcp::ServiceExt;
+
     let server = GithubDwServer::new(warehouse);
     let service = server
         .serve(rmcp::transport::stdio())
