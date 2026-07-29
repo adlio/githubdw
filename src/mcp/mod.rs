@@ -69,13 +69,14 @@ fn tool<T: schemars::JsonSchema + 'static>(name: &'static str, description: &'st
 }
 
 /// Deserialize a tool call's arguments into its parameter struct.
+///
+/// `arguments` is optional in the MCP spec, so an absent map must behave like
+/// `{}` — defaulting to `Value::Null` instead would reject calls to tools whose
+/// parameters are all optional (e.g. `manage_monitors` with no action).
 fn parse_params<T: serde::de::DeserializeOwned>(
     args: Option<&Map<String, serde_json::Value>>,
 ) -> Result<T, McpError> {
-    let value = args
-        .cloned()
-        .map(serde_json::Value::Object)
-        .unwrap_or_default();
+    let value = serde_json::Value::Object(args.cloned().unwrap_or_default());
     serde_json::from_value(value).map_err(|e| invalid_params(format!("invalid params: {e}")))
 }
 
@@ -485,4 +486,317 @@ pub async fn serve_stdio(warehouse: GithubDW) -> crate::Result<()> {
         .await
         .map_err(|error| crate::Error::Config(format!("MCP wait failed: {error}")))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A server over an empty in-memory warehouse.
+    fn server() -> GithubDwServer {
+        GithubDwServer::new(GithubDW::open_in_memory().unwrap())
+    }
+
+    /// Build a tool-arguments map from a JSON object literal.
+    fn args(value: serde_json::Value) -> Map<String, serde_json::Value> {
+        match value {
+            serde_json::Value::Object(map) => map,
+            other => panic!("expected a JSON object, got {other}"),
+        }
+    }
+
+    /// Extract the text of a successful single-block tool result.
+    fn text_of(result: CallToolResult) -> String {
+        let block = result.content.first().expect("one content block").clone();
+        block.as_text().expect("a text block").text.clone()
+    }
+
+    // ─── Router wiring ───────────────────────────────────────────────────────
+
+    #[test]
+    fn router_registers_every_tool_with_a_schema() {
+        let tools = server().tool_router.list_all();
+        let mut names: Vec<_> = tools.iter().map(|t| t.name.to_string()).collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec![
+                "get_metrics",
+                "manage_monitors",
+                "query_pull_requests",
+                "search",
+                "trigger_sync",
+            ]
+        );
+        for tool in &tools {
+            assert!(
+                tool.description.as_ref().is_some_and(|d| !d.is_empty()),
+                "{} is missing a description",
+                tool.name
+            );
+            assert!(
+                tool.input_schema.contains_key("properties"),
+                "{} is missing schema properties",
+                tool.name
+            );
+        }
+    }
+
+    #[test]
+    fn server_info_advertises_tools_and_instructions() {
+        let info = server().get_info();
+        assert!(info.capabilities.tools.is_some(), "tools not advertised");
+        let instructions = info.instructions.expect("instructions");
+        assert!(instructions.contains("githubdw"));
+    }
+
+    // ─── Helpers ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_params_defaults_when_arguments_are_absent() {
+        let params: QueryParams = parse_params(None).expect("defaults");
+        assert!(params.author.is_none());
+        assert!(params.output.is_none());
+    }
+
+    #[test]
+    fn parse_params_reads_supplied_fields() {
+        let map = args(json!({ "author": "alice", "output": "count" }));
+        let params: QueryParams = parse_params(Some(&map)).expect("parsed");
+        assert_eq!(params.author.as_deref(), Some("alice"));
+        assert_eq!(params.output.as_deref(), Some("count"));
+    }
+
+    #[test]
+    fn parse_params_rejects_wrong_types() {
+        let map = args(json!({ "author": 42 }));
+        let parsed: Result<QueryParams, _> = parse_params(Some(&map));
+        assert!(parsed.is_err(), "expected a type error");
+    }
+
+    #[test]
+    fn json_result_pretty_prints_into_a_text_block() {
+        let result = json_result(json!({ "count": 7 })).expect("result");
+        let text = text_of(result);
+        assert!(text.contains("\"count\""));
+        assert!(text.contains('\n'), "expected pretty-printed JSON");
+    }
+
+    // ─── query_pull_requests ─────────────────────────────────────────────────
+
+    #[test]
+    fn query_counts_zero_on_an_empty_warehouse() {
+        let map = args(json!({ "output": "count" }));
+        let text = text_of(server().query_pull_requests(Some(&map)).expect("ok"));
+        assert!(text.contains("\"count\": 0"), "got {text}");
+    }
+
+    #[test]
+    fn query_returns_an_empty_list_with_meta() {
+        let text = text_of(server().query_pull_requests(None).expect("ok"));
+        assert!(text.contains("\"result_count\": 0"), "got {text}");
+        assert!(text.contains("pull_requests"));
+    }
+
+    #[test]
+    fn query_supports_every_breakdown_output() {
+        for output in [
+            "count_by_author",
+            "count_by_repo",
+            "count_by_state",
+            "count_by_period",
+        ] {
+            let map = args(json!({ "output": output }));
+            let text = text_of(
+                server()
+                    .query_pull_requests(Some(&map))
+                    .unwrap_or_else(|e| panic!("{output} failed: {e}")),
+            );
+            assert!(text.contains("results"), "{output} -> {text}");
+        }
+    }
+
+    #[test]
+    fn query_rejects_an_unknown_output() {
+        let map = args(json!({ "output": "nonsense" }));
+        let error = server().query_pull_requests(Some(&map)).expect_err("error");
+        assert!(error.message.contains("unknown output"), "{error:?}");
+    }
+
+    #[test]
+    fn query_rejects_an_unknown_state() {
+        let map = args(json!({ "state": "nonsense" }));
+        let error = server().query_pull_requests(Some(&map)).expect_err("error");
+        assert!(error.message.contains("unknown state"), "{error:?}");
+    }
+
+    #[test]
+    fn query_accepts_the_documented_states() {
+        for state in ["open", "merged", "closed", "MERGED"] {
+            let map = args(json!({ "state": state, "output": "count" }));
+            assert!(
+                server().query_pull_requests(Some(&map)).is_ok(),
+                "state {state} rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn query_rejects_an_unparseable_period() {
+        let map = args(json!({ "period": "not-a-period" }));
+        assert!(server().query_pull_requests(Some(&map)).is_err());
+    }
+
+    #[test]
+    fn query_accepts_calendar_and_rolling_periods() {
+        for period in ["2026-Q1", "last-30"] {
+            let map = args(json!({ "period": period, "output": "count" }));
+            assert!(
+                server().query_pull_requests(Some(&map)).is_ok(),
+                "period {period} rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn query_rejects_an_unknown_group() {
+        let map = args(json!({ "group": "no-such-group" }));
+        assert!(server().query_pull_requests(Some(&map)).is_err());
+    }
+
+    // ─── get_metrics ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn metrics_returns_user_and_repo_shapes() {
+        for entity in ["user", "repo"] {
+            let map =
+                args(json!({ "entity_type": entity, "name": "someone", "period": "2026-Q1" }));
+            let text = text_of(
+                server()
+                    .get_metrics(Some(&map))
+                    .unwrap_or_else(|e| panic!("{entity} failed: {e}")),
+            );
+            assert!(text.contains("metrics"), "{entity} -> {text}");
+            assert!(text.contains("aggregations"), "{entity} -> {text}");
+        }
+    }
+
+    #[test]
+    fn metrics_rejects_an_unknown_entity_type() {
+        let map = args(json!({ "entity_type": "planet", "name": "x", "period": "2026-Q1" }));
+        let error = server().get_metrics(Some(&map)).expect_err("error");
+        assert!(error.message.contains("unknown entity_type"), "{error:?}");
+    }
+
+    #[test]
+    fn metrics_rejects_an_invalid_period() {
+        let map = args(json!({ "entity_type": "user", "name": "x", "period": "nope" }));
+        assert!(server().get_metrics(Some(&map)).is_err());
+    }
+
+    #[test]
+    fn metrics_rejects_an_unknown_group() {
+        for entity in ["user_group", "repo_group"] {
+            let map = args(json!({ "entity_type": entity, "name": "ghost", "period": "2026-Q1" }));
+            assert!(
+                server().get_metrics(Some(&map)).is_err(),
+                "{entity} should reject a missing group"
+            );
+        }
+    }
+
+    // ─── search ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn search_returns_no_hits_on_an_empty_warehouse() {
+        let map = args(json!({ "query": "anything" }));
+        let text = text_of(server().search(Some(&map)).expect("ok"));
+        assert!(text.contains("\"result_count\": 0"), "got {text}");
+    }
+
+    #[test]
+    fn search_accepts_every_scope() {
+        for scope in ["all", "pull_requests", "issues", "comments"] {
+            let map = args(json!({ "query": "abc", "scope": scope }));
+            assert!(
+                server().search(Some(&map)).is_ok(),
+                "scope {scope} rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn search_rejects_an_unknown_scope() {
+        let map = args(json!({ "query": "abc", "scope": "everywhere" }));
+        let error = server().search(Some(&map)).expect_err("error");
+        assert!(error.message.contains("unknown scope"), "{error:?}");
+    }
+
+    // ─── manage_monitors ─────────────────────────────────────────────────────
+
+    #[test]
+    fn monitors_list_is_empty_by_default() {
+        let text = text_of(server().manage_monitors(None).expect("ok"));
+        for key in ["users", "repos", "orgs"] {
+            assert!(text.contains(key), "missing {key} in {text}");
+        }
+    }
+
+    #[test]
+    fn monitors_add_then_list_then_remove_round_trips() {
+        let server = server();
+
+        let add = args(json!({ "action": "add", "entity_type": "repo", "name": "adlio/githubdw" }));
+        assert!(server.manage_monitors(Some(&add)).is_ok());
+
+        let listed = text_of(server.manage_monitors(None).expect("list"));
+        assert!(listed.contains("adlio/githubdw"), "got {listed}");
+
+        let remove =
+            args(json!({ "action": "remove", "entity_type": "repo", "name": "adlio/githubdw" }));
+        assert!(server.manage_monitors(Some(&remove)).is_ok());
+
+        let after = text_of(server.manage_monitors(None).expect("list"));
+        assert!(!after.contains("adlio/githubdw"), "got {after}");
+    }
+
+    #[test]
+    fn monitors_add_requires_entity_type_and_name() {
+        let server = server();
+        let missing_type = args(json!({ "action": "add", "name": "x" }));
+        assert!(server.manage_monitors(Some(&missing_type)).is_err());
+        let missing_name = args(json!({ "action": "add", "entity_type": "user" }));
+        assert!(server.manage_monitors(Some(&missing_name)).is_err());
+    }
+
+    #[test]
+    fn monitors_reject_unknown_entity_type_and_action() {
+        let server = server();
+        let bad_type = args(json!({ "action": "add", "entity_type": "planet", "name": "x" }));
+        let error = server.manage_monitors(Some(&bad_type)).expect_err("error");
+        assert!(error.message.contains("unknown entity_type"), "{error:?}");
+
+        let bad_action = args(json!({ "action": "explode" }));
+        let error = server
+            .manage_monitors(Some(&bad_action))
+            .expect_err("error");
+        assert!(error.message.contains("unknown action"), "{error:?}");
+    }
+
+    #[test]
+    fn monitors_removing_an_untracked_name_errors() {
+        let map = args(json!({ "action": "remove", "entity_type": "repo", "name": "no/such" }));
+        let error = server().manage_monitors(Some(&map)).expect_err("error");
+        assert!(error.message.contains("not monitored"), "{error:?}");
+    }
+
+    // ─── trigger_sync ────────────────────────────────────────────────────────
+
+    #[test]
+    fn sync_rejects_a_non_repo_entity_type() {
+        // Guard runs before any network/gh access, so this stays hermetic.
+        let map = args(json!({ "entity_type": "user", "name": "alice" }));
+        let error = server().trigger_sync(Some(&map)).expect_err("error");
+        assert!(error.message.contains("only 'repo'"), "{error:?}");
+    }
 }
