@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-08-15
+
+### Fixed
+
+- Restored the git hash in `--version` output. The 0.2.0 release notes
+  document this feature, but the shipped 0.2.0 artifacts do not contain
+  it: the summaries PR was squashed against a stale base and silently
+  reverted it. `githubdw --version` once again prints
+  `githubdw <version> (<short-hash>)`.
+
+### Changed
+
+- Linux release binaries are now statically linked (musl targets). The
+  0.2.0 gnu binaries required glibc >= 2.39 and failed to load on older
+  hosts; the musl binaries have no runtime library requirements.
+
 ## [0.2.0] - 2026-08-15
 
 ### Added
