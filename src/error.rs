@@ -43,4 +43,9 @@ pub enum Error {
 
     #[error("sync already in progress for {0}")]
     SyncInProgress(String),
+
+    /// LLM / agent failure (only present with the `summaries` feature).
+    #[cfg(feature = "summaries")]
+    #[error("LLM error: {0}")]
+    Llm(String),
 }

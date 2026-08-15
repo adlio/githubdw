@@ -10,6 +10,7 @@ pub fn migrations() -> Migrations<'static> {
     Migrations::new(vec![
         M::up(include_str!("migrations/001_initial.sql")),
         M::up(include_str!("migrations/002_groups.sql")),
+        M::up(include_str!("migrations/003_pr_summaries.sql")),
     ])
 }
 
@@ -65,7 +66,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 2);
+        assert_eq!(version, 3);
     }
 
     #[test]

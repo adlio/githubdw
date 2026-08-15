@@ -26,11 +26,21 @@ rmcp = { version = "0.12", features = ["server", "transport-io"] }
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros"] }
 schemars = "1.2.1"
 
+# Optional: AI summaries (feature = "summaries"). Gated so the default build
+# stays lean and resolvable from vendored/mirrored registries. Bedrock and
+# mixtape-core are PUBLIC dependencies with no Amazon-internal coupling, so
+# this keeps the crate GitHub-only in the sense the hard rule cares about.
+mixtape-core = { version = "0.4", features = ["bedrock"], optional = true }
+aws-config = { version = "1", optional = true }
+
 [dev-dependencies]
 tempfile = "3.20"
 
 [features]
+default = []
 live-tests = []
+# AI summaries of pull requests (Bedrock via mixtape-core). Opt-in.
+summaries = ["dep:mixtape-core", "dep:aws-config"]
 
 [[bin]]
 name = "githubdw"
