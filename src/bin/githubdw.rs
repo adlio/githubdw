@@ -10,7 +10,7 @@ use githubdw::GithubDW;
 #[derive(Parser)]
 #[command(
     name = "githubdw",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_SHA"), ")"),
     about = "Local SQLite data warehouse for GitHub: sync PRs and issues, query, metrics, search, MCP"
 )]
 struct CommandLine {
