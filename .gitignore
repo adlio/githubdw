@@ -22,3 +22,6 @@ target
 
 # Local planning documents (never committed)
 .plan/
+
+# Release packaging scratch dir (built by CI, never committed)
+dist/
