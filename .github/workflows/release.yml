@@ -103,7 +103,10 @@ jobs:
       - name: Download build artifacts
         uses: actions/download-artifact@v4
         with:
-          path: dist
+          # OUTSIDE the checkout: cargo publish refuses to run from a dirty
+          # working tree, and downloaded tarballs inside the repo dir are
+          # exactly that (v0.2.0 release failed on this).
+          path: ${{ runner.temp }}/dist
           pattern: tarball-*
           merge-multiple: true
 
@@ -112,7 +115,7 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
             --notes "$RELEASE_NOTES" \
-            dist/*.tar.gz dist/*.tar.gz.sha256
+            "$RUNNER_TEMP"/dist/*.tar.gz "$RUNNER_TEMP"/dist/*.tar.gz.sha256
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_NOTES: ${{ steps.changelog.outputs.notes }}
