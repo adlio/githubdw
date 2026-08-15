@@ -4,13 +4,75 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+*"
+  # Manual dry-run: builds all binaries but skips release creation + publish.
+  workflow_dispatch:
 
 permissions:
   contents: write
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # A release is all-or-nothing: if one platform fails, fix it and re-tag
+      # rather than shipping a partial asset set.
+      fail-fast: true
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+          - target: x86_64-apple-darwin
+            # Cross-compiled from the arm64 runner; Apple's toolchain builds
+            # both architectures natively, including rusqlite's bundled cc.
+            runner: macos-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Smoke-test the binary
+        # Only when the build architecture can execute on this runner.
+        if: matrix.target != 'x86_64-apple-darwin'
+        run: ./target/${{ matrix.target }}/release/githubdw --version
+
+      - name: Package
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          name="githubdw-${version}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/githubdw" "dist/${name}/"
+          cp LICENSE README.md CHANGELOG.md "dist/${name}/"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          (cd dist && shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256")
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
   release:
     name: Release
+    # Dry-runs (workflow_dispatch) stop after the builds succeed.
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: build
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
@@ -38,11 +100,19 @@ jobs:
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: tarball-*
+          merge-multiple: true
+
+      - name: Create GitHub Release with binaries
         run: |
           gh release create "$GITHUB_REF_NAME" \
             --title "$GITHUB_REF_NAME" \
-            --notes "$RELEASE_NOTES"
+            --notes "$RELEASE_NOTES" \
+            dist/*.tar.gz dist/*.tar.gz.sha256
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_NOTES: ${{ steps.changelog.outputs.notes }}
