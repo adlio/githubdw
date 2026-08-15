@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-08-15
+
+### Added
+
+- Opt-in AI summaries for pull requests (`--features summaries`): agentic
+  single-PR summarization storing a headline, what-changed / why-it-matters
+  prose, a 0-10 notability score, and change-type / impact-area / complexity
+  classification in a new `pr_summaries` table (migration 003). Ships two
+  agent tools: `query_database` (read-only SQL, enforced at the prepared-
+  statement level via `sqlite3_stmt_readonly`, with row caps applied during
+  collection) and `write_pr_summary` (upsert that preserves `created_at`).
+  Default builds compile none of the LLM dependencies.
+- `githubdw --version` now embeds the build's short git hash, e.g.
+  `githubdw 0.2.0 (03574c8)`, so installed binaries are auditable across
+  machines. Builds outside a git checkout (crates.io tarballs) report
+  `(unknown)`.
+- Tagged releases now build and attach binary tarballs with sha256 checksums
+  for Linux x86_64 / aarch64 and macOS arm64 / x86_64.
+
+### Changed
+
+- MCP server pinned to rmcp 0.12 with a hand-written tool router, keeping the
+  crate resolvable from vendored and mirrored crates.io registries.
+
 ## [0.1.0] - 2026-07-24
 
 ### Added
