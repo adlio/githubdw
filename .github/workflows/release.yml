@@ -23,9 +23,13 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - target: x86_64-unknown-linux-gnu
+          # musl, statically linked: the gnu builds inherit the runner
+          # image glibc (2.39 on ubuntu-24.04), which older hosts cannot
+          # load. rusqlite bundles SQLite, so the result has no runtime
+          # library requirements at all.
+          - target: x86_64-unknown-linux-musl
             runner: ubuntu-latest
-          - target: aarch64-unknown-linux-gnu
+          - target: aarch64-unknown-linux-musl
             runner: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             runner: macos-latest
@@ -40,6 +44,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install musl toolchain
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update -q && sudo apt-get install -y musl-tools
 
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }}
