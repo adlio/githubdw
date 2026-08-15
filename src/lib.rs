@@ -23,6 +23,10 @@ pub mod search;
 pub mod storage;
 pub mod sync;
 
+/// AI summarization of pull requests (opt-in via the `summaries` feature).
+#[cfg(feature = "summaries")]
+pub mod summaries;
+
 pub use error::{Error, Result};
 pub use githubdw::GithubDW;
 pub use period::Period;
