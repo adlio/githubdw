@@ -1,9 +1,10 @@
 //! Sync-state persistence: locks, job records, synced ranges, cursors.
 
-use chrono::{Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, NaiveDate, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
+use crate::storage::time_dimension;
 
 /// Locks staler than this are considered crashed and auto-released.
 const STALE_LOCK_MINUTES: i64 = 30;
@@ -120,6 +121,16 @@ pub fn fail_job(conn: &Connection, entity_key: &str, error: &str) -> Result<()> 
 
 /// Record a freshly synced `[start, end]` date range, merging with any
 /// overlapping or adjacent (within one day) existing ranges.
+///
+/// `end_date` is clamped to the last complete day in the warehouse timezone.
+/// A range may only ever claim days that have finished: an item created later
+/// in a still-running day would otherwise sit inside a range recorded as fully
+/// covered, and any reader that trusts the claim would never fetch it. The
+/// clamp also repairs legacy rows, because the merged end is re-clamped after
+/// absorbing them.
+///
+/// A range whose start is itself beyond the last complete day is dropped —
+/// there is nothing complete to record.
 pub fn record_range(
     conn: &Connection,
     entity_key: &str,
@@ -127,8 +138,32 @@ pub fn record_range(
     end_date: &str,
     item_count: i64,
 ) -> Result<()> {
+    record_range_as_of(
+        conn,
+        entity_key,
+        start_date,
+        end_date,
+        item_count,
+        Utc::now(),
+    )
+}
+
+/// [`record_range`] anchored to an explicit instant.
+pub fn record_range_as_of(
+    conn: &Connection,
+    entity_key: &str,
+    start_date: &str,
+    end_date: &str,
+    item_count: i64,
+    instant: DateTime<Utc>,
+) -> Result<()> {
     let start = parse_date(start_date)?;
     let end = parse_date(end_date)?;
+    let sealable = time_dimension::last_complete_day_as_of(conn, instant)?;
+    let end = end.min(sealable);
+    if start > end {
+        return Ok(());
+    }
 
     let mut statement = conn.prepare(
         "SELECT start_date, end_date, item_count FROM synced_ranges
@@ -156,6 +191,7 @@ pub fn record_range(
             params![entity_key, existing_start, existing_end],
         )?;
     }
+    let merged_end = merged_end.min(sealable);
     conn.execute(
         "INSERT INTO synced_ranges (entity_key, start_date, end_date, synced_at, item_count)
          VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -170,6 +206,36 @@ pub fn record_range(
     Ok(())
 }
 
+/// Stored ranges with every end clamped to the last complete day in the
+/// warehouse timezone, and ranges entirely beyond it dropped.
+///
+/// Clamping on read as well as on write means a database written by an older
+/// version — whose rows can claim the day that was in progress at the time —
+/// is still interpreted honestly, with no migration and no lost day.
+fn clamped_ranges(
+    conn: &Connection,
+    entity_key: &str,
+    instant: DateTime<Utc>,
+) -> Result<Vec<(NaiveDate, NaiveDate)>> {
+    let sealable = time_dimension::last_complete_day_as_of(conn, instant)?;
+    let mut statement = conn.prepare(
+        "SELECT start_date, end_date FROM synced_ranges
+         WHERE entity_key = ?1 ORDER BY start_date",
+    )?;
+    let rows: Vec<(String, String)> = statement
+        .query_map([entity_key], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<std::result::Result<_, _>>()?;
+    let mut ranges = Vec::with_capacity(rows.len());
+    for (start_text, end_text) in rows {
+        let start = parse_date(&start_text)?;
+        let end = parse_date(&end_text)?.min(sealable);
+        if start <= end {
+            ranges.push((start, end));
+        }
+    }
+    Ok(ranges)
+}
+
 /// Uncovered `[start, end]` windows between coverage and `target_date`.
 /// No ranges at all -> empty result (caller picks the initial window).
 pub fn gaps(
@@ -177,31 +243,33 @@ pub fn gaps(
     entity_key: &str,
     target_date: &str,
 ) -> Result<Vec<(String, String)>> {
+    gaps_as_of(conn, entity_key, target_date, Utc::now())
+}
+
+/// [`gaps`] anchored to an explicit instant.
+pub fn gaps_as_of(
+    conn: &Connection,
+    entity_key: &str,
+    target_date: &str,
+    instant: DateTime<Utc>,
+) -> Result<Vec<(String, String)>> {
     let target = parse_date(target_date)?;
-    let mut statement = conn.prepare(
-        "SELECT start_date, end_date FROM synced_ranges
-         WHERE entity_key = ?1 ORDER BY start_date",
-    )?;
-    let ranges: Vec<(String, String)> = statement
-        .query_map([entity_key], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<std::result::Result<_, _>>()?;
+    let ranges = clamped_ranges(conn, entity_key, instant)?;
     if ranges.is_empty() {
         return Ok(Vec::new());
     }
     let mut result = Vec::new();
-    let mut previous_end = parse_date(&ranges[0].1)?;
-    for (range_start, range_end) in ranges.iter().skip(1) {
-        let start = parse_date(range_start)?;
-        let end = parse_date(range_end)?;
-        if start > previous_end + Duration::days(1) {
+    let mut previous_end = ranges[0].1;
+    for (start, end) in ranges.iter().skip(1) {
+        if *start > previous_end + Duration::days(1) {
             result.push((
                 (previous_end + Duration::days(1))
                     .format("%Y-%m-%d")
                     .to_string(),
-                (start - Duration::days(1)).format("%Y-%m-%d").to_string(),
+                (*start - Duration::days(1)).format("%Y-%m-%d").to_string(),
             ));
         }
-        previous_end = previous_end.max(end);
+        previous_end = previous_end.max(*end);
     }
     if target > previous_end {
         result.push((
@@ -215,23 +283,33 @@ pub fn gaps(
 }
 
 /// The `(MIN(start_date), MAX(end_date))` of coverage, if any.
+///
+/// The end is clamped to the last complete day in the warehouse timezone, so
+/// coverage is never reported as reaching into a day that is still running.
 pub fn coverage_extent(conn: &Connection, entity_key: &str) -> Result<Option<(String, String)>> {
-    let extent = conn
-        .query_row(
-            "SELECT MIN(start_date), MAX(end_date) FROM synced_ranges WHERE entity_key = ?1",
-            [entity_key],
-            |row| {
-                Ok((
-                    row.get::<_, Option<String>>(0)?,
-                    row.get::<_, Option<String>>(1)?,
-                ))
-            },
-        )
-        .optional()?;
-    Ok(match extent {
-        Some((Some(start), Some(end))) => Some((start, end)),
-        _ => None,
-    })
+    coverage_extent_as_of(conn, entity_key, Utc::now())
+}
+
+/// [`coverage_extent`] anchored to an explicit instant.
+pub fn coverage_extent_as_of(
+    conn: &Connection,
+    entity_key: &str,
+    instant: DateTime<Utc>,
+) -> Result<Option<(String, String)>> {
+    let ranges = clamped_ranges(conn, entity_key, instant)?;
+    let Some(start) = ranges.iter().map(|(start, _)| *start).min() else {
+        return Ok(None);
+    };
+    let end = ranges
+        .iter()
+        .map(|(_, end)| *end)
+        .max()
+        .unwrap_or(start)
+        .max(start);
+    Ok(Some((
+        start.format("%Y-%m-%d").to_string(),
+        end.format("%Y-%m-%d").to_string(),
+    )))
 }
 
 /// Read the `updated_at` high-water cursor for a source.
@@ -281,6 +359,35 @@ fn parse_date(text: &str) -> Result<NaiveDate> {
 mod tests {
     use super::*;
     use crate::GithubDW;
+    use chrono::TimeZone;
+
+    /// 2026-08-17T03:00:00Z is 2026-08-16 20:00 in Los Angeles: the 16th is
+    /// still running locally, and UTC has already rolled to the 17th.
+    fn evening_in_los_angeles() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 8, 17, 3, 0, 0).unwrap()
+    }
+
+    fn warehouse_in_los_angeles() -> GithubDW {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        warehouse
+            .connection()
+            .execute(
+                "INSERT INTO config (key, value) VALUES ('timezone', 'America/Los_Angeles')
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [],
+            )
+            .unwrap();
+        warehouse
+    }
+
+    fn stored_range(conn: &Connection, entity_key: &str) -> (String, String) {
+        conn.query_row(
+            "SELECT start_date, end_date FROM synced_ranges WHERE entity_key = ?1",
+            [entity_key],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn lock_lifecycle_rejects_double_acquire() {
@@ -295,18 +402,117 @@ mod tests {
         acquire_lock(conn, "repo:octocat/hello").unwrap();
     }
 
+    /// A range may not claim the day that is still in progress, and "in
+    /// progress" is decided in the warehouse's own calendar — not UTC's.
+    #[test]
+    fn recorded_end_is_capped_at_the_last_complete_local_day() {
+        let warehouse = warehouse_in_los_angeles();
+        let conn = warehouse.connection();
+        let entity = "repo:octocat/hello";
+
+        record_range_as_of(
+            conn,
+            entity,
+            "2026-06-01",
+            "2026-08-17",
+            10,
+            evening_in_los_angeles(),
+        )
+        .unwrap();
+
+        let (start, end) = stored_range(conn, entity);
+        assert_eq!(start, "2026-06-01");
+        assert_eq!(
+            end, "2026-08-15",
+            "the 16th is still running locally and the 17th has not begun"
+        );
+    }
+
+    /// Nothing is recorded when the whole requested range is still in progress.
+    #[test]
+    fn a_range_entirely_in_the_running_day_is_not_recorded() {
+        let warehouse = warehouse_in_los_angeles();
+        let conn = warehouse.connection();
+        let entity = "repo:octocat/hello";
+
+        record_range_as_of(
+            conn,
+            entity,
+            "2026-08-16",
+            "2026-08-16",
+            3,
+            evening_in_los_angeles(),
+        )
+        .unwrap();
+
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM synced_ranges WHERE entity_key = ?1",
+                [entity],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0);
+        assert!(
+            coverage_extent_as_of(conn, entity, evening_in_los_angeles())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A row written by an older version can claim a day that was in progress
+    /// when it was written. Reads clamp it back, so the day resurfaces as work
+    /// to do instead of being silently treated as covered.
+    #[test]
+    fn legacy_optimistic_rows_are_clamped_on_read_and_repaired_on_write() {
+        let warehouse = warehouse_in_los_angeles();
+        let conn = warehouse.connection();
+        let entity = "repo:octocat/hello";
+        let instant = evening_in_los_angeles();
+
+        // Simulate what 0.2.1 wrote: coverage through "today", in UTC terms.
+        conn.execute(
+            "INSERT INTO synced_ranges (entity_key, start_date, end_date, synced_at, item_count)
+             VALUES (?1, '2026-06-01', '2026-08-17', '2026-08-17T03:00:00Z', 42)",
+            [entity],
+        )
+        .unwrap();
+
+        let extent = coverage_extent_as_of(conn, entity, instant)
+            .unwrap()
+            .unwrap();
+        assert_eq!(extent, ("2026-06-01".to_string(), "2026-08-15".to_string()));
+
+        // The clamped end means the trailing days show up as a gap again.
+        let holes = gaps_as_of(conn, entity, "2026-08-16", instant).unwrap();
+        assert_eq!(
+            holes,
+            vec![("2026-08-16".to_string(), "2026-08-16".to_string())]
+        );
+
+        // The next write repairs the stored row rather than merging its
+        // optimistic end forward.
+        record_range_as_of(conn, entity, "2026-08-10", "2026-08-15", 5, instant).unwrap();
+        let (start, end) = stored_range(conn, entity);
+        assert_eq!(start, "2026-06-01");
+        assert_eq!(end, "2026-08-15");
+    }
+
     #[test]
     fn ranges_merge_overlapping_and_adjacent() {
         let warehouse = GithubDW::open_in_memory().unwrap();
         let conn = warehouse.connection();
         let entity = "repo:octocat/hello";
+        // Fixed instant well past every range below, so the completeness clamp
+        // never participates and the test does not depend on the wall clock.
+        let now = Utc.with_ymd_and_hms(2027, 1, 1, 12, 0, 0).unwrap();
 
         // Recent window, then backfill older, then fill the middle hole.
-        record_range(conn, entity, "2026-06-01", "2026-06-30", 10).unwrap();
-        record_range(conn, entity, "2026-01-01", "2026-03-31", 20).unwrap();
-        record_range(conn, entity, "2026-04-01", "2026-05-31", 5).unwrap();
+        record_range_as_of(conn, entity, "2026-06-01", "2026-06-30", 10, now).unwrap();
+        record_range_as_of(conn, entity, "2026-01-01", "2026-03-31", 20, now).unwrap();
+        record_range_as_of(conn, entity, "2026-04-01", "2026-05-31", 5, now).unwrap();
 
-        let extent = coverage_extent(conn, entity).unwrap().unwrap();
+        let extent = coverage_extent_as_of(conn, entity, now).unwrap().unwrap();
         assert_eq!(extent, ("2026-01-01".to_string(), "2026-06-30".to_string()));
         let row_count: i64 = conn
             .query_row(
@@ -331,13 +537,18 @@ mod tests {
         let warehouse = GithubDW::open_in_memory().unwrap();
         let conn = warehouse.connection();
         let entity = "repo:octocat/hello";
+        let now = Utc.with_ymd_and_hms(2027, 1, 1, 12, 0, 0).unwrap();
 
-        assert!(gaps(conn, entity, "2026-07-01").unwrap().is_empty());
+        assert!(
+            gaps_as_of(conn, entity, "2026-07-01", now)
+                .unwrap()
+                .is_empty()
+        );
 
-        record_range(conn, entity, "2026-01-01", "2026-01-31", 1).unwrap();
-        record_range(conn, entity, "2026-03-01", "2026-03-31", 1).unwrap();
+        record_range_as_of(conn, entity, "2026-01-01", "2026-01-31", 1, now).unwrap();
+        record_range_as_of(conn, entity, "2026-03-01", "2026-03-31", 1, now).unwrap();
 
-        let holes = gaps(conn, entity, "2026-04-15").unwrap();
+        let holes = gaps_as_of(conn, entity, "2026-04-15", now).unwrap();
         assert_eq!(
             holes,
             vec![

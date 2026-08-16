@@ -1,7 +1,7 @@
 //! Sync orchestration: fetch pages via `gh`, upsert into the warehouse,
 //! stream progress, and record incremental coverage.
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use rusqlite::Connection;
 
 use crate::error::Result;
@@ -17,7 +17,11 @@ use crate::storage::time_dimension;
 /// Options controlling one sync run.
 #[derive(Debug, Clone, Default)]
 pub struct SyncOptions {
-    /// Restrict the window to the last N days (initial sync default: 90).
+    /// Start the recorded coverage window N days back instead of the default.
+    ///
+    /// This sets the *coverage claim* only. It does not bound the fetch: the
+    /// PR and issue loops page until the source is exhausted or the
+    /// incremental cursor stops them.
     pub days: Option<u32>,
     /// Skip fetching per-file patch text via REST (fast mode).
     pub skip_diffs: bool,
@@ -46,11 +50,24 @@ const INITIAL_WINDOW_DAYS: i64 = 90;
 pub struct Syncer<'a> {
     connection: &'a Connection,
     client: &'a mut GhClient,
+    /// The instant this run is anchored to. Injectable so coverage-window
+    /// arithmetic is deterministic under test.
+    now: DateTime<Utc>,
 }
 
 impl<'a> Syncer<'a> {
     pub fn new(connection: &'a Connection, client: &'a mut GhClient) -> Self {
-        Self { connection, client }
+        Self {
+            connection,
+            client,
+            now: Utc::now(),
+        }
+    }
+
+    /// Anchor this run to a specific instant instead of the wall clock.
+    pub fn as_of(mut self, instant: DateTime<Utc>) -> Self {
+        self.now = instant;
+        self
     }
 
     /// Sync a repository ("owner/name"): PRs (M1) and issues (M2).
@@ -99,15 +116,25 @@ impl<'a> Syncer<'a> {
         let cursor_before =
             sync_state::last_updated_cursor(self.connection, "repo", repository_name)?;
 
-        // Determine the work window from coverage + --days.
-        let today = Utc::now().date_naive();
+        // Determine the work window from coverage + --days, in the warehouse's
+        // own calendar: these strings live alongside `*_date_key` values, which
+        // are built in the configured zone.
+        let today = time_dimension::today_as_of(self.connection, self.now)?;
+        // Never claim the day that is still in progress locally. An item
+        // created later today would otherwise fall inside a range recorded as
+        // fully covered and be skipped by any reader that trusts the claim.
+        let coverage_end = today - Duration::days(1);
         let window_start = match options.days {
             Some(days) => today - Duration::days(days as i64),
-            None => match sync_state::coverage_extent(self.connection, entity_key)? {
-                Some(_) => today, // incremental: cursor governs, range extends to today
+            None => match sync_state::coverage_extent_as_of(self.connection, entity_key, self.now)?
+            {
+                // Incremental: the cursor governs what is fetched; the range
+                // only needs to extend coverage to the last complete day.
+                Some(_) => coverage_end,
                 None => today - Duration::days(INITIAL_WINDOW_DAYS),
             },
-        };
+        }
+        .min(coverage_end);
 
         if !options.issues_only {
             self.sync_pull_requests(
@@ -134,13 +161,15 @@ impl<'a> Syncer<'a> {
             )?;
         }
 
-        // Record coverage and advance the cursor.
-        sync_state::record_range(
+        // Record coverage through the last complete local day and advance the
+        // cursor.
+        sync_state::record_range_as_of(
             self.connection,
             entity_key,
             &window_start.format("%Y-%m-%d").to_string(),
-            &today.format("%Y-%m-%d").to_string(),
+            &coverage_end.format("%Y-%m-%d").to_string(),
             summary.pull_requests_synced + summary.issues_synced,
+            self.now,
         )?;
         monitor_repository::touch_repo(self.connection, repository_name)?;
         Ok(summary)
@@ -200,11 +229,21 @@ impl<'a> Syncer<'a> {
 
             let page_is_empty = page.pull_requests.is_empty();
             for pull_request in &page.pull_requests {
-                // Incremental stop: results are updated-desc; once at/under
-                // the cursor, everything further is already ingested.
+                // Incremental stop: results are updated-desc, so once an item
+                // is *strictly* older than the cursor everything after it is
+                // already ingested.
+                //
+                // The comparison must be strict. `updated_at` is
+                // second-granular, so an item updated in the same second as
+                // the cursor — after the previous run had already served its
+                // page — sits exactly at the boundary. Stopping there would
+                // skip it forever, since only a further update (which moves
+                // its timestamp) could bring it back. Re-ingesting the
+                // boundary second instead is free: the upserts are
+                // `ON CONFLICT` idempotent.
                 if let (Some(cursor), Some(updated)) =
                     (updated_cursor, pull_request.updated_at.as_deref())
-                    && updated <= cursor
+                    && updated < cursor
                 {
                     summary.up_to_date = summary.pull_requests_synced == 0;
                     break 'pages;
@@ -221,13 +260,23 @@ impl<'a> Syncer<'a> {
                     &bot_suffix,
                     options,
                 ) {
-                    Ok(()) => summary.pull_requests_synced += 1,
+                    Ok(()) => {
+                        summary.pull_requests_synced += 1;
+                        // Only advance the cursor past items that actually
+                        // landed. Folding a failed item's timestamp in would
+                        // move the watermark past data the warehouse does not
+                        // hold, and the next run's stop condition would break
+                        // before reaching it again — a permanent hole with no
+                        // self-heal. Because the page is updated-desc, the
+                        // surviving maximum stays below any failed item, so the
+                        // failure is retried on the next run.
+                        if let Some(updated) = pull_request.updated_at.as_deref()
+                            && max_updated_at.as_deref().is_none_or(|max| updated > max)
+                        {
+                            max_updated_at = Some(updated.to_string());
+                        }
+                    }
                     Err(error) => summary.failed.push((pr_key.clone(), error.to_string())),
-                }
-                if let Some(updated) = pull_request.updated_at.as_deref()
-                    && max_updated_at.as_deref().is_none_or(|max| updated > max)
-                {
-                    max_updated_at = Some(updated.to_string());
                 }
                 sync_state::update_lock_progress(
                     self.connection,
@@ -491,8 +540,11 @@ impl<'a> Syncer<'a> {
 
             let page_is_empty = page.issues.is_empty();
             for issue in &page.issues {
+                // Strict comparison, so an item updated in the same second as
+                // the cursor is re-ingested rather than skipped forever. See
+                // the equivalent stop in `sync_pull_requests`.
                 if let Some(cursor) = updated_cursor
-                    && issue.updated_at.as_str() <= cursor
+                    && issue.updated_at.as_str() < cursor
                 {
                     break 'pages;
                 }
@@ -500,14 +552,17 @@ impl<'a> Syncer<'a> {
                 item_index += 1;
                 let item_id = format!("{repo_key}#issue-{}", issue.number);
                 match self.upsert_one_issue(&repo_key, issue, timezone, core_hours, &bot_suffix) {
-                    Ok(()) => summary.issues_synced += 1,
+                    Ok(()) => {
+                        summary.issues_synced += 1;
+                        // Cursor advances only past items that persisted.
+                        if max_updated_at
+                            .as_deref()
+                            .is_none_or(|max| issue.updated_at.as_str() > max)
+                        {
+                            max_updated_at = Some(issue.updated_at.clone());
+                        }
+                    }
                     Err(error) => summary.failed.push((item_id.clone(), error.to_string())),
-                }
-                if max_updated_at
-                    .as_deref()
-                    .is_none_or(|max| issue.updated_at.as_str() > max)
-                {
-                    max_updated_at = Some(issue.updated_at.clone());
                 }
                 sync_state::update_lock_progress(
                     self.connection,
@@ -626,42 +681,40 @@ mod tests {
     use crate::fetch::test_support::FixtureTransport;
     use serde_json::json;
 
-    fn page_response(has_next: bool, cursor: Option<&str>, numbers: &[i64]) -> String {
-        let nodes: Vec<_> = numbers
-            .iter()
-            .map(|number| {
-                json!({
-                    "number": number,
-                    "title": format!("PR {number}"),
-                    "body": "body text",
-                    "state": "MERGED",
-                    "isDraft": false,
-                    "createdAt": "2026-01-05T18:00:00Z",
-                    "updatedAt": format!("2026-01-{:02}T09:00:00Z", 5 + number),
-                    "mergedAt": "2026-01-06T09:00:00Z",
-                    "closedAt": "2026-01-06T09:00:00Z",
-                    "baseRefName": "main",
-                    "headRefName": format!("feature/{number}"),
-                    "additions": 10,
-                    "deletions": 2,
-                    "changedFiles": 1,
-                    "author": {"login": "octocat", "__typename": "User"},
-                    "mergedBy": {"login": "hubot", "__typename": "User"},
-                    "reviews": {"nodes": [{
-                        "id": format!("REV{number}"), "state": "APPROVED", "body": "",
-                        "submittedAt": "2026-01-06T08:00:00Z",
-                        "author": {"login": "hubot", "__typename": "User"}
-                    }]},
-                    "reviewThreads": {"nodes": []},
-                    "comments": {"nodes": []},
-                    "files": {"nodes": [{
-                        "path": "src/lib.rs", "changeType": "MODIFIED",
-                        "additions": 10, "deletions": 2
-                    }]},
-                    "commits": {"nodes": []}
-                })
-            })
-            .collect();
+    fn pr_node(number: i64, created_at: &str, updated_at: &str) -> serde_json::Value {
+        json!({
+            "number": number,
+            "title": format!("PR {number}"),
+            "body": "body text",
+            "state": "MERGED",
+            "isDraft": false,
+            "createdAt": created_at,
+            "updatedAt": updated_at,
+            "mergedAt": "2026-01-06T09:00:00Z",
+            "closedAt": "2026-01-06T09:00:00Z",
+            "baseRefName": "main",
+            "headRefName": format!("feature/{number}"),
+            "additions": 10,
+            "deletions": 2,
+            "changedFiles": 1,
+            "author": {"login": "octocat", "__typename": "User"},
+            "mergedBy": {"login": "hubot", "__typename": "User"},
+            "reviews": {"nodes": [{
+                "id": format!("REV{number}"), "state": "APPROVED", "body": "",
+                "submittedAt": "2026-01-06T08:00:00Z",
+                "author": {"login": "hubot", "__typename": "User"}
+            }]},
+            "reviewThreads": {"nodes": []},
+            "comments": {"nodes": []},
+            "files": {"nodes": [{
+                "path": "src/lib.rs", "changeType": "MODIFIED",
+                "additions": 10, "deletions": 2
+            }]},
+            "commits": {"nodes": []}
+        })
+    }
+
+    fn page_of(has_next: bool, cursor: Option<&str>, nodes: Vec<serde_json::Value>) -> String {
         json!({
             "data": {
                 "rateLimit": {"limit": 5000, "cost": 1, "remaining": 4999, "resetAt": "2099-01-01T00:00:00Z"},
@@ -682,6 +735,41 @@ mod tests {
         .to_string()
     }
 
+    fn page_response(has_next: bool, cursor: Option<&str>, numbers: &[i64]) -> String {
+        let nodes = numbers
+            .iter()
+            .map(|number| {
+                pr_node(
+                    *number,
+                    "2026-01-05T18:00:00Z",
+                    &format!("2026-01-{:02}T09:00:00Z", 5 + number),
+                )
+            })
+            .collect();
+        page_of(has_next, cursor, nodes)
+    }
+
+    fn fast_pr_options() -> SyncOptions {
+        SyncOptions {
+            skip_diffs: true,
+            pull_requests_only: true,
+            ..Default::default()
+        }
+    }
+
+    fn los_angeles_warehouse() -> GithubDW {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        warehouse
+            .connection()
+            .execute(
+                "INSERT INTO config (key, value) VALUES ('timezone', 'America/Los_Angeles')
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                [],
+            )
+            .unwrap();
+        warehouse
+    }
+
     #[test]
     fn syncs_two_pages_and_records_state() {
         let warehouse = GithubDW::open_in_memory().unwrap();
@@ -690,11 +778,7 @@ mod tests {
             Ok(page_response(false, None, &[3])),
         ]);
         let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
-        let options = SyncOptions {
-            skip_diffs: true,
-            pull_requests_only: true,
-            ..Default::default()
-        };
+        let options = fast_pr_options();
         let mut syncer = Syncer::new(warehouse.connection(), &mut client);
         let summary = syncer.sync_repository("octocat/hello", &options).unwrap();
 
@@ -742,11 +826,7 @@ mod tests {
             Ok(page_response(false, None, &[1, 2])),
         ]);
         let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
-        let options = SyncOptions {
-            skip_diffs: true,
-            pull_requests_only: true,
-            ..Default::default()
-        };
+        let options = fast_pr_options();
 
         {
             let mut syncer = Syncer::new(warehouse.connection(), &mut client);
@@ -759,6 +839,129 @@ mod tests {
             assert_eq!(second.pull_requests_synced, 0, "no-op on unchanged data");
             assert!(second.up_to_date);
         }
+    }
+
+    /// An item updated in the *same second* as the cursor was late to the
+    /// previous run's page. The stop must be strict so the boundary second is
+    /// re-read, otherwise that item is skipped for good: nothing short of
+    /// another update (which moves its timestamp) would ever surface it.
+    #[test]
+    fn same_second_late_update_is_not_lost() {
+        let boundary = "2026-01-10T10:00:00Z";
+        let older = "2026-01-09T10:00:00Z";
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        let transport = FixtureTransport::new(vec![
+            // Run 1 sees only PR 1; the cursor lands exactly on `boundary`.
+            Ok(page_of(
+                false,
+                None,
+                vec![pr_node(1, "2026-01-05T18:00:00Z", boundary)],
+            )),
+            // Run 2: PR 2 was updated in the same second but missed page 1,
+            // followed by the already-ingested PR 1 and a strictly older PR 3.
+            Ok(page_of(
+                false,
+                None,
+                vec![
+                    pr_node(2, "2026-01-05T18:00:00Z", boundary),
+                    pr_node(1, "2026-01-05T18:00:00Z", boundary),
+                    pr_node(3, "2026-01-05T18:00:00Z", older),
+                ],
+            )),
+        ]);
+        let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
+        let options = fast_pr_options();
+
+        {
+            let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+            syncer.sync_repository("octocat/hello", &options).unwrap();
+        }
+        {
+            let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+            syncer.sync_repository("octocat/hello", &options).unwrap();
+        }
+
+        let conn = warehouse.connection();
+        let numbers: Vec<i64> = conn
+            .prepare("SELECT number FROM fact_pull_requests ORDER BY number")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap();
+        assert_eq!(
+            numbers,
+            vec![1, 2],
+            "the same-second item is picked up, and the strictly older one \
+             still terminates the walk"
+        );
+    }
+
+    /// The cursor must not move past an item that failed to persist. If it
+    /// does, the next run's stop condition fires before reaching that item and
+    /// the gap never heals.
+    #[test]
+    fn cursor_does_not_advance_past_a_failed_upsert() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        // Newest-first, as GitHub serves it. PR 9 has an unparseable
+        // `createdAt`, so its upsert fails; PR 8 is fine.
+        let transport = FixtureTransport::new(vec![Ok(page_of(
+            false,
+            None,
+            vec![
+                pr_node(9, "not-a-timestamp", "2026-01-20T10:00:00Z"),
+                pr_node(8, "2026-01-05T18:00:00Z", "2026-01-19T10:00:00Z"),
+            ],
+        ))]);
+        let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
+        let options = fast_pr_options();
+        let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+        let summary = syncer.sync_repository("octocat/hello", &options).unwrap();
+
+        assert_eq!(summary.pull_requests_synced, 1);
+        assert_eq!(summary.failed.len(), 1, "PR 9 is reported as failed");
+
+        let cursor =
+            sync_state::last_updated_cursor(warehouse.connection(), "repo", "octocat/hello")
+                .unwrap();
+        assert_eq!(
+            cursor.as_deref(),
+            Some("2026-01-19T10:00:00Z"),
+            "the watermark stays below the failed item so it is retried"
+        );
+    }
+
+    /// Coverage is recorded in the warehouse's own calendar and stops at the
+    /// last completed day there. The injected instant is evening in Los
+    /// Angeles, which is already the next day in UTC — so a UTC-derived
+    /// "today" would seal two days that are not finished locally.
+    #[test]
+    fn recorded_coverage_stops_at_the_last_complete_local_day() {
+        let warehouse = los_angeles_warehouse();
+        let transport = FixtureTransport::new(vec![Ok(page_response(false, None, &[1]))]);
+        let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
+        let options = fast_pr_options();
+
+        // 2026-08-16 20:00 PDT.
+        let instant = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 17, 3, 0, 0).unwrap();
+        let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(instant);
+        syncer.sync_repository("octocat/hello", &options).unwrap();
+
+        let (start, end): (String, String) = warehouse
+            .connection()
+            .query_row(
+                "SELECT start_date, end_date FROM synced_ranges
+                 WHERE entity_key = 'repo:octocat/hello'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            end, "2026-08-15",
+            "neither the running local day (08-16) nor the UTC day (08-17)"
+        );
+        // Initial window: 90 days back from the local day, 2026-08-16.
+        assert_eq!(start, "2026-05-18");
     }
 
     fn issue_page_response(has_next: bool, cursor: Option<&str>, numbers: &[i64]) -> String {
