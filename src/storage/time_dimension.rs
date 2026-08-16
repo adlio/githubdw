@@ -1,10 +1,13 @@
 //! Timezone-aware date/time dimension key derivation and row seeding.
 
-use chrono::{DateTime, Datelike, NaiveDate, Timelike, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Timelike, Utc};
 use chrono_tz::Tz;
 use rusqlite::{Connection, params};
 
 use crate::error::{Error, Result};
+
+/// Fallback IANA zone when the warehouse has no usable `timezone` config.
+pub const DEFAULT_TIMEZONE: &str = "America/Los_Angeles";
 
 /// Derived dimension keys for one UTC timestamp in a local timezone.
 #[derive(Debug, Clone, PartialEq)]
@@ -21,9 +24,66 @@ pub fn configured_timezone(conn: &Connection) -> Result<Tz> {
             [],
             |row| row.get(0),
         )
-        .unwrap_or_else(|_| "America/Los_Angeles".to_string());
+        .unwrap_or_else(|_| DEFAULT_TIMEZONE.to_string());
     name.parse::<Tz>()
         .map_err(|_| Error::Config(format!("invalid timezone '{name}'")))
+}
+
+/// The calendar date `instant` falls on in `timezone`. DST-aware, because the
+/// conversion goes through the zone's full transition table rather than a
+/// fixed offset.
+///
+/// This is the single rule that relates a point in time to a `date_key`: the
+/// same rule [`derive_local_keys`] applies to stored facts. Any caller that
+/// needs a "today" to compare against `date_key` values must go through here
+/// (or [`today`]) rather than taking a UTC calendar date, otherwise the two
+/// calendars disagree for the hours when the zone's local date and the UTC
+/// date differ — up to 14 hours a day, every day.
+pub fn local_date_for(instant: DateTime<Utc>, timezone: Tz) -> NaiveDate {
+    instant.with_timezone(&timezone).date_naive()
+}
+
+/// "Today" in the warehouse's configured timezone, at `instant`.
+///
+/// Takes the instant explicitly so callers (and tests) can be deterministic.
+pub fn today_as_of(conn: &Connection, instant: DateTime<Utc>) -> Result<NaiveDate> {
+    Ok(local_date_for(instant, configured_timezone(conn)?))
+}
+
+/// "Today" in the warehouse's configured timezone, read from the clock.
+pub fn today(conn: &Connection) -> Result<NaiveDate> {
+    today_as_of(conn, Utc::now())
+}
+
+/// "Today" in the warehouse's configured timezone, falling back to
+/// [`DEFAULT_TIMEZONE`] when the configured value cannot be parsed.
+///
+/// For infallible constructors. A zone this rejects would also have failed
+/// every key derivation during sync, so the fallback is unreachable in a
+/// warehouse that holds any data.
+pub fn today_or_default(conn: &Connection) -> NaiveDate {
+    let timezone = configured_timezone(conn).unwrap_or_else(|_| {
+        DEFAULT_TIMEZONE
+            .parse::<Tz>()
+            .expect("DEFAULT_TIMEZONE is a valid IANA zone")
+    });
+    local_date_for(Utc::now(), timezone)
+}
+
+/// The last *fully elapsed* day in the warehouse's configured timezone, at
+/// `instant`.
+///
+/// Coverage records must never claim a day that is still in progress: items
+/// created later in that same local day would be permanently skipped by any
+/// reader that trusts the claim. Sealing only completed days makes the
+/// watermark lag the truth instead of overstating it.
+pub fn last_complete_day_as_of(conn: &Connection, instant: DateTime<Utc>) -> Result<NaiveDate> {
+    Ok(today_as_of(conn, instant)? - Duration::days(1))
+}
+
+/// The last fully elapsed day in the configured timezone, read from the clock.
+pub fn last_complete_day(conn: &Connection) -> Result<NaiveDate> {
+    last_complete_day_as_of(conn, Utc::now())
 }
 
 /// Read the configured core-hours window (start inclusive, end exclusive).
@@ -177,5 +237,101 @@ mod tests {
         let keys = derive_local_keys(&timestamp, Los_Angeles);
         assert_eq!(keys.date_key, "2026-01-01");
         assert_eq!(keys.time_key, "22:00");
+    }
+
+    fn set_timezone(conn: &Connection, name: &str) {
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('timezone', ?1)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [name],
+        )
+        .unwrap();
+    }
+
+    /// `today` must agree with the calendar the stored `date_key` values use,
+    /// which is the configured zone's calendar — not the UTC one. Evening in a
+    /// zone behind UTC is already tomorrow in UTC.
+    #[test]
+    fn today_uses_the_configured_zone_not_utc() {
+        let warehouse = crate::GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        set_timezone(conn, "America/Los_Angeles");
+
+        // 2026-07-01T01:00:00Z is 2026-06-30 18:00 PDT: still June locally.
+        let instant = Utc.with_ymd_and_hms(2026, 7, 1, 1, 0, 0).unwrap();
+        assert_eq!(
+            today_as_of(conn, instant).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 6, 30).unwrap()
+        );
+        assert_ne!(today_as_of(conn, instant).unwrap(), instant.date_naive());
+
+        // Same rule under standard time (UTC-8), so the fix is not an offset
+        // baked in at one time of year.
+        let winter = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap();
+        assert_eq!(
+            today_as_of(conn, winter).unwrap(),
+            NaiveDate::from_ymd_opt(2025, 12, 31).unwrap()
+        );
+    }
+
+    /// The zone is read from config, so two warehouses configured differently
+    /// resolve different calendars at the same instant. Zones 26 hours apart
+    /// can never share a local date.
+    #[test]
+    fn today_is_config_driven_in_both_directions() {
+        let east = crate::GithubDW::open_in_memory().unwrap();
+        set_timezone(east.connection(), "Pacific/Kiritimati"); // UTC+14
+        let west = crate::GithubDW::open_in_memory().unwrap();
+        set_timezone(west.connection(), "Etc/GMT+12"); // UTC-12
+
+        let instant = Utc.with_ymd_and_hms(2026, 3, 10, 12, 0, 0).unwrap();
+        let east_today = today_as_of(east.connection(), instant).unwrap();
+        let west_today = today_as_of(west.connection(), instant).unwrap();
+        assert_eq!(east_today, NaiveDate::from_ymd_opt(2026, 3, 11).unwrap());
+        assert_eq!(west_today, NaiveDate::from_ymd_opt(2026, 3, 10).unwrap());
+        assert_ne!(east_today, west_today, "the zone comes from config");
+    }
+
+    /// Coverage must be sealed only through the last completed local day.
+    #[test]
+    fn last_complete_day_trails_local_today() {
+        let warehouse = crate::GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        set_timezone(conn, "America/Los_Angeles");
+
+        // Mid-afternoon UTC on 2026-08-16 is still morning of the 16th in LA:
+        // the 16th is in progress, so only the 15th is complete.
+        let instant = Utc.with_ymd_and_hms(2026, 8, 16, 16, 31, 57).unwrap();
+        assert_eq!(
+            last_complete_day_as_of(conn, instant).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 15).unwrap()
+        );
+
+        // Evening in LA: UTC has rolled to the 17th, but the 17th has not
+        // started locally, so the last complete local day is still the 15th.
+        let evening = Utc.with_ymd_and_hms(2026, 8, 17, 3, 0, 0).unwrap();
+        assert_eq!(
+            last_complete_day_as_of(conn, evening).unwrap(),
+            NaiveDate::from_ymd_opt(2026, 8, 15).unwrap()
+        );
+    }
+
+    /// `dim_date.week_key` must use the ISO week-*year*, which is what makes
+    /// the dimension self-consistent with the fact keys it is derived from at
+    /// a year boundary: 2024-12-30 belongs to ISO week 2025-W01.
+    #[test]
+    fn week_key_uses_the_iso_week_year() {
+        let warehouse = crate::GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        ensure_date_row(conn, "2024-12-30").unwrap();
+        let (week_key, year_key): (String, String) = conn
+            .query_row(
+                "SELECT week_key, year_key FROM dim_date WHERE date_key = '2024-12-30'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(week_key, "2025-W01");
+        assert_eq!(year_key, "2024", "calendar year is unaffected");
     }
 }

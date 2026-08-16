@@ -2,13 +2,14 @@
 
 pub mod types;
 
-use chrono::{NaiveDate, Utc};
+use chrono::NaiveDate;
 use rusqlite::Connection;
 use rusqlite::types::Value as SqlValue;
 
 use crate::error::Result;
 use crate::period::Period;
 use crate::query::resolve_entity_keys;
+use crate::storage::time_dimension;
 pub use types::*;
 
 /// The key a user report is labeled with when a login resolves to several.
@@ -37,10 +38,16 @@ struct Windows {
 }
 
 impl<'a> MetricsEngine<'a> {
+    /// Reference date defaults to today in the warehouse's configured
+    /// timezone — the same calendar every `date_key` is built in. A UTC
+    /// calendar date here would misplace `effective_end_date`, `is_partial`,
+    /// and `days_elapsed` by a day whenever the two calendars disagree,
+    /// skewing the partial-period truncation used for period-over-period
+    /// deltas.
     pub fn new(connection: &'a Connection) -> Self {
         Self {
             connection,
-            reference_date: Utc::now().date_naive(),
+            reference_date: time_dimension::today_or_default(connection),
         }
     }
 
@@ -48,6 +55,11 @@ impl<'a> MetricsEngine<'a> {
     pub fn as_of(mut self, reference: NaiveDate) -> Self {
         self.reference_date = reference;
         self
+    }
+
+    /// The date relative windows and partial-period truncation resolve against.
+    pub fn reference_date(&self) -> NaiveDate {
+        self.reference_date
     }
 
     fn windows(&self, period: &Period) -> Windows {
@@ -661,6 +673,42 @@ mod tests {
                ('R2', 'octo/alpha#4', 'user:alice', 'APPROVED', '2026-04-20T10:00:00Z', '2026-04-20', '10:00');",
         )
         .unwrap();
+    }
+
+    fn set_timezone(conn: &rusqlite::Connection, name: &str) {
+        conn.execute(
+            "INSERT INTO config (key, value) VALUES ('timezone', ?1)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+            [name],
+        )
+        .unwrap();
+    }
+
+    /// The default reference date must come from the warehouse's own calendar,
+    /// not the UTC one, because it is compared against `dim_date.date_key`
+    /// values built in the configured zone. Two zones 26 hours apart can never
+    /// share a local date, so this holds at every instant without a fake clock.
+    #[test]
+    fn reference_date_follows_the_configured_timezone() {
+        let east = GithubDW::open_in_memory().unwrap();
+        set_timezone(east.connection(), "Pacific/Kiritimati"); // UTC+14
+        let west = GithubDW::open_in_memory().unwrap();
+        set_timezone(west.connection(), "Etc/GMT+12"); // UTC-12
+
+        let east_reference = MetricsEngine::new(east.connection()).reference_date();
+        let west_reference = MetricsEngine::new(west.connection()).reference_date();
+        assert_ne!(
+            east_reference, west_reference,
+            "reference date is config-driven, not a single global UTC date"
+        );
+        assert_eq!(
+            east_reference,
+            crate::storage::time_dimension::today(east.connection()).unwrap(),
+        );
+        assert_eq!(
+            west_reference,
+            crate::storage::time_dimension::today(west.connection()).unwrap(),
+        );
     }
 
     #[test]
