@@ -43,14 +43,67 @@ pub struct PullRequestSummary {
     pub deletions: i64,
 }
 
-/// Normalize a login to an entity key; leave prefixed keys untouched.
-pub fn normalize_login(login: &str) -> String {
+/// Entity-key namespaces ingestion mints into `dim_entities.entity_type`.
+const ENTITY_NAMESPACES: [&str; 2] = ["user", "bot"];
+
+/// Namespace assumed for a bare login the warehouse has never seen.
+const DEFAULT_ENTITY_NAMESPACE: &str = "user";
+
+/// Strip a known `user:` / `bot:` namespace prefix and lowercase the result.
+///
+/// Roster tables (`monitored_users.login`, `user_group_member.login`) store
+/// *bare* logins, so every writer must funnel caller input through here. A
+/// prefixed spelling stored verbatim becomes a row no bare-login read can ever
+/// match, and the write reports success.
+pub fn to_bare_login(value: &str) -> String {
+    let lowered = value.to_lowercase();
+    for namespace in ENTITY_NAMESPACES {
+        if let Some(bare) = lowered.strip_prefix(&format!("{namespace}:")) {
+            return bare.to_string();
+        }
+    }
+    lowered
+}
+
+/// Resolve caller input to every entity key ingestion may have stored for it.
+///
+/// Ingestion keys an identity by its type — `user:<login>` for people,
+/// `bot:<login>` for apps — so assuming `user:` makes bot identities
+/// unreachable by their bare login (a bare `github-actions` would silently
+/// return zero rows while `bot:github-actions` matched). A bare login is
+/// therefore resolved through the indexed `dim_entities.login` column and
+/// matches whichever namespaces actually exist for it. Explicitly prefixed
+/// input is honored verbatim, so a caller can still disambiguate.
+///
+/// A login the warehouse does not know falls back to `user:<login>`, keeping a
+/// miss an empty result set rather than a match-everything wildcard.
+pub fn resolve_entity_keys(connection: &Connection, login: &str) -> Vec<String> {
     let login = login.to_lowercase();
     if login.contains(':') {
-        login
-    } else {
-        format!("user:{login}")
+        return vec![login];
     }
+    // A lookup failure degrades to the default namespace rather than
+    // propagating: the caller's filter is then exactly as selective as it was
+    // before this resolution existed.
+    let matched = lookup_entity_keys(connection, &login).unwrap_or_default();
+    if matched.is_empty() {
+        vec![format!("{DEFAULT_ENTITY_NAMESPACE}:{login}")]
+    } else {
+        matched
+    }
+}
+
+/// Every `dim_entities.entity_key` carrying this bare login, ordered for
+/// deterministic output.
+fn lookup_entity_keys(connection: &Connection, bare_login: &str) -> Result<Vec<String>> {
+    let mut statement =
+        connection.prepare("SELECT entity_key FROM dim_entities WHERE login = ?1 ORDER BY 1")?;
+    let rows = statement.query_map([bare_login], |row| row.get::<_, String>(0))?;
+    let mut keys = Vec::new();
+    for row in rows {
+        keys.push(row?);
+    }
+    Ok(keys)
 }
 
 /// Chainable query over the warehouse.
@@ -88,18 +141,22 @@ impl<'a> QueryBuilder<'a> {
     }
 
     pub fn author(mut self, login: &str) -> Self {
-        self.authors.push(normalize_login(login));
+        let keys = resolve_entity_keys(self.connection, login);
+        self.authors.extend(keys);
         self
     }
 
     pub fn authors(mut self, logins: &[String]) -> Self {
-        self.authors
-            .extend(logins.iter().map(|login| normalize_login(login)));
+        for login in logins {
+            let keys = resolve_entity_keys(self.connection, login);
+            self.authors.extend(keys);
+        }
         self
     }
 
     pub fn reviewer(mut self, login: &str) -> Self {
-        self.reviewers.push(normalize_login(login));
+        let keys = resolve_entity_keys(self.connection, login);
+        self.reviewers.extend(keys);
         self
     }
 
@@ -583,6 +640,83 @@ mod tests {
         assert_eq!(page.len(), 1);
         // Ordered created_at DESC; offset 1 skips the newest (beta 19:00Z).
         assert_eq!(page[0].pr_key, "octo/alpha#2");
+    }
+
+    /// Bots are keyed under their own namespace, so a bare login must resolve
+    /// namespace-agnostically or every bot identity is silently unreachable.
+    #[test]
+    fn bare_login_matches_bot_entities() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        seed(&warehouse);
+        let conn = warehouse.connection();
+        conn.execute_batch(
+            "INSERT INTO dim_entities (entity_key, entity_type, login, is_human, is_bot, name)
+             VALUES ('bot:github-actions', 'bot', 'github-actions', 0, 1, 'github-actions');
+             INSERT INTO fact_reviews (review_key, pr_key, reviewer_key, state, submitted_at,
+                 submitted_date_key, submitted_time_key)
+             VALUES ('R-BOT', 'octo/alpha#2', 'bot:github-actions', 'APPROVED',
+                 '2026-04-10T20:00:00Z', '2026-04-10', '10:00');",
+        )
+        .unwrap();
+
+        let bare = QueryBuilder::new(conn)
+            .reviewer("GitHub-Actions")
+            .count()
+            .unwrap();
+        assert_eq!(bare, 1, "bare login must reach a bot-namespaced reviewer");
+
+        let prefixed = QueryBuilder::new(conn)
+            .reviewer("bot:github-actions")
+            .count()
+            .unwrap();
+        assert_eq!(prefixed, 1, "explicit namespace still resolves");
+
+        let unknown = QueryBuilder::new(conn).reviewer("nobody").count().unwrap();
+        assert_eq!(unknown, 0, "an unknown login must not widen the result set");
+
+        let bot_author = QueryBuilder::new(conn)
+            .authors(&["github-actions".to_string()])
+            .count()
+            .unwrap();
+        assert_eq!(bot_author, 0, "the bot authored no PRs in this fixture");
+    }
+
+    #[test]
+    fn entity_key_resolution_and_bare_reduction() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        seed(&warehouse);
+        let conn = warehouse.connection();
+        conn.execute_batch(
+            "INSERT INTO dim_entities (entity_key, entity_type, login, is_human, is_bot, name)
+             VALUES ('bot:github-actions', 'bot', 'github-actions', 0, 1, 'github-actions'),
+                    ('user:shared-name', 'user', 'shared-name', 1, 0, 'shared-name'),
+                    ('bot:shared-name', 'bot', 'shared-name', 0, 1, 'shared-name');",
+        )
+        .unwrap();
+
+        assert_eq!(resolve_entity_keys(conn, "Alice"), vec!["user:alice"]);
+        assert_eq!(
+            resolve_entity_keys(conn, "GitHub-Actions"),
+            vec!["bot:github-actions"]
+        );
+        // A login present in both namespaces matches both, rather than one.
+        assert_eq!(
+            resolve_entity_keys(conn, "shared-name"),
+            vec!["bot:shared-name", "user:shared-name"]
+        );
+        // Explicit input is honored verbatim (lowercased).
+        assert_eq!(
+            resolve_entity_keys(conn, "Bot:GitHub-Actions"),
+            vec!["bot:github-actions"]
+        );
+        // An unknown login keeps the historical spelling: still selective.
+        assert_eq!(resolve_entity_keys(conn, "nobody"), vec!["user:nobody"]);
+
+        assert_eq!(to_bare_login("user:Alice"), "alice");
+        assert_eq!(to_bare_login("BOT:GitHub-Actions"), "github-actions");
+        assert_eq!(to_bare_login("Alice"), "alice");
+        // An unrecognized prefix is not a namespace and must survive intact.
+        assert_eq!(to_bare_login("team:backend"), "team:backend");
     }
 
     #[test]

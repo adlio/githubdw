@@ -3,6 +3,7 @@
 use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::{Error, Result};
+use crate::query::to_bare_login;
 
 /// Which kind a named group is.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -51,6 +52,18 @@ pub fn delete_group(conn: &Connection, kind: GroupKind, name: &str) -> Result<()
     Ok(())
 }
 
+/// Normalize a member identifier for storage.
+///
+/// `user_group_member.login` is declared bare, so a namespace prefix has to come
+/// off here; a prefixed member stored verbatim still *looks* queryable but never
+/// joins against `dim_entities.login`. Repository members carry no namespace.
+fn normalize_member(kind: GroupKind, member: &str) -> String {
+    match kind {
+        GroupKind::User => to_bare_login(member),
+        GroupKind::Repo => member.to_lowercase(),
+    }
+}
+
 pub fn add_members(
     conn: &Connection,
     kind: GroupKind,
@@ -73,7 +86,7 @@ pub fn add_members(
             &format!(
                 "INSERT OR IGNORE INTO {member_table} (group_name, {member_column}) VALUES (?1, ?2)"
             ),
-            params![name, member.to_lowercase()],
+            params![name, normalize_member(kind, member)],
         )?;
     }
     Ok(())
@@ -89,7 +102,7 @@ pub fn remove_members(
     for member in members {
         conn.execute(
             &format!("DELETE FROM {member_table} WHERE group_name = ?1 AND {member_column} = ?2"),
-            params![name, member.to_lowercase()],
+            params![name, normalize_member(kind, member)],
         )?;
     }
     Ok(())
@@ -222,5 +235,40 @@ mod tests {
         delete_group(conn, GroupKind::User, "core").unwrap();
         assert!(members(conn, GroupKind::User, "core").is_err());
         assert!(add_members(conn, GroupKind::User, "core", &["x".into()]).is_err());
+    }
+
+    /// Group membership is stored bare, so prefixed input has to be reduced —
+    /// otherwise the member never joins against the entity dimension.
+    #[test]
+    fn prefixed_members_are_stored_bare() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        create_group(conn, GroupKind::User, "automation", None).unwrap();
+        add_members(
+            conn,
+            GroupKind::User,
+            "automation",
+            &["bot:GitHub-Actions".into(), "user:Alice".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            members(conn, GroupKind::User, "automation").unwrap(),
+            vec!["alice", "github-actions"]
+        );
+
+        // Removal accepts either spelling.
+        remove_members(conn, GroupKind::User, "automation", &["user:alice".into()]).unwrap();
+        assert_eq!(
+            members(conn, GroupKind::User, "automation").unwrap(),
+            vec!["github-actions"]
+        );
+
+        // Repository members carry no namespace and are only lowercased.
+        create_group(conn, GroupKind::Repo, "services", None).unwrap();
+        add_members(conn, GroupKind::Repo, "services", &["Octo/Alpha".into()]).unwrap();
+        assert_eq!(
+            members(conn, GroupKind::Repo, "services").unwrap(),
+            vec!["octo/alpha"]
+        );
     }
 }

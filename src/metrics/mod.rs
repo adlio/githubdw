@@ -8,8 +8,15 @@ use rusqlite::types::Value as SqlValue;
 
 use crate::error::Result;
 use crate::period::Period;
-use crate::query::normalize_login;
+use crate::query::resolve_entity_keys;
 pub use types::*;
+
+/// The key a user report is labeled with when a login resolves to several.
+fn primary_key(keys: &[String], login: &str) -> String {
+    keys.first()
+        .cloned()
+        .unwrap_or_else(|| login.to_lowercase())
+}
 
 /// Computes user/repo/group metrics with apples-to-apples previous windows.
 pub struct MetricsEngine<'a> {
@@ -186,18 +193,25 @@ impl<'a> MetricsEngine<'a> {
     // ===== User metrics =====
 
     pub fn user_metrics(&self, login: &str, period: &Period) -> Result<UserMetrics> {
-        let user_key = normalize_login(login);
+        // An identity may be keyed under any namespace ingestion mints, so match
+        // every key the login resolves to instead of one assumed spelling.
+        let user_keys = resolve_entity_keys(self.connection, login);
+        let placeholders = vec!["?"; user_keys.len()].join(", ");
         let windows = self.windows(period);
-        let user_parameter = vec![SqlValue::Text(user_key.clone())];
-        let both_parameter = vec![
-            SqlValue::Text(user_key.clone()),
-            SqlValue::Text(user_key.clone()),
-        ];
+        let user_parameter: Vec<SqlValue> = user_keys
+            .iter()
+            .map(|key| SqlValue::Text(key.clone()))
+            .collect();
+        let both_parameter: Vec<SqlValue> = user_parameter
+            .iter()
+            .chain(user_parameter.iter())
+            .cloned()
+            .collect();
 
         let prs_opened = self.split_measure(
             "fact_pull_requests p",
             "p.created_date_key",
-            "AND p.author_key = ?",
+            &format!("AND p.author_key IN ({placeholders})"),
             "1",
             &user_parameter,
             &windows,
@@ -205,7 +219,7 @@ impl<'a> MetricsEngine<'a> {
         let prs_merged = self.split_measure(
             "fact_pull_requests p",
             "p.created_date_key",
-            "AND p.author_key = ? AND p.state = 'MERGED'",
+            &format!("AND p.author_key IN ({placeholders}) AND p.state = 'MERGED'"),
             "1",
             &user_parameter,
             &windows,
@@ -213,7 +227,9 @@ impl<'a> MetricsEngine<'a> {
         let reviews_given = self.split_measure(
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
-            "AND fr.reviewer_key = ? AND p.author_key <> ?",
+            &format!(
+                "AND fr.reviewer_key IN ({placeholders}) AND p.author_key NOT IN ({placeholders})"
+            ),
             "1",
             &both_parameter,
             &windows,
@@ -221,7 +237,9 @@ impl<'a> MetricsEngine<'a> {
         let reviews_received = self.split_measure(
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
-            "AND p.author_key = ? AND fr.reviewer_key <> ?",
+            &format!(
+                "AND p.author_key IN ({placeholders}) AND fr.reviewer_key NOT IN ({placeholders})"
+            ),
             "1",
             &both_parameter,
             &windows,
@@ -233,7 +251,9 @@ impl<'a> MetricsEngine<'a> {
               FROM fact_issue_comments WHERE parent_type = 'pull_request') fc
              JOIN fact_pull_requests p ON p.pr_key = fc.pr_key",
             "fc.created_date_key",
-            "AND fc.author_key = ? AND p.author_key <> ?",
+            &format!(
+                "AND fc.author_key IN ({placeholders}) AND p.author_key NOT IN ({placeholders})"
+            ),
             "1",
             &both_parameter,
             &windows,
@@ -241,7 +261,7 @@ impl<'a> MetricsEngine<'a> {
         let lines_added = self.split_measure(
             "fact_pull_requests p",
             "p.created_date_key",
-            "AND p.author_key = ?",
+            &format!("AND p.author_key IN ({placeholders})"),
             "p.additions",
             &user_parameter,
             &windows,
@@ -249,14 +269,14 @@ impl<'a> MetricsEngine<'a> {
         let lines_removed = self.split_measure(
             "fact_pull_requests p",
             "p.created_date_key",
-            "AND p.author_key = ?",
+            &format!("AND p.author_key IN ({placeholders})"),
             "p.deletions",
             &user_parameter,
             &windows,
         )?;
 
         Ok(UserMetrics {
-            login: user_key,
+            login: primary_key(&user_keys, login),
             period_key: windows.period_key.clone(),
             previous_period_key: windows.previous_period_key.clone(),
             current_date_range: (windows.current_start.clone(), windows.current_end.clone()),
@@ -277,19 +297,24 @@ impl<'a> MetricsEngine<'a> {
         period: &Period,
         top: u32,
     ) -> Result<UserAggregations> {
-        let user_key = normalize_login(login);
+        let user_keys = resolve_entity_keys(self.connection, login);
+        let placeholders = vec!["?"; user_keys.len()].join(", ");
         let windows = self.windows(period);
-        let user_parameter = vec![SqlValue::Text(user_key.clone())];
-        let both_parameter = vec![
-            SqlValue::Text(user_key.clone()),
-            SqlValue::Text(user_key.clone()),
-        ];
+        let user_parameter: Vec<SqlValue> = user_keys
+            .iter()
+            .map(|key| SqlValue::Text(key.clone()))
+            .collect();
+        let both_parameter: Vec<SqlValue> = user_parameter
+            .iter()
+            .chain(user_parameter.iter())
+            .cloned()
+            .collect();
 
         let top_repos = self.leaderboard(
             "p.repo_key",
             "fact_pull_requests p",
             "p.created_date_key",
-            "AND p.author_key = ?",
+            &format!("AND p.author_key IN ({placeholders})"),
             &user_parameter,
             &windows,
             top,
@@ -298,7 +323,9 @@ impl<'a> MetricsEngine<'a> {
             "fr.reviewer_key",
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
-            "AND p.author_key = ? AND fr.reviewer_key <> ?",
+            &format!(
+                "AND p.author_key IN ({placeholders}) AND fr.reviewer_key NOT IN ({placeholders})"
+            ),
             &both_parameter,
             &windows,
             top,
@@ -307,7 +334,9 @@ impl<'a> MetricsEngine<'a> {
             "p.author_key",
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
-            "AND fr.reviewer_key = ? AND p.author_key <> ?",
+            &format!(
+                "AND fr.reviewer_key IN ({placeholders}) AND p.author_key NOT IN ({placeholders})"
+            ),
             &both_parameter,
             &windows,
             top,
@@ -470,7 +499,10 @@ impl<'a> MetricsEngine<'a> {
         logins: &[String],
         period: &Period,
     ) -> Result<GroupMetrics> {
-        let member_keys: Vec<String> = logins.iter().map(|login| normalize_login(login)).collect();
+        let member_keys: Vec<String> = logins
+            .iter()
+            .flat_map(|login| resolve_entity_keys(self.connection, login))
+            .collect();
         let windows = self.windows(period);
         let placeholders = vec!["?"; member_keys.len()].join(", ");
         let member_parameters: Vec<SqlValue> = member_keys
@@ -652,6 +684,50 @@ mod tests {
         );
         assert_eq!(metrics.lines_added.current, 50);
         assert_eq!(metrics.lines_added.previous, 100);
+    }
+
+    /// A bot's activity must be reportable by its bare login, exactly as a
+    /// person's is.
+    #[test]
+    fn user_metrics_resolve_bot_logins() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        seed(&warehouse);
+        let conn = warehouse.connection();
+        conn.execute_batch(
+            "INSERT INTO dim_entities (entity_key, entity_type, login, is_human, is_bot, name)
+             VALUES ('bot:github-actions', 'bot', 'github-actions', 0, 1, 'github-actions');
+             INSERT INTO fact_reviews (review_key, pr_key, reviewer_key, state, submitted_at,
+                 submitted_date_key, submitted_time_key)
+             VALUES ('R-BOT', 'octo/alpha#3', 'bot:github-actions', 'APPROVED',
+                 '2026-04-10T20:00:00Z', '2026-04-10', '10:00');",
+        )
+        .unwrap();
+        let engine = MetricsEngine::new(conn).as_of(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+
+        let metrics = engine
+            .user_metrics("GitHub-Actions", &Period::Quarter(2026, 2))
+            .unwrap();
+        assert_eq!(metrics.login, "bot:github-actions");
+        assert_eq!(metrics.reviews_given.current, 1);
+        assert_eq!(metrics.prs_opened.current, 0);
+
+        let aggregations = engine
+            .user_aggregations("github-actions", &Period::Quarter(2026, 2), 5)
+            .unwrap();
+        assert_eq!(
+            aggregations.top_reviewed_authors[0].entity_key,
+            "user:alice"
+        );
+
+        // The group path resolves each member the same way.
+        let group = engine
+            .user_group_metrics(
+                "automation",
+                &["github-actions".to_string()],
+                &Period::Quarter(2026, 2),
+            )
+            .unwrap();
+        assert_eq!(group.reviews_given.unwrap().current, 1);
     }
 
     #[test]
