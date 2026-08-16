@@ -3,6 +3,7 @@
 use rusqlite::Connection;
 
 use crate::error::{Error, Result};
+use crate::query::to_bare_login;
 
 /// A monitored source, uniformly described.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,9 +28,11 @@ pub fn add_repo(conn: &Connection, repository: &str) -> Result<()> {
 }
 
 pub fn add_user(conn: &Connection, login: &str) -> Result<()> {
+    // `monitored_users.login` is declared bare, so a prefixed spelling has to be
+    // reduced here — stored verbatim it would be a row no read path can reach.
     conn.execute(
         "INSERT OR IGNORE INTO monitored_users (login) VALUES (?1)",
-        [login.to_lowercase()],
+        [to_bare_login(login)],
     )?;
     Ok(())
 }
@@ -53,7 +56,9 @@ pub fn remove(conn: &Connection, identifier: &str) -> Result<usize> {
     )?;
     removed += conn.execute(
         "DELETE FROM monitored_users WHERE login = ?1",
-        [&identifier],
+        // Same reduction as `add_user`, so a source added by either spelling is
+        // removable by either spelling.
+        [to_bare_login(&identifier)],
     )?;
     removed += conn.execute(
         "DELETE FROM monitored_orgs WHERE org_login = ?1",
@@ -121,5 +126,39 @@ mod tests {
     fn add_repo_requires_owner_name_form() {
         let warehouse = GithubDW::open_in_memory().unwrap();
         assert!(add_repo(warehouse.connection(), "not-a-repo").is_err());
+    }
+
+    /// A namespace-prefixed login must be reduced to the bare form the column is
+    /// declared to hold, or the row is unreachable by every read path.
+    #[test]
+    fn prefixed_user_input_is_stored_bare() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        add_user(conn, "user:Octocat").unwrap();
+        add_user(conn, "bot:GitHub-Actions").unwrap();
+
+        let stored: Vec<String> = list(conn)
+            .unwrap()
+            .into_iter()
+            .filter(|source| source.source_type == "user")
+            .map(|source| source.identifier)
+            .collect();
+        assert_eq!(stored, vec!["github-actions", "octocat"]);
+
+        // Adding the bare spelling of an existing row is a no-op, not a duplicate.
+        add_user(conn, "octocat").unwrap();
+        assert_eq!(
+            list(conn)
+                .unwrap()
+                .iter()
+                .filter(|source| source.source_type == "user")
+                .count(),
+            2
+        );
+
+        // Removal accepts either spelling.
+        assert_eq!(remove(conn, "user:octocat").unwrap(), 1);
+        assert_eq!(remove(conn, "github-actions").unwrap(), 1);
+        assert!(list(conn).unwrap().is_empty());
     }
 }
