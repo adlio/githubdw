@@ -282,6 +282,16 @@ fn parse_date_argument(text: &str) -> githubdw::Result<chrono::NaiveDate> {
         .map_err(|error| githubdw::Error::InvalidArgument(format!("bad date '{text}': {error}")))
 }
 
+/// Today in the warehouse's configured timezone.
+///
+/// Relative periods (`this-quarter`, `last-30`, ...) are compared against
+/// `*_date_key` columns, which are built in that zone. Resolving them against
+/// the UTC calendar date shifts every window by a day for the hours when the
+/// two calendars disagree.
+fn today(connection: &rusqlite::Connection) -> githubdw::Result<chrono::NaiveDate> {
+    githubdw::storage::time_dimension::today(connection)
+}
+
 fn print_grouped(rows: Vec<(String, u64)>) {
     for (group, count) in rows {
         println!("{group}\t{count}");
@@ -594,7 +604,8 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
                 builder = builder.state(parsed);
             }
             if let Some(period_text) = period.as_deref() {
-                let parsed = githubdw::Period::parse(period_text)?;
+                let parsed =
+                    githubdw::Period::parse_with_reference(period_text, today(connection)?)?;
                 match parsed {
                     githubdw::Period::Rolling(..) => {
                         let (start, end) = parsed.date_range();
@@ -652,6 +663,9 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
         Command::Metrics { command } => {
             let warehouse = open_warehouse(command_line.db)?;
             let connection = warehouse.connection();
+            // Relative periods resolve in the warehouse's own calendar, the
+            // same one every stored date key is built in.
+            let reference_date = today(connection)?;
             let engine = githubdw::metrics::MetricsEngine::new(connection);
             match command {
                 MetricsCommand::User {
@@ -660,7 +674,7 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
                     top,
                     json,
                 } => {
-                    let period = githubdw::Period::parse(&period)?;
+                    let period = githubdw::Period::parse_with_reference(&period, reference_date)?;
                     let metrics = engine.user_metrics(&login, &period)?;
                     let aggregations = engine.user_aggregations(&login, &period, top)?;
                     if json {
@@ -697,7 +711,7 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
                     top,
                     json,
                 } => {
-                    let period = githubdw::Period::parse(&period)?;
+                    let period = githubdw::Period::parse_with_reference(&period, reference_date)?;
                     let metrics = engine.repo_metrics(&repository, &period)?;
                     let aggregations = engine.repo_aggregations(&repository, &period, top)?;
                     if json {
@@ -727,7 +741,7 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
                     }
                 }
                 MetricsCommand::Group { name, period, json } => {
-                    let period = githubdw::Period::parse(&period)?;
+                    let period = githubdw::Period::parse_with_reference(&period, reference_date)?;
                     let kind = githubdw::groups::kind_of(connection, &name)?;
                     let group_metrics = match kind {
                         githubdw::groups::GroupKind::User => {

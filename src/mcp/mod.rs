@@ -29,6 +29,7 @@ use crate::period::Period;
 use crate::query::QueryBuilder;
 use crate::search::{SearchOptions, SearchScope};
 use crate::storage::monitor_repository;
+use crate::storage::time_dimension;
 use params::*;
 
 /// The MCP server. The warehouse sits behind a Mutex: stdio MCP dispatches
@@ -207,8 +208,9 @@ impl GithubDwServer {
             builder = builder.state(parsed);
         }
         if let Some(period_text) = params.period.as_deref() {
-            let parsed =
-                Period::parse(period_text).map_err(|error| invalid_params(error.to_string()))?;
+            let reference = time_dimension::today(connection).map_err(internal_error)?;
+            let parsed = Period::parse_with_reference(period_text, reference)
+                .map_err(|error| invalid_params(error.to_string()))?;
             match parsed {
                 Period::Rolling(..) => {
                     let (start, end) = parsed.date_range();
@@ -258,8 +260,9 @@ impl GithubDwServer {
         let params: MetricsParams = parse_params(args)?;
         let warehouse = self.warehouse.lock().map_err(internal_error)?;
         let connection = warehouse.connection();
-        let period =
-            Period::parse(&params.period).map_err(|error| invalid_params(error.to_string()))?;
+        let reference = time_dimension::today(connection).map_err(internal_error)?;
+        let period = Period::parse_with_reference(&params.period, reference)
+            .map_err(|error| invalid_params(error.to_string()))?;
         let engine = MetricsEngine::new(connection);
         let response = match params.entity_type.as_str() {
             "user" => {

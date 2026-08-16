@@ -1,6 +1,7 @@
 //! The `Period` type: every time filter and metric window.
 
-use chrono::{Datelike, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Datelike, Duration, NaiveDate, Utc};
+use chrono_tz::Tz;
 
 use crate::error::{Error, Result};
 
@@ -31,10 +32,39 @@ impl Period {
     }
 
     /// Parse `2026`, `2026-H1`, `2026-Q1`, `2026-01`, `2026-M1`, `2026-W02`,
-    /// `last-N`, `this-*`, `previous-*`.
+    /// `last-N`, `this-*`, `previous-*` against the UTC calendar date.
+    ///
+    /// # Deprecated
+    ///
+    /// Relative forms (`this-*`, `previous-*`, `last-N`) are resolved against
+    /// a reference date, and that date must come from the same calendar the
+    /// warehouse's `date_key` columns use — the configured IANA zone, not UTC.
+    /// Using the UTC date shifts every relative window by one day for the
+    /// hours when the two calendars disagree, which at a quarter or year
+    /// boundary answers about the wrong period entirely.
+    ///
+    /// Use [`Period::parse_in_zone`] (or [`Period::parse_with_reference`] with
+    /// `storage::time_dimension::today`) instead.
+    #[deprecated(
+        since = "0.2.2",
+        note = "resolves relative periods against the UTC date; use parse_in_zone or \
+                parse_with_reference with the warehouse timezone"
+    )]
     pub fn parse(text: &str) -> Result<Self> {
-        let today = Utc::now().date_naive();
-        Self::parse_with_reference(text, today)
+        Self::parse_with_reference(text, Utc::now().date_naive())
+    }
+
+    /// Parse against "now" as seen in `timezone`. DST-aware.
+    pub fn parse_in_zone(text: &str, timezone: Tz) -> Result<Self> {
+        Self::parse_as_of(text, Utc::now(), timezone)
+    }
+
+    /// Parse against a specific instant as seen in `timezone`.
+    ///
+    /// The injectable form: pass the instant rather than reading a clock so
+    /// relative-period resolution is deterministic.
+    pub fn parse_as_of(text: &str, instant: DateTime<Utc>, timezone: Tz) -> Result<Self> {
+        Self::parse_with_reference(text, instant.with_timezone(&timezone).date_naive())
     }
 
     /// Parse with an explicit reference date (testable).
@@ -266,21 +296,103 @@ fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+    use chrono_tz::America::Los_Angeles;
+    use chrono_tz::Pacific::Kiritimati;
+
+    /// Reference date for the absolute forms, where it is not consulted.
+    fn any_reference() -> NaiveDate {
+        NaiveDate::from_ymd_opt(2026, 7, 24).unwrap()
+    }
+
+    fn parse(text: &str) -> Result<Period> {
+        Period::parse_with_reference(text, any_reference())
+    }
 
     #[test]
     fn parses_all_forms() {
-        assert_eq!(Period::parse("2026").unwrap(), Period::Year(2026));
-        assert_eq!(Period::parse("2026-H1").unwrap(), Period::Half(2026, 1));
-        assert_eq!(Period::parse("2026-Q3").unwrap(), Period::Quarter(2026, 3));
-        assert_eq!(Period::parse("2026-01").unwrap(), Period::Month(2026, 1));
-        assert_eq!(Period::parse("2026-M1").unwrap(), Period::Month(2026, 1));
-        assert_eq!(Period::parse("2026-W02").unwrap(), Period::Week(2026, 2));
-        assert!(matches!(
-            Period::parse("last-30").unwrap(),
-            Period::Rolling(30, _)
-        ));
-        assert!(Period::parse("garbage").is_err());
-        assert!(Period::parse("2026-Q5").is_err());
+        assert_eq!(parse("2026").unwrap(), Period::Year(2026));
+        assert_eq!(parse("2026-H1").unwrap(), Period::Half(2026, 1));
+        assert_eq!(parse("2026-Q3").unwrap(), Period::Quarter(2026, 3));
+        assert_eq!(parse("2026-01").unwrap(), Period::Month(2026, 1));
+        assert_eq!(parse("2026-M1").unwrap(), Period::Month(2026, 1));
+        assert_eq!(parse("2026-W02").unwrap(), Period::Week(2026, 2));
+        assert!(matches!(parse("last-30").unwrap(), Period::Rolling(30, _)));
+        assert!(parse("garbage").is_err());
+        assert!(parse("2026-Q5").is_err());
+    }
+
+    /// The defect this pins: an evening instant in a zone behind UTC is
+    /// already the next UTC day, so a UTC-derived reference date resolves
+    /// relative periods against a calendar the warehouse does not use.
+    ///
+    /// 2026-07-01T01:00:00Z is 2026-06-30 18:00 in Los Angeles. Every
+    /// assertion below is the Los Angeles answer; the commented UTC answer is
+    /// what the old code returned.
+    #[test]
+    fn relative_periods_resolve_in_the_target_zone_not_utc() {
+        let evening_pdt = Utc.with_ymd_and_hms(2026, 7, 1, 1, 0, 0).unwrap();
+
+        // Quarter boundary: the quarter that just ended, not the new one.
+        assert_eq!(
+            Period::parse_as_of("this-quarter", evening_pdt, Los_Angeles).unwrap(),
+            Period::Quarter(2026, 2),
+        );
+        assert_eq!(
+            Period::parse_as_of("previous-quarter", evening_pdt, Los_Angeles).unwrap(),
+            Period::Quarter(2026, 1),
+        );
+        assert_eq!(
+            Period::parse_as_of("this-month", evening_pdt, Los_Angeles).unwrap(),
+            Period::Month(2026, 6),
+        );
+
+        // Rolling window: ends on the local day, not the UTC one.
+        let rolling = Period::parse_as_of("last-30", evening_pdt, Los_Angeles).unwrap();
+        let (start, end) = rolling.date_range();
+        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 6, 30).unwrap());
+        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+
+        // For contrast, the UTC calendar gives the wrong quarter and a window
+        // shifted a day forward — including a day still in progress locally.
+        let utc_answer =
+            Period::parse_with_reference("this-quarter", evening_pdt.date_naive()).unwrap();
+        assert_eq!(utc_answer, Period::Quarter(2026, 3), "the old behavior");
+    }
+
+    /// Same rule under standard time, so the fix is a zone conversion rather
+    /// than a fixed offset: 2026-01-01T01:00:00Z is 2025-12-31 17:00 PST.
+    #[test]
+    fn relative_periods_are_dst_aware_at_a_year_boundary() {
+        let evening_pst = Utc.with_ymd_and_hms(2026, 1, 1, 1, 0, 0).unwrap();
+        assert_eq!(
+            Period::parse_as_of("this-year", evening_pst, Los_Angeles).unwrap(),
+            Period::Year(2025),
+        );
+        assert_eq!(
+            Period::parse_as_of("this-quarter", evening_pst, Los_Angeles).unwrap(),
+            Period::Quarter(2025, 4),
+        );
+        assert_eq!(
+            Period::parse_as_of("this-week", evening_pst, Los_Angeles).unwrap(),
+            Period::Week(2026, 1),
+            "ISO week 2026-W01 contains 2025-12-31",
+        );
+    }
+
+    /// A zone ahead of UTC shifts the other way, so nothing here is hardcoded
+    /// to "one day earlier": 2026-06-30T12:00:00Z is 2026-07-01 in Kiritimati.
+    #[test]
+    fn relative_periods_resolve_forward_in_an_eastern_zone() {
+        let instant = Utc.with_ymd_and_hms(2026, 6, 30, 12, 0, 0).unwrap();
+        assert_eq!(
+            Period::parse_as_of("this-quarter", instant, Kiritimati).unwrap(),
+            Period::Quarter(2026, 3),
+        );
+        assert_eq!(
+            Period::parse_as_of("this-quarter", instant, Los_Angeles).unwrap(),
+            Period::Quarter(2026, 2),
+        );
     }
 
     #[test]
