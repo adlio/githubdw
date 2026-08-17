@@ -4,6 +4,7 @@ use rusqlite::Connection;
 use serde::Serialize;
 
 use crate::error::Result;
+use crate::query::{entity_namespace, to_bare_login};
 
 /// Which corpora to search.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -24,7 +25,10 @@ pub struct SearchHit {
     pub kind: String,
     pub repository: Option<String>,
     pub title: Option<String>,
+    /// The author's login, exactly as GitHub spells it — never namespaced.
     pub author: Option<String>,
+    /// The namespace that login was stored under: `user` or `bot`.
+    pub author_type: Option<String>,
     pub state: Option<String>,
     /// Highlighted snippet with [ ] markers, ~64 chars of context.
     pub snippet: String,
@@ -53,6 +57,21 @@ fn fts_quote(query: &str) -> String {
     format!("\"{}\"", query.replace('"', "\"\""))
 }
 
+/// The author of a hit, as a login plus its type.
+///
+/// The joined dimension row is authoritative; splitting the warehouse key is
+/// the fallback, so a hit whose author dimension is missing still reports a
+/// bare login rather than a raw key, and is never dropped from the results.
+fn author_identity(
+    author_key: Option<String>,
+    login: Option<String>,
+    entity_type: Option<String>,
+) -> (Option<String>, Option<String>) {
+    let author = login.or_else(|| author_key.as_deref().map(to_bare_login));
+    let author_type = entity_type.or_else(|| author_key.as_deref().map(entity_namespace));
+    (author, author_type)
+}
+
 /// Search the warehouse. Results are merged across corpora and ordered by rank.
 pub fn search(
     connection: &Connection,
@@ -65,9 +84,11 @@ pub fn search(
 
     if matches!(options.scope, SearchScope::All | SearchScope::PullRequests) {
         let sql = "SELECT f.pr_key, p.repo_key, p.title, p.author_key, p.state,
-                          snippet(pull_requests_fts, -1, '[', ']', '…', 12), rank
+                          snippet(pull_requests_fts, -1, '[', ']', '…', 12), rank,
+                          ae.login, ae.entity_type
                    FROM pull_requests_fts f
                    JOIN fact_pull_requests p ON p.pr_key = f.pr_key
+                   LEFT JOIN dim_entities ae ON ae.entity_key = p.author_key
                    WHERE pull_requests_fts MATCH ?1
                      AND (?2 IS NULL OR p.repo_key = ?2)
                    ORDER BY rank LIMIT ?3";
@@ -75,12 +96,14 @@ pub fn search(
         let rows = statement.query_map(
             rusqlite::params![quoted, options.repository, limit],
             |row| {
+                let (author, author_type) = author_identity(row.get(3)?, row.get(7)?, row.get(8)?);
                 Ok(SearchHit {
                     key: row.get(0)?,
                     kind: "pull_request".into(),
                     repository: row.get(1)?,
                     title: row.get(2)?,
-                    author: row.get(3)?,
+                    author,
+                    author_type,
                     state: row.get(4)?,
                     snippet: row.get(5)?,
                     rank: row.get(6)?,
@@ -94,9 +117,11 @@ pub fn search(
 
     if matches!(options.scope, SearchScope::All | SearchScope::Issues) {
         let sql = "SELECT i.repo_key || '#' || i.number, i.repo_key, i.title, i.author_key,
-                          i.state, snippet(issues_fts, -1, '[', ']', '…', 12), rank
+                          i.state, snippet(issues_fts, -1, '[', ']', '…', 12), rank,
+                          ae.login, ae.entity_type
                    FROM issues_fts f
                    JOIN issues i ON i.id = f.id
+                   LEFT JOIN dim_entities ae ON ae.entity_key = i.author_key
                    WHERE issues_fts MATCH ?1
                      AND (?2 IS NULL OR i.repo_key = ?2)
                    ORDER BY rank LIMIT ?3";
@@ -104,12 +129,14 @@ pub fn search(
         let rows = statement.query_map(
             rusqlite::params![quoted, options.repository, limit],
             |row| {
+                let (author, author_type) = author_identity(row.get(3)?, row.get(7)?, row.get(8)?);
                 Ok(SearchHit {
                     key: row.get(0)?,
                     kind: "issue".into(),
                     repository: row.get(1)?,
                     title: row.get(2)?,
-                    author: row.get(3)?,
+                    author,
+                    author_type,
                     state: row.get(4)?,
                     snippet: row.get(5)?,
                     rank: row.get(6)?,
@@ -123,10 +150,12 @@ pub fn search(
 
     if matches!(options.scope, SearchScope::All | SearchScope::Comments) {
         let sql = "SELECT c.comment_key, c.pr_key, p.repo_key, p.title, c.author_key,
-                          snippet(review_comments_fts, -1, '[', ']', '…', 12), rank
+                          snippet(review_comments_fts, -1, '[', ']', '…', 12), rank,
+                          ae.login, ae.entity_type
                    FROM review_comments_fts f
                    JOIN fact_review_comments c ON c.comment_key = f.comment_key
                    JOIN fact_pull_requests p ON p.pr_key = c.pr_key
+                   LEFT JOIN dim_entities ae ON ae.entity_key = c.author_key
                    WHERE review_comments_fts MATCH ?1
                      AND (?2 IS NULL OR p.repo_key = ?2)
                    ORDER BY rank LIMIT ?3";
@@ -134,12 +163,14 @@ pub fn search(
         let rows = statement.query_map(
             rusqlite::params![quoted, options.repository, limit],
             |row| {
+                let (author, author_type) = author_identity(row.get(4)?, row.get(7)?, row.get(8)?);
                 Ok(SearchHit {
                     key: row.get::<_, String>(1)?, // anchor to the PR
                     kind: "review_comment".into(),
                     repository: row.get(2)?,
                     title: row.get(3)?,
-                    author: row.get(4)?,
+                    author,
+                    author_type,
                     state: None,
                     snippet: row.get(5)?,
                     rank: row.get(6)?,
@@ -151,9 +182,11 @@ pub fn search(
         }
 
         let sql = "SELECT c.comment_key, c.parent_key, c.author_key,
-                          snippet(issue_comments_fts, -1, '[', ']', '…', 12), rank
+                          snippet(issue_comments_fts, -1, '[', ']', '…', 12), rank,
+                          ae.login, ae.entity_type
                    FROM issue_comments_fts f
                    JOIN fact_issue_comments c ON c.comment_key = f.comment_key
+                   LEFT JOIN dim_entities ae ON ae.entity_key = c.author_key
                    WHERE issue_comments_fts MATCH ?1
                      AND (?2 IS NULL OR c.parent_key LIKE ?2 || '%'
                           OR c.parent_key IN (SELECT id FROM issues WHERE repo_key = ?2))
@@ -162,12 +195,14 @@ pub fn search(
         let rows = statement.query_map(
             rusqlite::params![quoted, options.repository, limit],
             |row| {
+                let (author, author_type) = author_identity(row.get(2)?, row.get(5)?, row.get(6)?);
                 Ok(SearchHit {
                     key: row.get::<_, String>(1)?, // parent PR key or issue id
                     kind: "issue_comment".into(),
                     repository: None,
                     title: None,
-                    author: row.get(2)?,
+                    author,
+                    author_type,
                     state: None,
                     snippet: row.get(3)?,
                     rank: row.get(4)?,
@@ -255,6 +290,50 @@ mod tests {
         assert!(!hits.is_empty());
     }
 
+    /// A search hit names its author the way GitHub does. The warehouse's
+    /// namespaced key is an internal join target, so the type it encodes is
+    /// carried in its own field instead.
+    #[test]
+    fn hits_report_a_bare_author_and_its_type() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        seed(&warehouse);
+        warehouse
+            .connection()
+            .execute_batch(
+                "INSERT INTO dim_entities (entity_key, entity_type, login, is_human, is_bot, name)
+                 VALUES ('bot:builder', 'bot', 'builder', 0, 1, 'builder');
+                 INSERT INTO fact_pull_requests (pr_key, number, repo_key, author_key, state,
+                     title, body, created_at, created_date_key, created_time_key)
+                 VALUES ('octo/beta#3', 3, 'octo/beta', 'bot:builder', 'OPEN',
+                         'Bump the connection library', 'Automated dependency bump',
+                         '2026-01-10T20:00:00Z', '2026-01-10', '10:00');",
+            )
+            .unwrap();
+
+        let hits = search(
+            warehouse.connection(),
+            "connection",
+            &SearchOptions::default(),
+        )
+        .unwrap();
+        assert!(!hits.is_empty());
+        for hit in &hits {
+            if let Some(author) = hit.author.as_deref() {
+                assert!(!author.contains(':'), "author '{author}' is bare");
+            }
+        }
+        let bot_hit = hits
+            .iter()
+            .find(|hit| hit.author.as_deref() == Some("builder"))
+            .expect("the bot-authored PR is found by its bare login");
+        assert_eq!(bot_hit.author_type.as_deref(), Some("bot"));
+
+        let human_hit = hits
+            .iter()
+            .find(|hit| hit.author.as_deref() == Some("alice"))
+            .expect("the person-authored PR is found by its bare login");
+        assert_eq!(human_hit.author_type.as_deref(), Some("user"));
+    }
     #[test]
     fn scope_and_repository_filters() {
         let warehouse = GithubDW::open_in_memory().unwrap();

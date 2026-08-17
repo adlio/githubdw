@@ -32,7 +32,13 @@ pub struct PullRequestSummary {
     pub pr_key: String,
     pub number: i64,
     pub repo_key: String,
+    /// The author's login, exactly as GitHub spells it — never namespaced.
     pub author: String,
+    /// The namespace that login was stored under: `user` or `bot`.
+    pub author_type: String,
+    /// The warehouse key for the author, for callers joining back to the
+    /// star schema. Always `author_type` + `:` + `author`.
+    pub author_key: String,
     pub state: String,
     pub title: Option<String>,
     pub created_at: String,
@@ -41,6 +47,15 @@ pub struct PullRequestSummary {
     pub review_count: i64,
     pub additions: i64,
     pub deletions: i64,
+}
+
+impl PullRequestSummary {
+    /// The author for a single-column display: the bare login, with bots
+    /// marked. A row has one author column in table output, so the marker is
+    /// what keeps a bot from reading as the person who shares its login.
+    pub fn author_display(&self) -> String {
+        display_identity(&self.author, &self.author_type)
+    }
 }
 
 /// Entity-key namespaces ingestion mints into `dim_entities.entity_type`.
@@ -63,6 +78,35 @@ pub fn to_bare_login(value: &str) -> String {
         }
     }
     lowered
+}
+
+/// The namespace half of an entity key (`bot:builder` → `bot`).
+///
+/// Only used to recover the type when a key could not be joined back to
+/// `dim_entities`; an unrecognized spelling degrades to the default namespace
+/// rather than surfacing the raw key to a caller.
+pub fn entity_namespace(entity_key: &str) -> String {
+    entity_key
+        .split_once(':')
+        .map(|(namespace, _)| namespace.to_lowercase())
+        .filter(|namespace| ENTITY_NAMESPACES.contains(&namespace.as_str()))
+        .unwrap_or_else(|| DEFAULT_ENTITY_NAMESPACE.to_string())
+}
+
+/// Render one identity for a single display column: the bare login, with bots
+/// marked.
+///
+/// Human-facing output shows the login GitHub itself uses, so a value read off
+/// the screen can be typed back into any GitHub surface. That drops the
+/// namespace, and with it the one thing the namespace was doing for a reader —
+/// telling a bot apart from a person of the same name — so bots carry a visible
+/// marker instead of a machine prefix.
+pub fn display_identity(login: &str, entity_type: &str) -> String {
+    if entity_type == "bot" {
+        format!("{login} [bot]")
+    } else {
+        login.to_string()
+    }
 }
 
 /// Resolve caller input to every entity key ingestion may have stored for it.
@@ -331,22 +375,30 @@ impl<'a> QueryBuilder<'a> {
     /// Matching PRs ordered by created_at DESC. Honors limit/offset.
     pub fn pull_requests(self) -> Result<Vec<PullRequestSummary>> {
         let (joins, conditions, parameters) = self.assemble();
+        // The author is resolved back to `dim_entities` so callers get the login
+        // GitHub uses. LEFT so the join can only add columns, never drop a row.
         let sql = format!(
             "SELECT DISTINCT p.pr_key, p.number, p.repo_key, p.author_key, p.state, p.title,
                     p.created_at, p.merged_at, p.comment_count, p.review_count,
-                    p.additions, p.deletions
-             FROM fact_pull_requests p {joins} {}
+                    p.additions, p.deletions, ae.login, ae.entity_type
+             FROM fact_pull_requests p {joins}
+             LEFT JOIN dim_entities ae ON ae.entity_key = p.author_key {}
              ORDER BY p.created_at DESC{}",
             Self::where_clause(&conditions),
             self.pagination_clause(),
         );
         let mut statement = self.connection.prepare(&sql)?;
         let rows = statement.query_map(rusqlite::params_from_iter(parameters), |row| {
+            let author_key: String = row.get(3)?;
+            let login: Option<String> = row.get(12)?;
+            let entity_type: Option<String> = row.get(13)?;
             Ok(PullRequestSummary {
                 pr_key: row.get(0)?,
                 number: row.get(1)?,
                 repo_key: row.get(2)?,
-                author: row.get(3)?,
+                author: login.unwrap_or_else(|| to_bare_login(&author_key)),
+                author_type: entity_type.unwrap_or_else(|| entity_namespace(&author_key)),
+                author_key,
                 state: row.get(4)?,
                 title: row.get(5)?,
                 created_at: row.get(6)?,
@@ -405,9 +457,14 @@ impl<'a> QueryBuilder<'a> {
         } else {
             ""
         };
+        let entity_join = if group_expression.contains("ae.") {
+            " LEFT JOIN dim_entities ae ON ae.entity_key = p.author_key"
+        } else {
+            ""
+        };
         let sql = format!(
             "SELECT {group_expression} AS grp, COUNT(DISTINCT p.pr_key) AS cnt
-             FROM fact_pull_requests p {joins}{date_join} {}
+             FROM fact_pull_requests p {joins}{date_join}{entity_join} {}
              GROUP BY grp ORDER BY cnt DESC, grp",
             Self::where_clause(&conditions)
         );
@@ -422,8 +479,16 @@ impl<'a> QueryBuilder<'a> {
         Ok(results)
     }
 
+    /// PR counts per author, labeled with the bare login.
+    ///
+    /// Grouping on the display label rather than the raw key keeps two
+    /// identities that share a login — a person and a bot — as separate rows,
+    /// because only one of them carries the `[bot]` marker.
     pub fn count_by_author(self) -> Result<Vec<(String, u64)>> {
-        self.count_grouped("p.author_key")
+        self.count_grouped(
+            "COALESCE(ae.login, p.author_key) ||
+             CASE WHEN ae.entity_type = 'bot' THEN ' [bot]' ELSE '' END",
+        )
     }
 
     pub fn count_by_repo(self) -> Result<Vec<(String, u64)>> {
@@ -442,15 +507,16 @@ impl<'a> QueryBuilder<'a> {
     pub fn to_csv(self) -> Result<String> {
         let rows = self.pull_requests()?;
         let mut output = String::from(
-            "pr_key,number,repo,author,state,title,created_at,merged_at,comments,reviews,additions,deletions\n",
+            "pr_key,number,repo,author,author_type,state,title,created_at,merged_at,comments,reviews,additions,deletions\n",
         );
         for row in rows {
             output.push_str(&format!(
-                "{},{},{},{},{},{},{},{},{},{},{},{}\n",
+                "{},{},{},{},{},{},{},{},{},{},{},{},{}\n",
                 row.pr_key,
                 row.number,
                 row.repo_key,
                 row.author,
+                row.author_type,
                 row.state,
                 csv_escape(row.title.as_deref().unwrap_or("")),
                 row.created_at,
@@ -613,7 +679,7 @@ mod tests {
         assert_eq!(by_state[0], ("MERGED".to_string(), 2));
 
         let by_author = QueryBuilder::new(conn).count_by_author().unwrap();
-        assert_eq!(by_author[0], ("user:alice".to_string(), 2));
+        assert_eq!(by_author[0], ("alice".to_string(), 2));
 
         let by_period = QueryBuilder::new(conn).count_by_period().unwrap();
         assert_eq!(by_period.len(), 2);
@@ -625,6 +691,112 @@ mod tests {
         let csv = QueryBuilder::new(conn).to_csv().unwrap();
         assert!(csv.starts_with("pr_key,"));
         assert_eq!(csv.lines().count(), 4);
+    }
+
+    /// Seed a bot whose login collides with a person's, the case a single
+    /// identity column has to keep distinguishable.
+    fn seed_colliding_bot(warehouse: &GithubDW) {
+        warehouse
+            .connection()
+            .execute_batch(
+                "INSERT INTO dim_entities (entity_key, entity_type, login, is_human, is_bot, name)
+                 VALUES ('bot:alice', 'bot', 'alice', 0, 1, 'alice');
+                 INSERT INTO fact_pull_requests (pr_key, number, repo_key, author_key, state, title,
+                     created_at, created_date_key, created_time_key, additions, deletions)
+                 VALUES ('octo/beta#2', 2, 'octo/beta', 'bot:alice', 'OPEN', 'Automated bump',
+                    '2026-04-10T20:00:00Z', '2026-04-10', '10:00', 1, 1);",
+            )
+            .unwrap();
+    }
+
+    /// The identity a caller reads is the login GitHub itself uses. The
+    /// warehouse's namespaced key is a join target, not a name to show a person.
+    #[test]
+    fn pull_requests_report_the_bare_login() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        seed(&warehouse);
+        let conn = warehouse.connection();
+
+        let rows = QueryBuilder::new(conn)
+            .author("alice")
+            .pull_requests()
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        for row in &rows {
+            assert_eq!(row.author, "alice", "the display field is bare");
+            assert_eq!(row.author_type, "user");
+            assert_eq!(row.author_key, "user:alice", "the key is still available");
+            assert_eq!(row.author_display(), "alice");
+        }
+    }
+
+    /// Nothing is lost by showing the bare login: the type travels with it, and
+    /// a bot is marked so it cannot be read as the person of the same name.
+    #[test]
+    fn bot_authors_are_marked_rather_than_prefixed() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        seed(&warehouse);
+        seed_colliding_bot(&warehouse);
+        let conn = warehouse.connection();
+
+        let rows = QueryBuilder::new(conn)
+            .author("bot:alice")
+            .pull_requests()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].author, "alice");
+        assert_eq!(rows[0].author_type, "bot");
+        assert_eq!(rows[0].author_key, "bot:alice");
+        assert_eq!(
+            rows[0].author_display(),
+            "alice [bot]",
+            "a bot is distinguishable from the person sharing its login"
+        );
+
+        // The two identities remain separate groups, and neither is shown
+        // as a raw key.
+        let by_author = QueryBuilder::new(conn).count_by_author().unwrap();
+        let labels: Vec<&str> = by_author.iter().map(|(label, _)| label.as_str()).collect();
+        assert!(labels.contains(&"alice"), "got {labels:?}");
+        assert!(labels.contains(&"alice [bot]"), "got {labels:?}");
+        assert!(
+            labels.iter().all(|label| !label.contains(':')),
+            "no group label carries a namespace: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn json_and_csv_carry_a_bare_login_and_its_type() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        seed(&warehouse);
+        seed_colliding_bot(&warehouse);
+        let conn = warehouse.connection();
+
+        let json = QueryBuilder::new(conn).to_json().unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for row in parsed.as_array().unwrap() {
+            let author = row["author"].as_str().unwrap();
+            assert!(!author.contains(':'), "author '{author}' is bare");
+            assert!(
+                matches!(row["author_type"].as_str(), Some("user") | Some("bot")),
+                "the type is carried separately"
+            );
+            let key = row["author_key"].as_str().unwrap();
+            assert_eq!(
+                key,
+                format!("{}:{author}", row["author_type"].as_str().unwrap())
+            );
+        }
+
+        let csv = QueryBuilder::new(conn).to_csv().unwrap();
+        let header = csv.lines().next().unwrap();
+        assert!(header.contains("author,author_type"), "got {header}");
+        for line in csv.lines().skip(1) {
+            assert!(
+                !line.contains("user:") && !line.contains("bot:"),
+                "no namespaced identity in: {line}"
+            );
+        }
     }
 
     #[test]

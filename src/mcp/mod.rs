@@ -735,6 +735,115 @@ mod tests {
         assert!(error.message.contains("unknown scope"), "{error:?}");
     }
 
+    // ─── Identity rendering ──────────────────────────────────────────────────
+
+    /// A warehouse holding one PR by a person and one by a bot.
+    fn server_with_two_authors() -> GithubDwServer {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        warehouse
+            .connection()
+            .execute_batch(
+                "INSERT INTO dim_entities (entity_key, entity_type, login, is_human, is_bot, name)
+                 VALUES ('user:octocat', 'user', 'octocat', 1, 0, 'Octocat'),
+                        ('bot:builder', 'bot', 'builder', 0, 1, 'builder');
+                 INSERT INTO dim_repositories (repo_key, owner, name)
+                 VALUES ('octo/alpha', 'octo', 'alpha');
+                 INSERT INTO dim_date (date_key, year, quarter, month, day_of_month, day_of_week,
+                     is_weekend, week_of_year, week_key, month_key, quarter_key, year_key, half_key)
+                 VALUES ('2026-01-05', 2026, 1, 1, 5, 1, 0, 2, '2026-W02', '2026-01', '2026-Q1',
+                     '2026', '2026-H1');
+                 INSERT INTO dim_time (time_key, hour, hour_12, am_pm, time_bucket, is_core_hours)
+                 VALUES ('10:00', 10, 10, 'AM', 'Morning', 1);
+                 INSERT INTO fact_pull_requests (pr_key, number, repo_key, author_key, state,
+                     title, created_at, created_date_key, created_time_key)
+                 VALUES ('octo/alpha#1', 1, 'octo/alpha', 'user:octocat', 'OPEN',
+                         'A hand-written change', '2026-01-05T18:00:00Z', '2026-01-05', '10:00'),
+                        ('octo/alpha#2', 2, 'octo/alpha', 'bot:builder', 'OPEN',
+                         'An automated change', '2026-01-05T19:00:00Z', '2026-01-05', '10:00');",
+            )
+            .unwrap();
+        GithubDwServer::new(warehouse)
+    }
+
+    /// Every identity a client reads is the login GitHub uses. The namespaced
+    /// key stays available, but only in a field that says so by name — a client
+    /// reading `author` or `login` must get a value it can pass straight to the
+    /// GitHub API.
+    #[test]
+    fn tool_payloads_name_identities_the_way_github_does() {
+        let server = server_with_two_authors();
+
+        let listing: serde_json::Value = serde_json::from_str(&text_of(
+            server
+                .query_pull_requests(Some(&args(json!({}))))
+                .expect("ok"),
+        ))
+        .expect("json");
+        let rows = listing["pull_requests"].as_array().expect("rows");
+        assert_eq!(rows.len(), 2);
+        for row in rows {
+            let author = row["author"].as_str().expect("an author");
+            assert!(!author.contains(':'), "author '{author}' is bare");
+            let entity_type = row["author_type"].as_str().expect("a type");
+            assert_eq!(
+                row["author_key"].as_str().expect("a key"),
+                format!("{entity_type}:{author}"),
+                "the key remains available under its own name"
+            );
+        }
+
+        let grouped: serde_json::Value = serde_json::from_str(&text_of(
+            server
+                .query_pull_requests(Some(&args(json!({ "output": "count_by_author" }))))
+                .expect("ok"),
+        ))
+        .expect("json");
+        for group in grouped["results"].as_array().expect("groups") {
+            let label = group[0].as_str().expect("a label");
+            assert!(!label.contains(':'), "group label '{label}' is bare");
+        }
+        let labels: Vec<&str> = grouped["results"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|group| group[0].as_str().unwrap())
+            .collect();
+        assert!(labels.contains(&"builder [bot]"), "got {labels:?}");
+
+        let hits: serde_json::Value = serde_json::from_str(&text_of(
+            server
+                .search(Some(&args(json!({ "query": "change" }))))
+                .expect("ok"),
+        ))
+        .expect("json");
+        let results = hits["results"].as_array().expect("hits");
+        assert!(!results.is_empty());
+        for hit in results {
+            if let Some(author) = hit["author"].as_str() {
+                assert!(!author.contains(':'), "hit author '{author}' is bare");
+                assert!(hit["author_type"].is_string(), "the type travels with it");
+            }
+        }
+
+        let report: serde_json::Value = serde_json::from_str(&text_of(
+            server
+                .get_metrics(Some(&args(json!({
+                    "entity_type": "user",
+                    "name": "builder",
+                    "period": "2026-Q1",
+                }))))
+                .expect("ok"),
+        ))
+        .expect("json");
+        assert_eq!(report["metrics"]["login"].as_str(), Some("builder"));
+        assert_eq!(report["metrics"]["entity_type"].as_str(), Some("bot"));
+        assert_eq!(
+            report["metrics"]["entity_key"].as_str(),
+            Some("bot:builder"),
+            "the key remains available under its own name"
+        );
+    }
+
     // ─── manage_monitors ─────────────────────────────────────────────────────
 
     #[test]

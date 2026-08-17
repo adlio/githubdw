@@ -8,15 +8,18 @@ use rusqlite::types::Value as SqlValue;
 
 use crate::error::Result;
 use crate::period::Period;
-use crate::query::resolve_entity_keys;
+use crate::query::{entity_namespace, resolve_entity_keys, to_bare_login};
 use crate::storage::time_dimension;
 pub use types::*;
 
-/// The key a user report is labeled with when a login resolves to several.
+/// The key a user report is labeled with when a login resolves to several,
+/// normalized so it is always `<type>:<login>`.
 fn primary_key(keys: &[String], login: &str) -> String {
-    keys.first()
+    let key = keys
+        .first()
         .cloned()
-        .unwrap_or_else(|| login.to_lowercase())
+        .unwrap_or_else(|| login.to_lowercase());
+    format!("{}:{}", entity_namespace(&key), to_bare_login(&key))
 }
 
 /// Computes user/repo/group metrics with apples-to-apples previous windows.
@@ -287,8 +290,11 @@ impl<'a> MetricsEngine<'a> {
             &windows,
         )?;
 
+        let entity_key = primary_key(&user_keys, login);
         Ok(UserMetrics {
-            login: primary_key(&user_keys, login),
+            login: to_bare_login(&entity_key),
+            entity_type: entity_namespace(&entity_key),
+            entity_key,
             period_key: windows.period_key.clone(),
             previous_period_key: windows.previous_period_key.clone(),
             current_date_range: (windows.current_start.clone(), windows.current_end.clone()),
@@ -755,7 +761,17 @@ mod tests {
         let metrics = engine
             .user_metrics("GitHub-Actions", &Period::Quarter(2026, 2))
             .unwrap();
-        assert_eq!(metrics.login, "bot:github-actions");
+        assert_eq!(
+            metrics.login, "github-actions",
+            "the report is labeled with the bare login, not the warehouse key"
+        );
+        assert_eq!(metrics.entity_type, "bot");
+        assert_eq!(metrics.entity_key, "bot:github-actions");
+        assert_eq!(
+            metrics.display_login(),
+            "github-actions [bot]",
+            "a bot is marked, so it cannot be read as a person of the same name"
+        );
         assert_eq!(metrics.reviews_given.current, 1);
         assert_eq!(metrics.prs_opened.current, 0);
 
