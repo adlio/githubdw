@@ -14,6 +14,9 @@ pub enum Error {
     #[error("migration error: {0}")]
     Migration(#[from] rusqlite_migration::Error),
 
+    #[error("schema integrity check failed: {0}")]
+    SchemaIntegrity(String),
+
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 

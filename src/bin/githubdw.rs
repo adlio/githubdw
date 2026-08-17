@@ -643,7 +643,7 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
                             "{}\t{}\t{}\t{}\t{}",
                             row.pr_key,
                             row.state,
-                            row.author,
+                            row.author_display(),
                             row.created_at,
                             row.title.as_deref().unwrap_or("")
                         );
@@ -688,7 +688,9 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
                     } else {
                         println!(
                             "User {} — {} (vs {})",
-                            metrics.login, metrics.period_key, metrics.previous_period_key
+                            metrics.display_login(),
+                            metrics.period_key,
+                            metrics.previous_period_key
                         );
                         println!("  PRs opened:       {}", metrics.prs_opened.render());
                         println!("  PRs merged:       {}", metrics.prs_merged.render());
