@@ -207,14 +207,12 @@ fn nodes<'a>(value: &'a Value, collection: &str) -> Vec<&'a Value> {
         .unwrap_or_default()
 }
 
-/// Parse one page of the repository pull-requests query response (`data` value).
-pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
-    let repository = data
-        .get("repository")
-        .filter(|value| !value.is_null())
-        .ok_or_else(|| Error::GitHubApi("repository not found in response".into()))?;
-
-    let metadata = RepositoryMetadata {
+/// Parse a `repository { … }` selection into its dimension metadata.
+///
+/// Shared with the user-search path, where the same selection arrives once per
+/// node instead of once per page.
+pub fn parse_repository_metadata(repository: &Value) -> Result<RepositoryMetadata> {
+    Ok(RepositoryMetadata {
         name_with_owner: string_field(repository, "nameWithOwner")
             .ok_or_else(|| Error::GitHubApi("repository.nameWithOwner missing".into()))?,
         primary_language: repository
@@ -236,7 +234,17 @@ pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
             .and_then(Value::as_str)
             .map(str::to_string),
         created_at: string_field(repository, "createdAt"),
-    };
+    })
+}
+
+/// Parse one page of the repository pull-requests query response (`data` value).
+pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
+    let repository = data
+        .get("repository")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| Error::GitHubApi("repository not found in response".into()))?;
+
+    let metadata = parse_repository_metadata(repository)?;
 
     let pull_requests_value = repository
         .get("pullRequests")
@@ -254,7 +262,7 @@ pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
 
     let mut pull_requests = Vec::new();
     for node in nodes(repository, "pullRequests") {
-        pull_requests.push(parse_pull_request(node)?);
+        pull_requests.push(parse_pull_request_node(node)?);
     }
 
     Ok(PullRequestPage {
@@ -265,7 +273,11 @@ pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
     })
 }
 
-fn parse_pull_request(node: &Value) -> Result<PullRequestData> {
+/// Parse one pull-request node.
+///
+/// The repository query and the user-search query select the same node shape, so
+/// a PR ingested through either path parses to the identical value.
+pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
     let number = node
         .get("number")
         .and_then(Value::as_i64)

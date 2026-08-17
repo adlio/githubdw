@@ -3,10 +3,11 @@
 pub mod issues;
 pub mod pull_requests;
 pub mod rate_limit;
+pub mod user_search;
 
 use std::process::Command;
 use std::thread::sleep;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
@@ -44,6 +45,16 @@ const RETRY_ATTEMPTS: u32 = 7;
 /// Exponential backoff schedule in seconds (attempt N sleeps SCHEDULE[N-1]).
 const BACKOFF_SECONDS: [u64; 6] = [2, 4, 8, 16, 32, 64];
 
+/// Minimum spacing between GitHub *search* calls.
+///
+/// Search has its own budget — 30 requests per minute for an authenticated
+/// user — an order of magnitude tighter than the 5,000 points/hour the
+/// repository path spends on ordinary GraphQL. The observed `rateLimit` block
+/// tracks the latter and says nothing about the former, so search is paced on
+/// its own clock: 2.1s between calls leaves ~28 requests/minute, under the cap
+/// with room for clock skew.
+const SEARCH_MIN_INTERVAL: Duration = Duration::from_millis(2100);
+
 /// Client for the GitHub API via the `gh` CLI.
 pub struct GhClient {
     transport: Box<dyn GhTransport>,
@@ -52,6 +63,8 @@ pub struct GhClient {
     inter_request_delay: Option<Duration>,
     /// When false (tests), never actually sleep.
     sleeping_enabled: bool,
+    /// When the last search call was issued, for search-specific pacing.
+    last_search_at: Option<Instant>,
 }
 
 impl GhClient {
@@ -67,6 +80,7 @@ impl GhClient {
             rate_limit: RateLimitTracker::new(),
             inter_request_delay: None,
             sleeping_enabled: true,
+            last_search_at: None,
         }
     }
 
@@ -130,6 +144,23 @@ impl GhClient {
             .ok_or_else(|| Error::GitHubApi("response has no data field".into()))?;
         self.observe_rate_limit(&data);
         Ok(data)
+    }
+
+    /// Execute a GraphQL query against the **search** connection.
+    ///
+    /// Identical to [`Self::graphql`] except it first waits out a minimum
+    /// interval since the previous search call, so a long
+    /// user-scoped walk stays inside search's own 30-requests-per-minute budget
+    /// instead of tripping a secondary rate limit halfway through.
+    pub fn graphql_search(&mut self, query: &str, variables: &[(&str, &str)]) -> Result<Value> {
+        if let Some(previous) = self.last_search_at {
+            let elapsed = previous.elapsed();
+            if elapsed < SEARCH_MIN_INTERVAL && self.sleeping_enabled {
+                sleep(SEARCH_MIN_INTERVAL - elapsed);
+            }
+        }
+        self.last_search_at = Some(Instant::now());
+        self.graphql(query, variables)
     }
 
     /// Execute a REST call (`gh api <path>`), returning the parsed JSON.
