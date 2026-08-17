@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.3] - 2026-08-16
+
+### Fixed
+
+- Every command that names an author printed the warehouse's internal entity
+  key (`user:octocat`, `bot:dependabot`) instead of the login GitHub uses.
+  `query` in all four modes (table, json, csv, count-by-author), `search
+  --json`, the `metrics user` header, and the `query_pull_requests`, `search`
+  and `get_metrics` MCP tools were all affected, so the only githubdw output
+  that showed a usable login was the metrics leaderboards. A value copied off
+  any other surface could not be pasted into a GitHub URL or API call without
+  knowing to strip a namespace first, and the field carrying it was already
+  named `author` or `login` — the bare spelling the schema itself uses for
+  `dim_entities.login`. Identity fields now hold the bare login everywhere, and
+  the type that the namespace used to convey travels in its own field:
+  `author_type` on PR rows and search hits, `entity_type` on a user report. The
+  key remains available where a caller genuinely needs to join back to the star
+  schema, under a name that says so: `author_key` on PR rows and `entity_key`
+  on a user report.
+- A single display column could not tell a bot from the person who shares its
+  login, since dropping the namespace drops that distinction. Bots are now
+  marked visibly instead — `dependabot [bot]` in table output, in
+  `count-by-author` group labels, and in the `metrics user` header — so the two
+  identities stay distinguishable and remain separate groups in a breakdown.
+- A leaderboard row for an entity with no display name fell back to printing
+  its raw key. It now falls back to the bare login, with the same bot marker.
+
+### Added
+
+- Schema v4 constrains `dim_entities` to the identity invariants the ingest
+  code already upholds: `login` is non-empty and never namespaced,
+  `entity_key` is exactly `entity_type` + `:` + `login`, and `entity_type` is
+  one of the namespaces ingestion mints. These were enforced by code alone, so
+  a writer that bypassed the normalizer could store a row that no bare-login
+  lookup would ever match while the write reported success. The upgrade is a
+  no-op on a warehouse whose rows already conform, and refuses to complete on
+  one that carries a violating row rather than migrating the problem forward.
+
+### Changed
+
+- The `csv` output of `query` gained an `author_type` column, so the bare
+  author and its type are both present without the namespaced key. Callers
+  parsing CSV by column position need to account for the new column.
+
 ## [0.2.2] - 2026-08-16
 
 ### Fixed
@@ -130,6 +174,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Custom user and repository groups
 - Configurable timezone-aware date bucketing (DST-correct)
 
-[Unreleased]: https://github.com/adlio/githubdw/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/adlio/githubdw/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/adlio/githubdw/releases/tag/v0.2.3
 [0.2.2]: https://github.com/adlio/githubdw/releases/tag/v0.2.2
 [0.1.0]: https://github.com/adlio/githubdw/releases/tag/v0.1.0
