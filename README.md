@@ -60,6 +60,7 @@ The database lives at `~/.githubdw/githubdw.db` by default (override with
 
 ```bash
 githubdw sync repo <owner/name> [--days N] [--skip-diffs] [--pull-requests-only | --issues-only]
+githubdw sync user <login>      [--days N] [--skip-diffs]
 githubdw sync all            # sync every enabled monitored source
 githubdw sync watch          # live progress of a running sync
 ```
@@ -69,6 +70,22 @@ merged, an `updated_at` cursor stops pagination early when nothing changed, and
 a stale-lock timeout recovers from crashes. `--skip-diffs` skips per-file patch
 text for a much faster first pass.
 
+`sync repo` walks one repository's pull requests and issues. `sync user`
+answers the other question — everything one person did, wherever they did it —
+by searching for the pull requests they authored (`author:`) and the ones they
+reviewed (`reviewed-by:`), each with its own watermark. Repositories found this
+way get stored so the facts have somewhere to hang, but they are **not** added
+to the monitored set: syncing a person is not an instruction to start tracking
+every repository they contributed to.
+
+Search is bounded in two ways githubdw works around rather than ignores. It
+serves at most 1,000 results per query, so a backfill is partitioned into
+calendar-month `created:` windows and any window still reporting more is
+bisected until each part fits; if a single day is over the cap, the run says so
+instead of claiming coverage it does not have. Search also has its own budget of
+30 requests per minute, well under the 5,000 points/hour ordinary GraphQL gets,
+so search calls are paced on their own clock.
+
 Manage what `sync all` covers:
 
 ```bash
@@ -77,6 +94,10 @@ githubdw monitor add-user login
 githubdw monitor list
 githubdw monitor remove owner/name
 ```
+
+`sync all` runs repositories first, then users, and prints a line for every
+enabled source it will not serve — an unimplemented source type or a disabled
+row is named, never dropped in silence.
 
 ## Query
 

@@ -143,6 +143,17 @@ enum SyncCommand {
         #[arg(long)]
         issues_only: bool,
     },
+    /// Sync one user's pull requests and reviews across every repository
+    User {
+        /// GitHub login
+        login: String,
+        /// Limit the sync window to the last N days
+        #[arg(long)]
+        days: Option<u32>,
+        /// Skip fetching per-file patch text (fast mode)
+        #[arg(long)]
+        skip_diffs: bool,
+    },
     /// Sync every enabled monitored source
     All,
     /// Watch live progress of a running sync
@@ -397,32 +408,77 @@ fn run(command_line: CommandLine) -> githubdw::Result<()> {
                         eprintln!("failed {item}: {error}");
                     }
                 }
+                SyncCommand::User {
+                    login,
+                    days,
+                    skip_diffs,
+                } => {
+                    let mut client = githubdw::fetch::GhClient::new();
+                    client.preflight()?;
+                    let options = githubdw::sync::SyncOptions {
+                        days,
+                        skip_diffs,
+                        pull_requests_only: true,
+                        issues_only: false,
+                    };
+                    let mut syncer =
+                        githubdw::sync::Syncer::new(warehouse.connection(), &mut client);
+                    let summary = syncer.sync_user(&login, &options)?;
+                    if summary.up_to_date {
+                        println!("{login}: already up to date");
+                    } else {
+                        println!(
+                            "{login}: synced {} pull requests authored or reviewed ({} pages, {} failed)",
+                            summary.pull_requests_synced,
+                            summary.pages_fetched,
+                            summary.failed.len()
+                        );
+                    }
+                    for note in &summary.notes {
+                        println!("{note}");
+                    }
+                    for (item, error) in &summary.failed {
+                        eprintln!("failed {item}: {error}");
+                    }
+                }
                 SyncCommand::All => {
                     let mut client = githubdw::fetch::GhClient::new();
                     client.preflight()?;
                     let sources =
                         githubdw::storage::monitor_repository::list(warehouse.connection())?;
-                    let repos: Vec<_> = sources
-                        .into_iter()
-                        .filter(|source| source.sync_enabled && source.source_type == "repo")
-                        .collect();
-                    if repos.is_empty() {
-                        println!(
-                            "no enabled monitored repositories — use `githubdw monitor add-repo`"
-                        );
+                    let plan = githubdw::sync::plan_all(&sources);
+                    // Printed before any work, so a source this build cannot
+                    // serve is visible even if the run is interrupted.
+                    for notice in &plan.notices {
+                        println!("{notice}");
                     }
-                    for source in repos {
+                    for repository in &plan.repos {
                         let options = githubdw::sync::SyncOptions::default();
                         let mut syncer =
                             githubdw::sync::Syncer::new(warehouse.connection(), &mut client);
-                        match syncer.sync_repository(&source.identifier, &options) {
+                        match syncer.sync_repository(repository, &options) {
                             Ok(summary) => println!(
-                                "{}: {} PRs, {} issues",
-                                source.identifier,
-                                summary.pull_requests_synced,
-                                summary.issues_synced
+                                "{repository}: {} PRs, {} issues",
+                                summary.pull_requests_synced, summary.issues_synced
                             ),
-                            Err(error) => eprintln!("{}: {error}", source.identifier),
+                            Err(error) => eprintln!("{repository}: {error}"),
+                        }
+                    }
+                    for login in &plan.users {
+                        let options = githubdw::sync::SyncOptions::default();
+                        let mut syncer =
+                            githubdw::sync::Syncer::new(warehouse.connection(), &mut client);
+                        match syncer.sync_user(login, &options) {
+                            Ok(summary) => {
+                                println!(
+                                    "user {login}: {} PRs authored or reviewed",
+                                    summary.pull_requests_synced
+                                );
+                                for note in &summary.notes {
+                                    println!("  {note}");
+                                }
+                            }
+                            Err(error) => eprintln!("user {login}: {error}"),
                         }
                     }
                 }

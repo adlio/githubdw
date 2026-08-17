@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.4] - 2026-08-17
+
+### Added
+
+- `sync user <login>` and user coverage in `sync all`. `monitor add-user` has
+  registered user sources since 0.1.0 and `monitor list` has shown them, but
+  sync only ever served repositories — so a monitored user's `last_sync_at`
+  never moved and no command could answer "what did this person do". This
+  release makes sync serve them: for each enabled user it searches the pull
+  requests they authored (`author:`) and the ones they reviewed
+  (`reviewed-by:`), and upserts every result through the same entity, fact, and
+  time-dimension pipeline `sync repo` uses. A PR reachable from both paths lands
+  identically either way.
+- Coverage, locking, and job records for user sources under the `user:<login>`
+  entity key, so `sync watch`, stale-lock recovery, and the recorded date-range
+  merge all behave as they do for repositories. The two roles keep separate
+  `updated_at` watermarks (`user` and `user_reviews` in `sync_metadata`) because
+  they walk disjoint result sets — one shared cursor would let the busier side
+  advance past items the other has not fetched. As on the repository path, a
+  watermark only ever moves past an item that actually persisted, so a failed
+  upsert is retried on the next run instead of becoming a permanent hole.
+- Honest handling of the two limits search imposes. GitHub serves at most 1,000
+  results per query however many it reports matching, so a backfill is
+  partitioned into calendar-month `created:` windows and any window still
+  reporting more than the cap is bisected until each part fits — the over-cap
+  query is abandoned before its results are spent, not truncated silently. When
+  a window is already a single day and still over the cap, the run reports the
+  shortfall rather than recording coverage it did not fetch. An incremental run
+  is bounded by its watermark instead of by the window, so there the cap is only
+  a problem if pagination runs out before the watermark is reached: that case is
+  reported with the `--days` command that closes the gap, while a walk that
+  reaches its watermark stays quiet no matter how many lifetime matches the
+  query reports. Search's request budget is 30/minute, an order of magnitude
+  tighter than the 5,000 points/hour the repository path spends, so search calls
+  are paced on their own clock independent of the observed `rateLimit` block.
+
+### Changed
+
+- `sync all` now iterates every supported source type — repositories first, then
+  users — and prints a line for each enabled source it will not serve. A source
+  type this build does not implement, and a row that is present but disabled,
+  are both named on stdout. Previously the source list was filtered to
+  repositories and everything else disappeared without a word, which read as
+  "there was nothing to do".
+- `sync user` covers pull requests and reviews. `--issues-only` has no
+  user-scoped counterpart in this release; passing it reports that instead of
+  returning zero, which would read as "this user has no issues".
+- Repositories discovered through a user sync are stored as dimensions but are
+  **not** added to `monitored_repos`. Monitoring a person is a statement about
+  that person, not an instruction to start tracking every repository they
+  contributed to.
+
 ## [0.2.3] - 2026-08-16
 
 ### Fixed

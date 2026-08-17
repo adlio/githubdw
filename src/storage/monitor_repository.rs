@@ -101,6 +101,18 @@ pub fn touch_repo(conn: &Connection, repository: &str) -> Result<()> {
     Ok(())
 }
 
+/// Stamp last_sync_at for a user source.
+///
+/// The login is reduced the same way `add_user` reduces it, so a row added by
+/// either spelling is the row this stamps.
+pub fn touch_user(conn: &Connection, login: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE monitored_users SET last_sync_at = datetime('now') WHERE login = ?1",
+        [to_bare_login(login)],
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
