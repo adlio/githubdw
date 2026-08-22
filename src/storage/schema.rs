@@ -26,12 +26,33 @@ pub fn init(conn: &mut Connection) -> Result<()> {
     // it is toggled around the migration run and the schema is re-checked
     // before the connection is handed out: a rebuild that lost a parent row
     // fails here rather than surfacing later as a query that silently omits it.
+    let version_before = schema_version(conn)?;
     conn.pragma_update(None, "foreign_keys", "OFF")?;
     let outcome = migrations().to_latest(conn);
     conn.pragma_update(None, "foreign_keys", "ON")?;
     outcome?;
-    assert_referential_integrity(conn)?;
+    // Only a table rebuild can orphan a row, and only a migration rebuilds a
+    // table — so an unchanged schema version means there is nothing new to
+    // check, and re-checking costs a FULL SCAN OF EVERY TABLE. That scan was
+    // running on every open: 0.9s on a 2.3 GB warehouse, paid by every caller
+    // including read-only ones, and paid four times over by a single page that
+    // opens the warehouse from four concurrent request handlers. Gating it on a
+    // version change keeps the guarantee exactly — the check still runs after
+    // any migration that could have broken integrity — while taking the scan
+    // off the hot path. Compare cruxdw, which has no such check and opens a
+    // larger database in 0.07s.
+    if schema_version(conn)? != version_before {
+        assert_referential_integrity(conn)?;
+    }
     Ok(())
+}
+
+/// The migration marker rusqlite_migration maintains (`PRAGMA user_version`).
+///
+/// Read directly rather than through `Migrations::current_version` so that the
+/// before/after comparison cannot disagree with what the migration run wrote.
+fn schema_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
 }
 
 /// Fail if any row references a parent that does not exist.
@@ -252,6 +273,58 @@ mod tests {
         assert!(
             error.to_string().contains("CHECK constraint failed"),
             "expected a CHECK failure, got: {error}"
+        );
+    }
+
+    /// A fresh database runs the integrity check (the schema version moves from
+    /// 0 to the latest), and the check really does fail on an orphan.
+    #[test]
+    fn integrity_check_runs_when_migrations_apply() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        assert_eq!(schema_version(&conn).expect("version"), 0);
+        init(&mut conn).expect("fresh init passes");
+        assert!(schema_version(&conn).expect("version") > 0);
+
+        // Prove the check itself still has teeth on a schema that just moved.
+        conn.pragma_update(None, "foreign_keys", "OFF")
+            .expect("relax fks");
+        conn.execute(
+            "INSERT INTO pr_labels (pr_key, label_id) VALUES ('no-such-pr', 'no-such-label')",
+            [],
+        )
+        .expect("insert orphan");
+        assert!(
+            assert_referential_integrity(&conn).is_err(),
+            "foreign_key_check must still catch an orphaned row"
+        );
+    }
+
+    /// Re-opening an already-current schema SKIPS the check -- that is the whole
+    /// point, because the check is a full scan of every table (0.9s on a 2.3 GB
+    /// warehouse) and only a migration can rebuild a table and orphan a row.
+    ///
+    /// The tradeoff is deliberate and is what this test pins: an orphan created
+    /// by something other than a migration is no longer surfaced at open time.
+    /// If it were, this second `init` would fail.
+    #[test]
+    fn integrity_check_is_skipped_when_the_schema_is_current() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        init(&mut conn).expect("fresh init passes");
+        let settled = schema_version(&conn).expect("version");
+
+        conn.pragma_update(None, "foreign_keys", "OFF")
+            .expect("relax fks");
+        conn.execute(
+            "INSERT INTO pr_labels (pr_key, label_id) VALUES ('no-such-pr', 'no-such-label')",
+            [],
+        )
+        .expect("insert orphan");
+
+        init(&mut conn).expect("re-init must not rescan, so the orphan is not seen");
+        assert_eq!(
+            schema_version(&conn).expect("version"),
+            settled,
+            "no migration should have applied on the second open"
         );
     }
 
