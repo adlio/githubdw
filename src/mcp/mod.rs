@@ -26,7 +26,7 @@ use crate::GithubDW;
 use crate::groups::{self, GroupKind};
 use crate::metrics::MetricsEngine;
 use crate::period::Period;
-use crate::query::PrFilters;
+use crate::query::{PrFilters, PrState};
 use crate::search::{SearchOptions, SearchScope};
 use crate::storage::monitor_repository;
 use crate::storage::time_dimension;
@@ -170,6 +170,16 @@ impl GithubDwServer {
         args: Option<&Map<String, serde_json::Value>>,
     ) -> Result<CallToolResult, McpError> {
         let params: QueryParams = parse_params(args)?;
+        let state = params
+            .state
+            .as_deref()
+            .map(PrState::parse)
+            .transpose()
+            .map_err(|error| match error {
+                // The tool has always answered with the bare message here.
+                crate::Error::InvalidArgument(message) => invalid_params(message),
+                other => caller_error(other),
+            })?;
         let warehouse = self.warehouse.lock().map_err(internal_error)?;
         let filters = PrFilters {
             author: params.author,
@@ -178,7 +188,7 @@ impl GithubDwServer {
             org: params.org,
             group: params.group,
             label: params.label,
-            state: params.state,
+            state,
             period: params.period,
             ..PrFilters::default()
         };

@@ -135,7 +135,10 @@ fn query_rejects_an_unknown_output() {
 fn query_rejects_an_unknown_state() {
     let map = args(json!({ "state": "nonsense" }));
     let error = server().query_pull_requests(Some(&map)).expect_err("error");
-    assert!(error.message.contains("unknown state"), "{error:?}");
+    assert_eq!(
+        error.message,
+        "unknown state 'nonsense', use: open, merged, closed"
+    );
 }
 
 #[test]

@@ -557,9 +557,9 @@ fn csv_escape(field: &str) -> String {
     }
 }
 
-/// Pull-request filters as the CLI and MCP surfaces receive them: plain text
-/// that still needs validating against the warehouse (group names, states,
-/// period expressions).
+/// Pull-request filters as the CLI and MCP surfaces receive them. Group names
+/// and period expressions are validated against the warehouse when the
+/// builder is made.
 #[derive(Debug, Clone, Default)]
 pub struct PrFilters {
     pub author: Option<String>,
@@ -569,8 +569,8 @@ pub struct PrFilters {
     /// A user group filters by author; a repo group filters by repository.
     pub group: Option<String>,
     pub label: Option<String>,
-    /// `open`, `merged` or `closed`. Applied after `merged`, so it wins.
-    pub state: Option<String>,
+    /// Applied after `merged`, so it wins. Parse text with [`PrState::parse`].
+    pub state: Option<PrState>,
     pub merged: bool,
     /// Period expression; relative periods resolve against the warehouse's
     /// own calendar.
@@ -609,8 +609,8 @@ impl PrFilters {
         if self.merged {
             builder = builder.merged();
         }
-        if let Some(state) = self.state.as_deref() {
-            builder = builder.state(PrState::parse(state)?);
+        if let Some(state) = self.state {
+            builder = builder.state(state);
         }
         if let Some(text) = self.period.as_deref() {
             let today = crate::storage::time_dimension::today(connection)?;

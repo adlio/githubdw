@@ -1,7 +1,7 @@
 //! Read-only reporting: query, metrics, and fulltext search.
 
 use githubdw::GithubDW;
-use githubdw::query::PrFilters;
+use githubdw::query::{PrFilters, PrState};
 
 use crate::cli::{MetricsCommand, QueryArguments, SearchArguments};
 
@@ -34,7 +34,7 @@ pub fn query(warehouse: GithubDW, arguments: QueryArguments) -> githubdw::Result
         org: arguments.org,
         group: arguments.group,
         label: arguments.label,
-        state: arguments.state,
+        state: arguments.state.as_deref().map(PrState::parse).transpose()?,
         merged: arguments.merged,
         period: arguments.period,
         since: arguments
