@@ -26,7 +26,7 @@ use crate::GithubDW;
 use crate::groups::{self, GroupKind};
 use crate::metrics::MetricsEngine;
 use crate::period::Period;
-use crate::query::QueryBuilder;
+use crate::query::PrFilters;
 use crate::search::{SearchOptions, SearchScope};
 use crate::storage::monitor_repository;
 use crate::storage::time_dimension;
@@ -47,6 +47,16 @@ fn internal_error(error: impl std::fmt::Display) -> McpError {
 
 fn invalid_params(message: impl Into<String>) -> McpError {
     McpError::invalid_params(message.into(), None)
+}
+
+/// A bad argument or unknown name is the caller's to fix; anything else is ours.
+fn caller_error(error: crate::Error) -> McpError {
+    match error {
+        crate::Error::InvalidArgument(_) | crate::Error::NotFound(_) => {
+            invalid_params(error.to_string())
+        }
+        other => internal_error(other),
+    }
 }
 
 /// Pretty-print a JSON value into a single text content block.
@@ -161,64 +171,20 @@ impl GithubDwServer {
     ) -> Result<CallToolResult, McpError> {
         let params: QueryParams = parse_params(args)?;
         let warehouse = self.warehouse.lock().map_err(internal_error)?;
-        let connection = warehouse.connection();
-        let mut builder = QueryBuilder::new(connection);
-        if let Some(author) = params.author.as_deref() {
-            builder = builder.author(author);
-        }
-        if let Some(reviewer) = params.reviewer.as_deref() {
-            builder = builder.reviewer(reviewer);
-        }
-        if let Some(repo) = params.repo.as_deref() {
-            builder = builder.repo(repo);
-        }
-        if let Some(org) = params.org.as_deref() {
-            builder = builder.org(org);
-        }
-        if let Some(group_name) = params.group.as_deref() {
-            match groups::kind_of(connection, group_name)
-                .map_err(|e| invalid_params(e.to_string()))?
-            {
-                GroupKind::User => {
-                    let members = groups::members(connection, GroupKind::User, group_name)
-                        .map_err(internal_error)?;
-                    builder = builder.authors(&members);
-                }
-                GroupKind::Repo => {
-                    let members = groups::members(connection, GroupKind::Repo, group_name)
-                        .map_err(internal_error)?;
-                    builder = builder.repos(&members);
-                }
-            }
-        }
-        if let Some(label) = params.label.as_deref() {
-            builder = builder.label(label);
-        }
-        if let Some(state) = params.state.as_deref() {
-            let parsed = match state.to_lowercase().as_str() {
-                "open" => crate::PrState::Open,
-                "merged" => crate::PrState::Merged,
-                "closed" => crate::PrState::Closed,
-                other => {
-                    return Err(invalid_params(format!(
-                        "unknown state '{other}', use: open, merged, closed"
-                    )));
-                }
-            };
-            builder = builder.state(parsed);
-        }
-        if let Some(period_text) = params.period.as_deref() {
-            let reference = time_dimension::today(connection).map_err(internal_error)?;
-            let parsed = Period::parse_with_reference(period_text, reference)
-                .map_err(|error| invalid_params(error.to_string()))?;
-            match parsed {
-                Period::Rolling(..) => {
-                    let (start, end) = parsed.date_range();
-                    builder = builder.between(start, end);
-                }
-                other => builder = builder.period(other),
-            }
-        }
+        let filters = PrFilters {
+            author: params.author,
+            reviewer: params.reviewer,
+            repo: params.repo,
+            org: params.org,
+            group: params.group,
+            label: params.label,
+            state: params.state,
+            period: params.period,
+            ..PrFilters::default()
+        };
+        let mut builder = filters
+            .builder(warehouse.connection())
+            .map_err(caller_error)?;
 
         let output = params.output.as_deref().unwrap_or("pull_requests");
         let response = match output {

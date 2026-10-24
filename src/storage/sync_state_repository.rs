@@ -485,6 +485,66 @@ pub fn clear_checkpoint(conn: &Connection, checkpoint_type: &str, source_id: &st
     Ok(())
 }
 
+/// A sync currently holding its entity's lock, with live progress counters.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ActiveSync {
+    pub entity_key: String,
+    pub started_at: String,
+    pub current_item: i64,
+    pub current_item_id: Option<String>,
+    pub synced: i64,
+    pub skipped: i64,
+    pub failed: i64,
+}
+
+/// One recorded sync job.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct SyncJob {
+    pub entity_key: String,
+    pub status: String,
+    pub started_at: String,
+    pub completed_at: Option<String>,
+    pub synced: i64,
+}
+
+/// Syncs in progress right now, oldest first.
+pub fn active_syncs(conn: &Connection) -> Result<Vec<ActiveSync>> {
+    let mut statement = conn.prepare(
+        "SELECT entity_key, started_at, current_item, current_item_id, synced, skipped, failed
+         FROM sync_locks ORDER BY started_at",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok(ActiveSync {
+            entity_key: row.get(0)?,
+            started_at: row.get(1)?,
+            current_item: row.get(2)?,
+            current_item_id: row.get(3)?,
+            synced: row.get(4)?,
+            skipped: row.get(5)?,
+            failed: row.get(6)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
+/// The most recent `limit` sync jobs, newest first.
+pub fn recent_jobs(conn: &Connection, limit: u32) -> Result<Vec<SyncJob>> {
+    let mut statement = conn.prepare(
+        "SELECT entity_key, status, started_at, completed_at, synced
+         FROM sync_jobs ORDER BY started_at DESC LIMIT ?1",
+    )?;
+    let rows = statement.query_map([limit], |row| {
+        Ok(SyncJob {
+            entity_key: row.get(0)?,
+            status: row.get(1)?,
+            started_at: row.get(2)?,
+            completed_at: row.get(3)?,
+            synced: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
+}
+
 /// Finish a walk atomically: advance the real high-water cursor and drop the
 /// checkpoint in one transaction, so a crash can never leave the cursor
 /// advanced while the checkpoint still points into the old walk, or the
@@ -719,5 +779,24 @@ mod tests {
         advance_cursor(conn, "repo", "octocat/hello", Some("2026-01-01T00:00:00Z")).unwrap();
         let cursor = last_updated_cursor(conn, "repo", "octocat/hello").unwrap();
         assert_eq!(cursor.as_deref(), Some("2026-06-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn watch_lists_live_syncs_then_finished_jobs() {
+        let warehouse = crate::GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        acquire_lock(conn, "repo:o/r").unwrap();
+        start_job(conn, "repo:o/r").unwrap();
+        let live = active_syncs(conn).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].entity_key, "repo:o/r");
+        complete_job(conn, "repo:o/r", 3, 0, &[]).unwrap();
+        release_lock(conn, "repo:o/r").unwrap();
+        assert!(active_syncs(conn).unwrap().is_empty());
+        let jobs = recent_jobs(conn, 5).unwrap();
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].entity_key, "repo:o/r");
+        assert_eq!(jobs[0].synced, 3);
+        assert!(jobs[0].completed_at.is_some());
     }
 }

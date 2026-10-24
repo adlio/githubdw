@@ -17,6 +17,18 @@ pub enum PrState {
 }
 
 impl PrState {
+    /// Parse `open`, `merged` or `closed` (any case).
+    pub fn parse(text: &str) -> Result<Self> {
+        match text.to_lowercase().as_str() {
+            "open" => Ok(PrState::Open),
+            "merged" => Ok(PrState::Merged),
+            "closed" => Ok(PrState::Closed),
+            other => Err(Error::InvalidArgument(format!(
+                "unknown state '{other}', use: open, merged, closed"
+            ))),
+        }
+    }
+
     fn as_sql(&self) -> &'static str {
         match self {
             PrState::Open => "OPEN",
@@ -542,6 +554,81 @@ fn csv_escape(field: &str) -> String {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {
         field.to_string()
+    }
+}
+
+/// Pull-request filters as the CLI and MCP surfaces receive them: plain text
+/// that still needs validating against the warehouse (group names, states,
+/// period expressions).
+#[derive(Debug, Clone, Default)]
+pub struct PrFilters {
+    pub author: Option<String>,
+    pub reviewer: Option<String>,
+    pub repo: Option<String>,
+    pub org: Option<String>,
+    /// A user group filters by author; a repo group filters by repository.
+    pub group: Option<String>,
+    pub label: Option<String>,
+    /// `open`, `merged` or `closed`. Applied after `merged`, so it wins.
+    pub state: Option<String>,
+    pub merged: bool,
+    /// Period expression; relative periods resolve against the warehouse's
+    /// own calendar.
+    pub period: Option<String>,
+    pub since: Option<NaiveDate>,
+    pub until: Option<NaiveDate>,
+}
+
+impl PrFilters {
+    /// Validate the filters and compile them into a builder.
+    pub fn builder<'a>(&self, connection: &'a Connection) -> Result<QueryBuilder<'a>> {
+        let mut builder = QueryBuilder::new(connection);
+        if let Some(author) = self.author.as_deref() {
+            builder = builder.author(author);
+        }
+        if let Some(reviewer) = self.reviewer.as_deref() {
+            builder = builder.reviewer(reviewer);
+        }
+        if let Some(repo) = self.repo.as_deref() {
+            builder = builder.repo(repo);
+        }
+        if let Some(org) = self.org.as_deref() {
+            builder = builder.org(org);
+        }
+        if let Some(name) = self.group.as_deref() {
+            let kind = crate::groups::kind_of(connection, name)?;
+            let members = crate::groups::members(connection, kind, name)?;
+            builder = match kind {
+                crate::groups::GroupKind::User => builder.authors(&members),
+                crate::groups::GroupKind::Repo => builder.repos(&members),
+            };
+        }
+        if let Some(label) = self.label.as_deref() {
+            builder = builder.label(label);
+        }
+        if self.merged {
+            builder = builder.merged();
+        }
+        if let Some(state) = self.state.as_deref() {
+            builder = builder.state(PrState::parse(state)?);
+        }
+        if let Some(text) = self.period.as_deref() {
+            let today = crate::storage::time_dimension::today(connection)?;
+            builder = match Period::parse_with_reference(text, today)? {
+                rolling @ Period::Rolling(..) => {
+                    let (start, end) = rolling.date_range();
+                    builder.between(start, end)
+                }
+                other => builder.period(other),
+            };
+        }
+        if let Some(since) = self.since {
+            builder = builder.since(since);
+        }
+        if let Some(until) = self.until {
+            builder = builder.until(until);
+        }
+        Ok(builder)
     }
 }
 

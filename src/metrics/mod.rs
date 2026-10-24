@@ -638,6 +638,17 @@ impl<'a> MetricsEngine<'a> {
             total_comments: Some(total_comments),
         })
     }
+
+    /// Metrics for a named group of either kind, resolving its members.
+    pub fn group_metrics(&self, group_name: &str, period: &Period) -> Result<GroupMetrics> {
+        use crate::groups::{self, GroupKind};
+        let kind = groups::kind_of(self.connection, group_name)?;
+        let members = groups::members(self.connection, kind, group_name)?;
+        match kind {
+            GroupKind::User => self.user_group_metrics(group_name, &members, period),
+            GroupKind::Repo => self.repo_group_metrics(group_name, &members, period),
+        }
+    }
 }
 
 #[cfg(test)]
