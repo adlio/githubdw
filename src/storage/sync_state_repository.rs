@@ -35,6 +35,79 @@ pub fn acquire_lock(conn: &Connection, entity_key: &str) -> Result<()> {
     Ok(())
 }
 
+fn lease_token(previous: Option<&str>) -> String {
+    loop {
+        let token = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        if Some(token.as_str()) != previous {
+            return token;
+        }
+    }
+}
+
+/// Acquire the lock and return an owner token (the exact `started_at` this
+/// caller wrote). Same exclusion as [`acquire_lock`]: a live lock refuses, a
+/// lock older than the stale window is taken over. The takeover deletes only
+/// the stale row it observed, so a concurrent fresh acquire still wins.
+pub fn acquire_owned_lock(conn: &Connection, entity_key: &str) -> Result<String> {
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT started_at FROM sync_locks WHERE entity_key = ?1",
+            [entity_key],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(started_at) = existing {
+        let started = started_at
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap_or_else(|_| Utc::now());
+        if Utc::now() - started < Duration::minutes(STALE_LOCK_MINUTES) {
+            return Err(Error::SyncInProgress(entity_key.to_string()));
+        }
+        conn.execute(
+            "DELETE FROM sync_locks WHERE entity_key = ?1 AND started_at = ?2",
+            params![entity_key, started_at],
+        )?;
+    }
+    let token = lease_token(None);
+    match conn.execute(
+        "INSERT INTO sync_locks (entity_key, started_at) VALUES (?1, ?2)",
+        params![entity_key, token],
+    ) {
+        Ok(_) => Ok(token),
+        Err(rusqlite::Error::SqliteFailure(failure, _))
+            if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Err(Error::SyncInProgress(entity_key.to_string()))
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Renew an owned lease. Returns the new token, or `None` when the lock is no
+/// longer this caller's (taken over as stale, or released by someone else).
+pub fn refresh_owned_lock(
+    conn: &Connection,
+    entity_key: &str,
+    token: &str,
+) -> Result<Option<String>> {
+    let next = lease_token(Some(token));
+    let changed = conn.execute(
+        "UPDATE sync_locks SET started_at = ?3 WHERE entity_key = ?1 AND started_at = ?2",
+        params![entity_key, token, next],
+    )?;
+    Ok((changed == 1).then_some(next))
+}
+
+/// Release only the lock this caller owns. Returns false, deleting nothing,
+/// when the lock now belongs to someone else.
+pub fn release_owned_lock(conn: &Connection, entity_key: &str, token: &str) -> Result<bool> {
+    let deleted = conn.execute(
+        "DELETE FROM sync_locks WHERE entity_key = ?1 AND started_at = ?2",
+        params![entity_key, token],
+    )?;
+    Ok(deleted == 1)
+}
+
 /// Release the lock (idempotent).
 pub fn release_lock(conn: &Connection, entity_key: &str) -> Result<()> {
     conn.execute("DELETE FROM sync_locks WHERE entity_key = ?1", [entity_key])?;
@@ -89,21 +162,36 @@ pub fn complete_job(
     skipped: i64,
     failed_items: &[(String, String)],
 ) -> Result<()> {
+    complete_job_outcome(conn, entity_key, synced, skipped, failed_items, false)
+}
+
+/// Record terminal counters and a paused catch-up state in one write. A budget
+/// yield is not a completed source scan and must not be labelled as one.
+pub fn complete_job_outcome(
+    conn: &Connection,
+    entity_key: &str,
+    synced: i64,
+    skipped: i64,
+    failed_items: &[(String, String)],
+    partial: bool,
+) -> Result<()> {
     let failed_json = if failed_items.is_empty() {
         None
     } else {
         Some(serde_json::to_string(failed_items)?)
     };
     conn.execute(
-        "UPDATE sync_jobs SET status = 'completed', completed_at = ?2,
-             synced = ?3, skipped = ?4, failed_items = ?5
+        "UPDATE sync_jobs SET status=?6, completed_at = ?2,
+             synced = ?3, skipped = ?4, failed_items = ?5,
+             error=CASE WHEN ?6='partial' THEN 'Catch-up paused; the next scheduled run resumes saved progress.' ELSE NULL END
          WHERE entity_key = ?1",
         params![
             entity_key,
             Utc::now().to_rfc3339(),
             synced,
             skipped,
-            failed_json
+            failed_json,
+            if partial { "partial" } else { "completed" }
         ],
     )?;
     Ok(())
@@ -347,6 +435,71 @@ pub fn advance_cursor(
                  excluded.last_updated_cursor)",
         params![source_type, source_id, Utc::now().to_rfc3339(), cursor],
     )?;
+    Ok(())
+}
+
+/// Read a resumable-walk checkpoint stored for a source.
+///
+/// Checkpoints live in `sync_metadata` under their own `source_type`, so no
+/// schema change is needed and readers that select a specific source type
+/// (`repo`, `user`, `user_reviews`) never see them. The value is opaque to
+/// storage; the syncer owns its format and validates it on load.
+pub fn load_checkpoint(
+    conn: &Connection,
+    checkpoint_type: &str,
+    source_id: &str,
+) -> Result<Option<String>> {
+    last_updated_cursor(conn, checkpoint_type, source_id)
+}
+
+/// Replace a resumable-walk checkpoint. Unlike [`advance_cursor`] this is a
+/// plain overwrite: a checkpoint describes a position, not a high-water mark.
+pub fn save_checkpoint(
+    conn: &Connection,
+    checkpoint_type: &str,
+    source_id: &str,
+    checkpoint: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO sync_metadata (source_type, source_id, last_sync_at, last_updated_cursor)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT (source_type, source_id) DO UPDATE SET
+             last_sync_at = excluded.last_sync_at,
+             last_updated_cursor = excluded.last_updated_cursor",
+        params![
+            checkpoint_type,
+            source_id,
+            Utc::now().to_rfc3339(),
+            checkpoint
+        ],
+    )?;
+    Ok(())
+}
+
+/// Drop a checkpoint (idempotent).
+pub fn clear_checkpoint(conn: &Connection, checkpoint_type: &str, source_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM sync_metadata WHERE source_type = ?1 AND source_id = ?2",
+        params![checkpoint_type, source_id],
+    )?;
+    Ok(())
+}
+
+/// Finish a walk atomically: advance the real high-water cursor and drop the
+/// checkpoint in one transaction, so a crash can never leave the cursor
+/// advanced while the checkpoint still points into the old walk, or the
+/// checkpoint gone while the cursor still sits at the old watermark.
+pub fn complete_walk(
+    conn: &Connection,
+    source_type: &str,
+    checkpoint_type: &str,
+    source_id: &str,
+    cursor: Option<&str>,
+) -> Result<()> {
+    let transaction = conn.unchecked_transaction()?;
+    advance_cursor(&transaction, source_type, source_id, cursor)?;
+    clear_checkpoint(&transaction, checkpoint_type, source_id)?;
+    transaction.commit()?;
     Ok(())
 }
 

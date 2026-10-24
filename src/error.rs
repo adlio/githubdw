@@ -35,6 +35,10 @@ pub enum Error {
     #[error("GitHub API error: {0}")]
     GitHubApi(String),
 
+    /// Git-backed file-set recovery failed or could not be validated.
+    #[error("git file recovery: {0}")]
+    GitRecovery(String),
+
     #[error("configuration error: {0}")]
     Config(String),
 
@@ -46,6 +50,11 @@ pub enum Error {
 
     #[error("sync already in progress for {0}")]
     SyncInProgress(String),
+
+    /// A request was refused locally because it would spend quota the
+    /// caller reserved. Nothing was sent to the provider.
+    #[error("quota reserve reached: {0}")]
+    QuotaReserve(String),
 
     /// LLM / agent failure (only present with the `summaries` feature).
     #[cfg(feature = "summaries")]

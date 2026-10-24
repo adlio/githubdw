@@ -149,6 +149,9 @@ mod tests {
             labels: vec![],
             assignees: vec![],
             comments: vec![],
+            pending_comments: None,
+            pending_labels: None,
+            pending_assignees: None,
         }
     }
 
