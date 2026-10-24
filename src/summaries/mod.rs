@@ -12,7 +12,7 @@
 //! structured result. Bedrock and `mixtape-core` are public dependencies, so
 //! enabling this feature adds no Amazon-internal coupling to the crate.
 //!
-//! Entry point: [`summarize_pr`]. Scope is intentionally single-PR only; there
+//! Entry point: [`summarize_pr`](crate::summaries::summarize_pr). Scope is intentionally single-PR only; there
 //! are no period-level (user / team / repo) summary functions here.
 
 pub mod pr_summary;
