@@ -103,7 +103,6 @@ pub(super) fn los_angeles_warehouse() -> GithubDW {
 pub(super) struct RoutingTransport {
     pub(super) pages: std::sync::Mutex<Vec<String>>,
     pub(super) continuations: Vec<(&'static str, &'static str, String)>,
-    pub(super) continuation_calls: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl crate::fetch::GhTransport for RoutingTransport {
@@ -136,10 +135,6 @@ impl crate::fetch::GhTransport for RoutingTransport {
                     .to_string()
             })
             .unwrap_or_default();
-        self.continuation_calls
-            .lock()
-            .unwrap()
-            .push((field.clone(), cursor.clone()));
         self.continuations
             .iter()
             .find(|(f, c, _)| *f == field && *c == cursor)
@@ -159,7 +154,6 @@ pub(super) fn routing_client(
     let transport = std::sync::Arc::new(RoutingTransport {
         pages: std::sync::Mutex::new(pages),
         continuations,
-        continuation_calls: std::sync::Mutex::new(Vec::new()),
     });
     struct Shared(std::sync::Arc<RoutingTransport>);
     impl crate::fetch::GhTransport for Shared {

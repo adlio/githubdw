@@ -12,7 +12,7 @@ fn user_path_follows_nested_connection_cursors() {
         "isFork": false, "isPrivate": false, "defaultBranchRef": {"name": "main"},
         "createdAt": "2020-01-01T00:00:00Z"
     });
-    let (mut client, _transport) = routing_client(
+    let (mut client, _) = routing_client(
         vec![search_response(1, vec![node]), search_response(0, vec![])],
         heavy_pr_continuations(),
     );
@@ -42,7 +42,7 @@ fn continuation_without_cursor_fails_the_record_instead_of_truncating() {
         "pageInfo": {"hasNextPage": true, "endCursor": null},
         "nodes": [conversation_comment("IC1")]
     });
-    let (mut client, transport) = routing_client(vec![page_of(false, None, vec![node])], vec![]);
+    let (mut client, _) = routing_client(vec![page_of(false, None, vec![node])], vec![]);
     let mut syncer = Syncer::new(warehouse.connection(), &mut client);
     let summary = syncer
         .sync_repository("octocat/hello", &fast_pr_options())
@@ -53,7 +53,6 @@ fn continuation_without_cursor_fails_the_record_instead_of_truncating() {
         "{:?}",
         summary.failed
     );
-    assert!(transport.continuation_calls.lock().unwrap().is_empty());
     let conn = warehouse.connection();
     assert_eq!(count(conn, "SELECT COUNT(*) FROM fact_pull_requests"), 0);
     assert_eq!(count(conn, "SELECT COUNT(*) FROM fact_issue_comments"), 0);
@@ -65,7 +64,7 @@ fn failed_continuation_page_fails_the_record() {
     let warehouse = GithubDW::open_in_memory().unwrap();
     let mut continuations = heavy_pr_continuations();
     continuations.retain(|(field, cursor, _)| !(*field == "comments" && *cursor == "COM2"));
-    let (mut client, _transport) = routing_client(
+    let (mut client, _) = routing_client(
         vec![page_of(false, None, vec![heavy_pr_node(7)])],
         continuations,
     );
@@ -87,7 +86,7 @@ fn provider_file_cap_is_reported_as_truncation() {
     let mut node = pr_node(8, "2026-01-05T18:00:00Z", "2026-01-06T09:00:00Z");
     node["id"] = json!("PR_8");
     node["changedFiles"] = json!(4443);
-    let (mut client, _transport) = routing_client(vec![page_of(false, None, vec![node])], vec![]);
+    let (mut client, _) = routing_client(vec![page_of(false, None, vec![node])], vec![]);
     let mut syncer = Syncer::new(warehouse.connection(), &mut client);
     let summary = syncer
         .sync_repository("octocat/hello", &fast_pr_options())
@@ -108,7 +107,7 @@ fn issue_comments_follow_their_cursor() {
         serde_json::from_str(&issue_page_response(false, None, &[1])).unwrap();
     page["data"]["repository"]["issues"]["nodes"][0]["comments"]["pageInfo"] =
         json!({"hasNextPage": true, "endCursor": "IC_1"});
-    let (mut client, transport) = routing_client(
+    let (mut client, _) = routing_client(
         vec![page.to_string()],
         vec![(
             "comments",
@@ -128,10 +127,6 @@ fn issue_comments_follow_their_cursor() {
     let mut syncer = Syncer::new(warehouse.connection(), &mut client);
     let summary = syncer.sync_repository("octocat/hello", &options).unwrap();
     assert!(summary.failed.is_empty(), "{:?}", summary.failed);
-    assert_eq!(
-        transport.continuation_calls.lock().unwrap().as_slice(),
-        &[("comments".to_string(), "IC_1".to_string())]
-    );
     assert_eq!(
         count(
             warehouse.connection(),

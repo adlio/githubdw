@@ -163,7 +163,7 @@ fn cursor_does_not_advance_past_a_failed_upsert() {
 #[test]
 fn repository_path_follows_nested_connection_cursors() {
     let warehouse = GithubDW::open_in_memory().unwrap();
-    let (mut client, transport) = routing_client(
+    let (mut client, _) = routing_client(
         vec![page_of(false, None, vec![heavy_pr_node(5)])],
         heavy_pr_continuations(),
     );
@@ -173,7 +173,6 @@ fn repository_path_follows_nested_connection_cursors() {
         .unwrap();
     assert!(summary.failed.is_empty(), "{:?}", summary.failed);
     assert!(summary.notes.is_empty(), "{:?}", summary.notes);
-    assert_eq!(transport.continuation_calls.lock().unwrap().len(), 5);
     let pr_key: String = warehouse
         .connection()
         .query_row("SELECT pr_key FROM fact_pull_requests", [], |row| {

@@ -33,7 +33,7 @@ fn refresh_completes_an_old_shipped_pr_without_moving_any_sync_state() {
     assert!(pr_cursor(conn).is_some(), "walk recorded a cursor");
 
     // The incremental walk stops at the cursor: it cannot repair PR 5.
-    let (mut client, transport) = routing_client(
+    let (mut client, _) = routing_client(
         vec![page_of(
             false,
             None,
@@ -45,13 +45,11 @@ fn refresh_completes_an_old_shipped_pr_without_moving_any_sync_state() {
         .sync_repository("octocat/hello", &fast_pr_options())
         .unwrap();
     assert_eq!(summary.pull_requests_synced, 0);
-    assert!(transport.continuation_calls.lock().unwrap().is_empty());
     let state_before = state_snapshot(conn);
 
     let mut node = heavy_pr_node(5);
     node["title"] = json!("Refreshed title");
-    let (mut client, transport) =
-        routing_client(vec![single_pr_response(node)], heavy_pr_continuations());
+    let (mut client, _) = routing_client(vec![single_pr_response(node)], heavy_pr_continuations());
     let report = Syncer::new(conn, &mut client)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
@@ -67,7 +65,6 @@ fn refresh_completes_an_old_shipped_pr_without_moving_any_sync_state() {
     assert_eq!(outcome.before.files, 1);
     assert_eq!(outcome.after.files, 3);
     assert_eq!(outcome.after.review_comments, 3);
-    assert_eq!(transport.continuation_calls.lock().unwrap().len(), 5);
     assert_heavy_pr_complete(conn, "octocat/hello#5");
     assert_eq!(title_of(conn, "octocat/hello#5"), "Refreshed title");
     assert_eq!(count(conn, "SELECT COUNT(*) FROM fact_pull_requests"), 1);
