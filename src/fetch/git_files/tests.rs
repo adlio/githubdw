@@ -475,6 +475,19 @@ fn runaway_output_and_time_are_bounded() {
     let error = run_git(&config, None, &["help", "-a"], Duration::from_secs(30)).unwrap_err();
     assert!(error.to_string().contains("more than 10 bytes"), "{error}");
     config.max_output_bytes = 1 << 20;
-    let error = run_git(&config, None, &["help", "-a"], Duration::from_millis(0)).unwrap_err();
+    // A command that outlives its bound. `git help -a` with a zero bound was
+    // racy: it can exit before the first deadline check.
+    let started = std::time::Instant::now();
+    let error = run_git(
+        &config,
+        None,
+        &["-c", "alias.pause=!sleep 5", "pause"],
+        Duration::from_millis(50),
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("exceeded"), "{error}");
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "the child was not killed"
+    );
 }
