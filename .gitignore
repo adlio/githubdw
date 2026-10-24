@@ -25,3 +25,8 @@ target
 
 # Release packaging scratch dir (built by CI, never committed)
 dist/
+
+# Local operational run state and one-off repair tooling (never committed)
+/.recovery-evidence/
+/scripts/
+__pycache__/
