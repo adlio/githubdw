@@ -422,8 +422,8 @@ impl Syncer<'_> {
             let expression = format!(
                 "is:pr {}:{login} updated:{}..{} sort:updated-desc",
                 role.qualifier(),
-                search_timestamp(start),
-                search_timestamp(end),
+                search_timestamp(start)?,
+                search_timestamp(end)?,
             );
             let data = loop {
                 match self.client.graphql_search(
@@ -522,7 +522,7 @@ impl Syncer<'_> {
         // The frozen bound, not the newest observed item, closes this walk.
         // Future updates are fetched by the next incremental walk. Keep the
         // freshness stamp at that bound when resuming a walk from a prior run.
-        let boundary = search_timestamp(saved.upper);
+        let boundary = search_timestamp(saved.upper)?;
         let transaction = self.connection.unchecked_transaction()?;
         sync_state::advance_cursor(
             &transaction,

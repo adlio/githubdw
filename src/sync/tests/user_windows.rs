@@ -5,7 +5,7 @@ fn user_update_window_failure_retains_checkpoint_and_cursor() {
     let warehouse = los_angeles_warehouse();
     let conn = warehouse.connection();
     let now = evening_instant();
-    let base = search_timestamp(now.timestamp());
+    let base = search_timestamp(now.timestamp()).unwrap();
     sync_state::advance_cursor(conn, "user", "octocat", Some(&base)).unwrap();
     let (mut client, _) = shared_client(vec![Ok(search_response(
         1,
@@ -43,8 +43,8 @@ fn user_update_windows_ingest_complete_search_results_with_newer_node_timestamps
     let warehouse = los_angeles_warehouse();
     let conn = warehouse.connection();
     let now = evening_instant();
-    let base = search_timestamp(now.timestamp() - 60);
-    let later = search_timestamp(now.timestamp() + 86400);
+    let base = search_timestamp(now.timestamp() - 60).unwrap();
+    let later = search_timestamp(now.timestamp() + 86400).unwrap();
     // GitHub can match the older search-index timestamp while returning a
     // newer PR node. This reproduces the live #14430 catch-up blocker.
     let (mut client, _) = shared_client(vec![Ok(search_response(
@@ -71,7 +71,7 @@ fn user_update_windows_ingest_complete_search_results_with_newer_node_timestamps
     assert_eq!(count(conn, "SELECT count(*) FROM fact_pull_requests"), 2);
     assert_eq!(
         sync_state::last_updated_cursor(conn, "user", "octocat").unwrap(),
-        Some(search_timestamp(now.timestamp())),
+        Some(search_timestamp(now.timestamp()).unwrap()),
         "a newer returned node must not advance coverage beyond the frozen search bound"
     );
     assert!(
@@ -87,7 +87,7 @@ fn user_update_windows_keep_unsplittable_ties_and_incomplete_responses_open() {
         let warehouse = los_angeles_warehouse();
         let conn = warehouse.connection();
         let now = evening_instant();
-        let base = search_timestamp(now.timestamp());
+        let base = search_timestamp(now.timestamp()).unwrap();
         let (mut client, _) = shared_client(vec![Ok(response)]);
         let mut summary = SyncSummary::default();
         Syncer::new(conn, &mut client)
@@ -159,7 +159,7 @@ fn user_update_checkpoint_survives_transport_failure_and_restarts_invalid_state(
     let warehouse = los_angeles_warehouse();
     let conn = warehouse.connection();
     let now = evening_instant();
-    let base = search_timestamp(now.timestamp() - 1);
+    let base = search_timestamp(now.timestamp() - 1).unwrap();
     let saved = UserUpdateCheckpoint {
         version: CHECKPOINT_VERSION,
         base: base.clone(),
@@ -227,7 +227,7 @@ fn user_update_checkpoint_survives_transport_failure_and_restarts_invalid_state(
     let calls = transport.calls.lock().unwrap();
     assert!(calls[0].iter().any(|a| a.contains(&format!(
         "updated:{base}..{}",
-        search_timestamp(now.timestamp())
+        search_timestamp(now.timestamp()).unwrap()
     ))));
     assert!(
         sync_state::load_checkpoint(conn, "user_update_checkpoint", "author:octocat")

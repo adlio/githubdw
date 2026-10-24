@@ -65,7 +65,7 @@ pub fn today_or_default(conn: &Connection) -> NaiveDate {
     let timezone = configured_timezone(conn).unwrap_or_else(|_| {
         DEFAULT_TIMEZONE
             .parse::<Tz>()
-            .expect("DEFAULT_TIMEZONE is a valid IANA zone")
+            .unwrap_or(chrono_tz::America::Los_Angeles)
     });
     local_date_for(Utc::now(), timezone)
 }
@@ -117,13 +117,14 @@ pub fn derive_local_keys(timestamp_utc: &DateTime<Utc>, timezone: Tz) -> LocalKe
 
 fn day_of_half(date: NaiveDate) -> i64 {
     let half_start_month = if date.month() <= 6 { 1 } else { 7 };
-    let half_start = NaiveDate::from_ymd_opt(date.year(), half_start_month, 1).unwrap();
+    let half_start = NaiveDate::from_ymd_opt(date.year(), half_start_month, 1).unwrap_or(date);
     (date - half_start).num_days() + 1
 }
 
 fn day_of_quarter(date: NaiveDate) -> i64 {
     let quarter_start_month = ((date.month() - 1) / 3) * 3 + 1;
-    let quarter_start = NaiveDate::from_ymd_opt(date.year(), quarter_start_month, 1).unwrap();
+    let quarter_start =
+        NaiveDate::from_ymd_opt(date.year(), quarter_start_month, 1).unwrap_or(date);
     (date - quarter_start).num_days() + 1
 }
 

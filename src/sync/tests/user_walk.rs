@@ -443,7 +443,7 @@ fn large_user_walk_resumes_time_windows_without_search_offsets() {
     let warehouse = los_angeles_warehouse();
     let conn = warehouse.connection();
     let now = evening_instant();
-    let base = search_timestamp(now.timestamp() - 1);
+    let base = search_timestamp(now.timestamp() - 1).unwrap();
     sync_state::record_range_as_of(conn, "user:octocat", "2026-08-15", "2026-08-15", 0, now)
         .unwrap();
     for role in UserRole::all() {
@@ -469,7 +469,7 @@ fn large_user_walk_resumes_time_windows_without_search_offsets() {
         // The other role has nothing newer than its existing cursor.
         Ok(search_response(0, vec![])),
         // Resume must fetch only the remaining second, no legacy probe.
-        Ok(leaf(2, &search_timestamp(now.timestamp()))),
+        Ok(leaf(2, &search_timestamp(now.timestamp()).unwrap())),
         Ok(search_response(0, vec![])),
     ]);
     let first = Syncer::new(conn, &mut client)
@@ -515,15 +515,15 @@ fn large_user_walk_resumes_time_windows_without_search_offsets() {
     );
     assert_eq!(
         sync_state::last_updated_cursor(conn, "user", "octocat").unwrap(),
-        Some(search_timestamp(now.timestamp()))
+        Some(search_timestamp(now.timestamp()).unwrap())
     );
     let stamp: String = conn.query_row("SELECT last_sync_at FROM sync_metadata WHERE source_type='user' AND source_id='octocat'", [], |r| r.get(0)).unwrap();
-    assert_eq!(stamp, search_timestamp(now.timestamp()));
+    assert_eq!(stamp, search_timestamp(now.timestamp()).unwrap());
     assert!(requested_cursors(&transport).iter().all(Option::is_none));
     let calls = transport.calls.lock().unwrap();
     let last_author_query = calls[4].iter().find(|a| a.starts_with("q=")).unwrap();
     assert!(last_author_query.contains(&format!(
         "updated:{0}..{0}",
-        search_timestamp(now.timestamp())
+        search_timestamp(now.timestamp()).unwrap()
     )));
 }

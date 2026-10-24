@@ -98,10 +98,12 @@ pub struct Syncer<'a> {
     git_recovery: Option<GitRecoveryConfig>,
 }
 
-fn search_timestamp(seconds: i64) -> String {
+fn search_timestamp(seconds: i64) -> Result<String> {
     DateTime::from_timestamp(seconds, 0)
-        .expect("timestamp originated from a parsed UTC date")
-        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        .map(|instant| instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .ok_or_else(|| {
+            crate::Error::InvalidArgument(format!("search window bound {seconds} is out of range"))
+        })
 }
 
 /// GitHub's message for a connection cursor it no longer accepts.
