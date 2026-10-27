@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - unreleased
+
+### Breaking
+
+- `Error` gains `GitRecovery` and `QuotaReserve` variants; exhaustive matches
+  on `Error` need a new arm.
+- New public fields break struct literals: `fetch::issues::IssueData`
+  (`pending_comments`, `pending_labels`, `pending_assignees`),
+  `fetch::pull_requests::PullRequestData` (`node_id`, `pending`,
+  `changed_files_reported`, `check_runs_truncated`, ...), and
+  `sync::SyncSummary` (`partial`).
+
+### Added
+
+- Nested-connection continuation, so heavy pull requests and issues land with
+  every comment, review, thread and file instead of the first slice.
+- Git-backed recovery of pull-request file sets GitHub caps at 3,000 files.
+- `sync targets`, `sync repair-plan`, `sync check-history` and
+  `sync check-history-plan`.
+- `GithubDW::open_read_only`.
+- `query::PrFilters` and `PrState::parse`: the filter set the CLI and the MCP
+  query tool share.
+- `MetricsEngine::group_metrics`, `storage::config_repository`, and
+  `sync_state_repository::{active_syncs, recent_jobs}`.
+
+### Changed
+
+- `query --state` with an unknown value now lists the accepted values.
+- Internal layout: `sync`, the CLI binary, `check_history` and
+  `fetch::git_files` are split into submodules. Public paths are unchanged.
+
 ## [0.2.4] - 2026-08-17
 
 ### Added

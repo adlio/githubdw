@@ -3,44 +3,61 @@
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use crate::fetch::GhClient;
+use crate::fetch::continuation::{
+    PendingConnection, fetch_remaining, required_connection, required_str,
+};
 
 /// GraphQL query for a repository's pull requests with nested reviews,
 /// review-thread comments, conversation comments, files, and check runs.
 /// `page_size` tunes the outer page: large repos with heavy PRs can overflow
 /// GitHub's response stream at 25, so the syncer degrades adaptively.
 pub fn repository_pull_requests_query(page_size: u32) -> String {
-    REPOSITORY_PULL_REQUESTS_QUERY_TEMPLATE.replace("{PAGE_SIZE}", &page_size.to_string())
+    REPOSITORY_PULL_REQUESTS_QUERY_TEMPLATE
+        .replace("{PAGE_SIZE}", &page_size.to_string())
+        .replace("{REPOSITORY}", REPOSITORY_HEADER_SELECTION)
+        .replace("{NODE}", PULL_REQUEST_NODE_SELECTION)
 }
 
-const REPOSITORY_PULL_REQUESTS_QUERY_TEMPLATE: &str = r#"
-query($owner: String!, $name: String!, $cursor: String) {
-  rateLimit { limit cost remaining resetAt }
-  repository(owner: $owner, name: $name) {
-    nameWithOwner
+/// GraphQL query for ONE pull request addressed by number, with the same node
+/// selection as the repository walk, so a targeted refresh parses, hydrates,
+/// and lands through exactly the same code as a bulk sync.
+pub fn single_pull_request_query() -> String {
+    SINGLE_PULL_REQUEST_QUERY_TEMPLATE
+        .replace("{REPOSITORY}", REPOSITORY_HEADER_SELECTION)
+        .replace("{NODE}", PULL_REQUEST_NODE_SELECTION)
+}
+
+/// Repository dimension fields selected alongside pull requests.
+pub const REPOSITORY_HEADER_SELECTION: &str = r#"nameWithOwner
     primaryLanguage { name }
     isFork
     isPrivate
     defaultBranchRef { name }
-    createdAt
-    pullRequests(first: {PAGE_SIZE}, after: $cursor,
-                 orderBy: {field: UPDATED_AT, direction: DESC}) {
-      pageInfo { hasNextPage endCursor }
-      nodes {
-        number title body state isDraft
+    createdAt"#;
+
+/// The pull-request node selection shared by the repository walk, the
+/// user-search walk, and the targeted refresh. Keep the continuation
+/// selections below in step with it.
+pub const PULL_REQUEST_NODE_SELECTION: &str = r#"id number title body state isDraft
         createdAt updatedAt mergedAt closedAt
         baseRefName headRefName
         additions deletions changedFiles
         author { login __typename }
         mergedBy { login __typename }
         reviews(first: 50) {
+          pageInfo { hasNextPage endCursor }
           nodes {
             id state body submittedAt
             author { login __typename }
           }
         }
         reviewThreads(first: 50) {
+          pageInfo { hasNextPage endCursor }
           nodes {
+            id
             comments(first: 50) {
+              pageInfo { hasNextPage endCursor }
               nodes {
                 id body path line createdAt
                 author { login __typename }
@@ -50,29 +67,57 @@ query($owner: String!, $name: String!, $cursor: String) {
           }
         }
         comments(first: 50) {
+          pageInfo { hasNextPage endCursor }
           nodes {
             id body createdAt
             author { login __typename }
           }
         }
         files(first: 100) {
+          pageInfo { hasNextPage endCursor }
           nodes { path changeType additions deletions }
         }
         commits(last: 1) {
           nodes {
             commit {
-              oid
+              id oid
               checkSuites(first: 10) {
+                pageInfo { hasNextPage endCursor }
                 nodes {
-                  checkRuns(first: 20) {
+                  id
+                  checkRuns(first: 20, filterBy: {checkType: ALL}) {
+                    pageInfo { hasNextPage endCursor }
                     nodes { id name status conclusion startedAt completedAt }
                   }
                 }
               }
             }
           }
-        }
+        }"#;
+
+const REPOSITORY_PULL_REQUESTS_QUERY_TEMPLATE: &str = r#"
+query($owner: String!, $name: String!, $cursor: String) {
+  rateLimit { limit cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    {REPOSITORY}
+    pullRequests(first: {PAGE_SIZE}, after: $cursor,
+                 orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes {
+        {NODE}
       }
+    }
+  }
+}
+"#;
+
+const SINGLE_PULL_REQUEST_QUERY_TEMPLATE: &str = r#"
+query($owner: String!, $name: String!, $number: Int!) {
+  rateLimit { limit cost remaining resetAt }
+  repository(owner: $owner, name: $name) {
+    {REPOSITORY}
+    pullRequest(number: $number) {
+      {NODE}
     }
   }
 }
@@ -125,6 +170,10 @@ pub struct PullRequestData {
     pub additions: i64,
     pub deletions: i64,
     pub changed_files: i64,
+    /// True when the provider actually reported `changedFiles`. A missing
+    /// field reads as 0 in `changed_files`, which must never be mistaken for
+    /// an authoritative empty file set.
+    pub changed_files_reported: bool,
     pub author: Option<ActorReference>,
     pub merged_by: Option<ActorReference>,
     pub reviews: Vec<ReviewData>,
@@ -133,7 +182,26 @@ pub struct PullRequestData {
     pub files: Vec<FileDiffData>,
     pub head_sha: Option<String>,
     pub check_runs: Vec<CheckRunData>,
+    /// GraphQL node id, used to continue nested connections.
+    pub node_id: Option<String>,
+    /// Nested connections whose first slice did not hold every node.
+    pub pending: Vec<PendingConnection>,
+    /// True until pending head-commit check suites and runs are hydrated.
+    pub check_runs_truncated: bool,
 }
+
+/// Node selections reused by the continuation queries; they must match the
+/// fields the page queries select for each connection.
+const REVIEW_SELECTION: &str = "id state body submittedAt author { login __typename }";
+const REVIEW_COMMENT_SELECTION: &str =
+    "id body path line createdAt author { login __typename } replyTo { id }";
+const REVIEW_THREAD_SELECTION: &str = "id comments(first: 50) { pageInfo { hasNextPage endCursor } \
+     nodes { id body path line createdAt author { login __typename } replyTo { id } } }";
+const CONVERSATION_COMMENT_SELECTION: &str = "id body createdAt author { login __typename }";
+const FILE_SELECTION: &str = "path changeType additions deletions";
+const CHECK_RUN_SELECTION: &str = "id name status conclusion startedAt completedAt";
+const CHECK_SUITE_SELECTION: &str = "id checkRuns(first: 20, filterBy: {checkType: ALL}) { pageInfo { hasNextPage endCursor } \
+    nodes { id name status conclusion startedAt completedAt } }";
 
 #[derive(Debug, Clone)]
 pub struct ReviewData {
@@ -198,13 +266,63 @@ fn integer_field(value: &Value, field: &str) -> i64 {
     value.get(field).and_then(Value::as_i64).unwrap_or(0)
 }
 
-fn nodes<'a>(value: &'a Value, collection: &str) -> Vec<&'a Value> {
-    value
+/// Read a top-level connection's page status, failing closed.
+///
+/// A missing `pageInfo` or `hasNextPage` used to read as "last page", which
+/// silently ended a walk on a malformed response and let it commit coverage it
+/// never fetched. A page that claims a successor without a cursor is equally
+/// unusable.
+pub fn page_status(connection: &Value, label: &str) -> Result<(bool, Option<String>)> {
+    let page_info = connection
+        .get("pageInfo")
+        .filter(|info| !info.is_null())
+        .ok_or_else(|| Error::GitHubApi(format!("{label} has no pageInfo")))?;
+    let has_next = page_info
+        .get("hasNextPage")
+        .and_then(Value::as_bool)
+        .ok_or_else(|| Error::GitHubApi(format!("{label} has no hasNextPage")))?;
+    let end_cursor = page_info
+        .get("endCursor")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    if has_next && end_cursor.is_none() {
+        return Err(Error::GitHubApi(format!(
+            "{label} reports another page but no endCursor"
+        )));
+    }
+    Ok((has_next, end_cursor))
+}
+
+/// The `nodes` of `value[collection]`, failing closed on a missing or null
+/// connection, a missing nodes array, or a null node.
+pub fn strict_nodes<'a>(value: &'a Value, collection: &str, label: &str) -> Result<Vec<&'a Value>> {
+    let nodes = value
         .get(collection)
-        .and_then(|c| c.get("nodes"))
+        .filter(|connection| !connection.is_null())
+        .and_then(|connection| connection.get("nodes"))
         .and_then(Value::as_array)
-        .map(|array| array.iter().collect())
-        .unwrap_or_default()
+        .ok_or_else(|| Error::GitHubApi(format!("{label} has no nodes array")))?;
+    if nodes.iter().any(Value::is_null) {
+        return Err(Error::GitHubApi(format!("{label} contains a null node")));
+    }
+    Ok(nodes.iter().collect())
+}
+
+/// Parse the single-pull-request query response (`data` value).
+///
+/// A `null` pull request (deleted, or the number names an issue) is an error,
+/// never an empty success.
+pub fn parse_single_pull_request(data: &Value) -> Result<(RepositoryMetadata, PullRequestData)> {
+    let repository = data
+        .get("repository")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| Error::GitHubApi("repository not found in response".into()))?;
+    let metadata = parse_repository_metadata(repository)?;
+    let node = repository
+        .get("pullRequest")
+        .filter(|value| !value.is_null())
+        .ok_or_else(|| Error::GitHubApi("pull request not found".into()))?;
+    Ok((metadata, parse_pull_request_node(node)?))
 }
 
 /// Parse a `repository { … }` selection into its dimension metadata.
@@ -250,18 +368,10 @@ pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
         .get("pullRequests")
         .ok_or_else(|| Error::GitHubApi("repository.pullRequests missing".into()))?;
 
-    let page_info = pull_requests_value.get("pageInfo");
-    let has_next_page = page_info
-        .and_then(|info| info.get("hasNextPage"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let end_cursor = page_info
-        .and_then(|info| info.get("endCursor"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let (has_next_page, end_cursor) = page_status(pull_requests_value, "repository.pullRequests")?;
 
     let mut pull_requests = Vec::new();
-    for node in nodes(repository, "pullRequests") {
+    for node in strict_nodes(repository, "pullRequests", "repository.pullRequests")? {
         pull_requests.push(parse_pull_request_node(node)?);
     }
 
@@ -285,91 +395,65 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
     let created_at = string_field(node, "createdAt")
         .ok_or_else(|| Error::GitHubApi(format!("PR #{number} has no createdAt")))?;
 
-    let reviews = nodes(node, "reviews")
+    let node_id = string_field(node, "id");
+    let label = format!("PR #{number}");
+    let owner = node_id.as_deref();
+    let mut pending = Vec::new();
+
+    let (review_nodes, more) = required_connection(
+        node,
+        "reviews",
+        &format!("{label} reviews"),
+        owner,
+        "PullRequest",
+    )?;
+    pending.extend(more);
+    let reviews = review_nodes
         .into_iter()
-        .filter_map(|review| {
-            Some(ReviewData {
-                id: string_field(review, "id")?,
-                state: string_field(review, "state").unwrap_or_else(|| "COMMENTED".into()),
-                body: string_field(review, "body").filter(|body| !body.is_empty()),
-                submitted_at: string_field(review, "submittedAt"),
-                author: review.get("author").and_then(ActorReference::from_value),
-            })
-        })
-        .collect();
+        .map(parse_review)
+        .collect::<Result<Vec<_>>>()?;
 
     let mut review_comments = Vec::new();
-    for thread in nodes(node, "reviewThreads") {
-        for comment in nodes(thread, "comments") {
-            let Some(id) = string_field(comment, "id") else {
-                continue;
-            };
-            let Some(created) = string_field(comment, "createdAt") else {
-                continue;
-            };
-            review_comments.push(ReviewCommentData {
-                id,
-                body: string_field(comment, "body"),
-                path: string_field(comment, "path"),
-                line: comment.get("line").and_then(Value::as_i64),
-                created_at: created,
-                author: comment.get("author").and_then(ActorReference::from_value),
-                in_reply_to: comment
-                    .get("replyTo")
-                    .and_then(|reply| reply.get("id"))
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            });
-        }
+    let (threads, more) = required_connection(
+        node,
+        "reviewThreads",
+        &format!("{label} reviewThreads"),
+        owner,
+        "PullRequest",
+    )?;
+    pending.extend(more);
+    for thread in threads {
+        collect_thread(thread, &mut review_comments, &mut pending)?;
     }
 
-    let conversation_comments = nodes(node, "comments")
+    let (comment_nodes, more) = required_connection(
+        node,
+        "comments",
+        &format!("{label} comments"),
+        owner,
+        "PullRequest",
+    )?;
+    pending.extend(more);
+    let conversation_comments = comment_nodes
         .into_iter()
-        .filter_map(|comment| {
-            Some(ConversationCommentData {
-                id: string_field(comment, "id")?,
-                body: string_field(comment, "body"),
-                created_at: string_field(comment, "createdAt")?,
-                author: comment.get("author").and_then(ActorReference::from_value),
-            })
-        })
-        .collect();
+        .map(parse_conversation_comment)
+        .collect::<Result<Vec<_>>>()?;
 
-    let files = nodes(node, "files")
+    let (file_nodes, more) = required_connection(
+        node,
+        "files",
+        &format!("{label} files"),
+        owner,
+        "PullRequest",
+    )?;
+    pending.extend(more);
+    let files = file_nodes
         .into_iter()
-        .filter_map(|file| {
-            Some(FileDiffData {
-                path: string_field(file, "path")?,
-                change_type: string_field(file, "changeType").unwrap_or_else(|| "MODIFIED".into()),
-                additions: integer_field(file, "additions"),
-                deletions: integer_field(file, "deletions"),
-            })
-        })
-        .collect();
+        .map(parse_file)
+        .collect::<Result<Vec<_>>>()?;
 
-    let mut head_sha = None;
-    let mut check_runs = Vec::new();
-    for commit_node in nodes(node, "commits") {
-        let Some(commit) = commit_node.get("commit") else {
-            continue;
-        };
-        head_sha = string_field(commit, "oid");
-        for suite in nodes(commit, "checkSuites") {
-            for check in nodes(suite, "checkRuns") {
-                let Some(id) = string_field(check, "id") else {
-                    continue;
-                };
-                check_runs.push(CheckRunData {
-                    id,
-                    name: string_field(check, "name").unwrap_or_default(),
-                    status: string_field(check, "status").unwrap_or_else(|| "COMPLETED".into()),
-                    conclusion: string_field(check, "conclusion"),
-                    started_at: string_field(check, "startedAt"),
-                    completed_at: string_field(check, "completedAt"),
-                });
-            }
-        }
-    }
+    let (head_sha, check_runs, check_runs_truncated) =
+        parse_head_commit(node, &label, &mut pending)?;
 
     Ok(PullRequestData {
         number,
@@ -389,6 +473,7 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
         additions: integer_field(node, "additions"),
         deletions: integer_field(node, "deletions"),
         changed_files: integer_field(node, "changedFiles"),
+        changed_files_reported: node.get("changedFiles").and_then(Value::as_i64).is_some(),
         author: node.get("author").and_then(ActorReference::from_value),
         merged_by: node.get("mergedBy").and_then(ActorReference::from_value),
         reviews,
@@ -397,7 +482,355 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
         files,
         head_sha,
         check_runs,
+        node_id,
+        pending,
+        check_runs_truncated,
     })
+}
+
+/// The head commit selected by `commits(last: 1)`.
+///
+/// That selection deliberately asks for the newest commit only and no
+/// `pageInfo`: the full commit history is not walked, so its absence is not a
+/// truncation. The connection and each commit object must still be present
+/// and well formed, and the commit's check suites are a required, paginated
+/// connection like any other.
+fn parse_head_commit(
+    node: &Value,
+    label: &str,
+    pending: &mut Vec<PendingConnection>,
+) -> Result<(Option<String>, Vec<CheckRunData>, bool)> {
+    let commits = node
+        .get("commits")
+        .filter(|connection| !connection.is_null())
+        .and_then(|connection| connection.get("nodes"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| Error::GitHubApi(format!("{label} commits has no nodes array")))?;
+    let mut head_sha = None;
+    let mut check_runs = Vec::new();
+    let mut truncated = false;
+    for commit_node in commits {
+        let commit = commit_node
+            .get("commit")
+            .filter(|commit| !commit.is_null())
+            .ok_or_else(|| Error::GitHubApi(format!("{label} head commit node has no commit")))?;
+        let commit_label = format!("{label} head commit");
+        let commit_id = required_str(commit, "id", &commit_label)?;
+        head_sha = Some(required_str(commit, "oid", &commit_label)?);
+        let (suites, more) = required_connection(
+            commit,
+            "checkSuites",
+            &format!("{commit_label} checkSuites"),
+            Some(&commit_id),
+            "Commit",
+        )?;
+        truncated |= more.is_some();
+        pending.extend(more);
+        for suite in suites {
+            truncated |= collect_check_suite(suite, &mut check_runs, pending)?;
+        }
+    }
+    Ok((head_sha, check_runs, truncated))
+}
+
+fn parse_check_run(check: &Value) -> Result<CheckRunData> {
+    Ok(CheckRunData {
+        id: required_str(check, "id", "check run")?,
+        name: string_field(check, "name").unwrap_or_default(),
+        status: string_field(check, "status").unwrap_or_else(|| "COMPLETED".into()),
+        conclusion: string_field(check, "conclusion"),
+        started_at: string_field(check, "startedAt"),
+        completed_at: string_field(check, "completedAt"),
+    })
+}
+
+/// Collect one check suite's runs; returns true when its runs continue.
+fn collect_check_suite(
+    suite: &Value,
+    check_runs: &mut Vec<CheckRunData>,
+    pending: &mut Vec<PendingConnection>,
+) -> Result<bool> {
+    let suite_id = required_str(suite, "id", "check suite")?;
+    let (runs, more) = required_connection(
+        suite,
+        "checkRuns",
+        &format!("check suite {suite_id} checkRuns"),
+        Some(&suite_id),
+        "CheckSuite",
+    )?;
+    for check in runs {
+        check_runs.push(parse_check_run(check)?);
+    }
+    let continues = more.is_some();
+    pending.extend(more);
+    Ok(continues)
+}
+
+fn parse_review(review: &Value) -> Result<ReviewData> {
+    Ok(ReviewData {
+        id: required_str(review, "id", "review")?,
+        state: string_field(review, "state").unwrap_or_else(|| "COMMENTED".into()),
+        body: string_field(review, "body").filter(|body| !body.is_empty()),
+        // Null for a pending (unsubmitted) review: legitimately nullable.
+        submitted_at: string_field(review, "submittedAt"),
+        // Null for a deleted ("ghost") account: legitimately nullable.
+        author: review.get("author").and_then(ActorReference::from_value),
+    })
+}
+
+fn parse_review_comment(comment: &Value) -> Result<ReviewCommentData> {
+    let id = required_str(comment, "id", "review comment")?;
+    let label = format!("review comment {id}");
+    Ok(ReviewCommentData {
+        body: string_field(comment, "body"),
+        path: Some(required_str(comment, "path", &label)?),
+        // Null when the comment is outdated against the current diff.
+        line: comment.get("line").and_then(Value::as_i64),
+        created_at: required_str(comment, "createdAt", &label)?,
+        author: comment.get("author").and_then(ActorReference::from_value),
+        in_reply_to: comment
+            .get("replyTo")
+            .and_then(|reply| reply.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        id,
+    })
+}
+
+fn collect_thread(
+    thread: &Value,
+    review_comments: &mut Vec<ReviewCommentData>,
+    pending: &mut Vec<PendingConnection>,
+) -> Result<()> {
+    let thread_id = required_str(thread, "id", "review thread")?;
+    let (comments, more) = required_connection(
+        thread,
+        "comments",
+        &format!("review thread {thread_id} comments"),
+        Some(&thread_id),
+        "PullRequestReviewThread",
+    )?;
+    for comment in comments {
+        review_comments.push(parse_review_comment(comment)?);
+    }
+    pending.extend(more);
+    Ok(())
+}
+
+fn parse_conversation_comment(comment: &Value) -> Result<ConversationCommentData> {
+    let id = required_str(comment, "id", "conversation comment")?;
+    Ok(ConversationCommentData {
+        body: string_field(comment, "body"),
+        created_at: required_str(comment, "createdAt", &format!("conversation comment {id}"))?,
+        author: comment.get("author").and_then(ActorReference::from_value),
+        id,
+    })
+}
+
+fn parse_file(file: &Value) -> Result<FileDiffData> {
+    Ok(FileDiffData {
+        path: required_str(file, "path", "changed file")?,
+        change_type: string_field(file, "changeType").unwrap_or_else(|| "MODIFIED".into()),
+        additions: integer_field(file, "additions"),
+        deletions: integer_field(file, "deletions"),
+    })
+}
+
+/// Fetch every nested node the page query's first slices left behind.
+///
+/// Shared by the repository and user-search paths. On success `pending` is
+/// empty. Returns a caveat when the provider served fewer files than the pull
+/// request reports changing (GitHub stops enumerating files at 3,000), so the
+/// caller can surface the truncation instead of treating the list as complete.
+/// Any continuation failure is returned as an error, leaving the item to the
+/// caller's failed-record handling.
+pub fn hydrate_pull_request(
+    client: &mut GhClient,
+    pull_request: &mut PullRequestData,
+) -> Result<Option<String>> {
+    let mut queue: Vec<PendingConnection> = std::mem::take(&mut pull_request.pending);
+    while let Some(next) = queue.pop() {
+        match (next.owner_type, next.field) {
+            ("PullRequest", "reviews") => {
+                let more = fetch_remaining(client, &next, REVIEW_SELECTION)?;
+                for review in &more {
+                    pull_request.reviews.push(parse_review(review)?);
+                }
+            }
+            ("PullRequest", "reviewThreads") => {
+                let more = fetch_remaining(client, &next, REVIEW_THREAD_SELECTION)?;
+                for thread in &more {
+                    collect_thread(thread, &mut pull_request.review_comments, &mut queue)?;
+                }
+            }
+            ("PullRequestReviewThread", "comments") => {
+                let more = fetch_remaining(client, &next, REVIEW_COMMENT_SELECTION)?;
+                for comment in &more {
+                    pull_request
+                        .review_comments
+                        .push(parse_review_comment(comment)?);
+                }
+            }
+            ("PullRequest", "comments") => {
+                let more = fetch_remaining(client, &next, CONVERSATION_COMMENT_SELECTION)?;
+                for comment in &more {
+                    pull_request
+                        .conversation_comments
+                        .push(parse_conversation_comment(comment)?);
+                }
+            }
+            ("PullRequest", "files") => {
+                let more = fetch_remaining(client, &next, FILE_SELECTION)?;
+                for file in &more {
+                    pull_request.files.push(parse_file(file)?);
+                }
+            }
+            ("Commit", "checkSuites") => {
+                let more = fetch_remaining(client, &next, CHECK_SUITE_SELECTION)?;
+                for suite in &more {
+                    collect_check_suite(suite, &mut pull_request.check_runs, &mut queue)?;
+                }
+            }
+            ("CheckSuite", "checkRuns") => {
+                let more = fetch_remaining(client, &next, CHECK_RUN_SELECTION)?;
+                for check in &more {
+                    pull_request.check_runs.push(parse_check_run(check)?);
+                }
+            }
+            (owner, field) => {
+                return Err(Error::GitHubApi(format!(
+                    "no continuation handler for {owner}.{field}"
+                )));
+            }
+        }
+    }
+    pull_request.check_runs_truncated = false;
+    let mut caveats = Vec::new();
+    let served = pull_request.files.len() as i64;
+    if served < pull_request.changed_files {
+        caveats.push(format!(
+            "PR #{}: provider listed {served} of {} changed files; file coverage is truncated",
+            pull_request.number, pull_request.changed_files
+        ));
+    }
+    if pull_request.check_runs_truncated {
+        caveats.push(format!(
+            "PR #{}: head commit has more check suites/runs than were fetched; check-run \
+             coverage is truncated",
+            pull_request.number
+        ));
+    }
+    Ok((!caveats.is_empty()).then(|| caveats.join("; ")))
+}
+
+/// GitHub's REST ceiling on files listed for one pull request.
+pub const REST_FILE_LIMIT: usize = 3000;
+
+/// Why a hydrated file list cannot be treated as the complete file set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSetGap {
+    pub reason: String,
+    /// True for a provider inconsistency (duplicate or empty path, more paths
+    /// than `changedFiles`) rather than an ordinary shortfall such as the
+    /// provider's 3,000-file cap, which the hydrator already reports.
+    pub anomalous: bool,
+}
+
+/// The hydrated file list as a provably complete set of paths, or why it is
+/// not one.
+///
+/// A listing is authoritative only when every nested page was walked (nothing
+/// pending), the provider reported `changedFiles`, every path is non-empty and
+/// unique, and the number of distinct paths equals `changedFiles` exactly. A
+/// provider-capped listing (fewer paths than `changedFiles`), a duplicate
+/// path, or more paths than `changedFiles` all fail closed, so the caller can
+/// keep stored rows instead of pruning against a set it cannot trust.
+pub fn authoritative_file_paths(
+    pull_request: &PullRequestData,
+) -> std::result::Result<std::collections::HashSet<&str>, FileSetGap> {
+    let gap = |reason: String, anomalous: bool| Err(FileSetGap { reason, anomalous });
+    if pull_request
+        .pending
+        .iter()
+        .any(|pending| pending.field == "files")
+    {
+        return gap("file pages were not all fetched".into(), false);
+    }
+    if !pull_request.changed_files_reported || pull_request.changed_files < 0 {
+        return gap(
+            "the provider did not report a changed-file total".into(),
+            true,
+        );
+    }
+    let mut paths = std::collections::HashSet::new();
+    for file in &pull_request.files {
+        if file.path.trim().is_empty() {
+            return gap("the provider listed a file with an empty path".into(), true);
+        }
+        if !paths.insert(file.path.as_str()) {
+            return gap(
+                format!("the provider listed {} more than once", file.path),
+                true,
+            );
+        }
+    }
+    let distinct = paths.len() as i64;
+    if distinct != pull_request.changed_files {
+        return gap(
+            format!(
+                "the provider listed {distinct} distinct paths for {} changed files",
+                pull_request.changed_files
+            ),
+            distinct > pull_request.changed_files,
+        );
+    }
+    Ok(paths)
+}
+/// Files per REST page (GitHub's maximum for this endpoint).
+pub const REST_FILES_PER_PAGE: usize = 100;
+
+/// Every patch the REST files endpoint served for one pull request.
+#[derive(Debug, Default)]
+pub struct PatchListing {
+    /// (path, previous_path, patch) per served file, in provider order.
+    pub files: Vec<(String, Option<String>, Option<String>)>,
+    /// REST pages requested.
+    pub pages: u32,
+    /// True when the walk stopped at GitHub's 3,000-file REST ceiling, so
+    /// further files (if any) are unreachable through this endpoint.
+    pub provider_capped: bool,
+}
+
+/// Walk `/repos/{repo}/pulls/{number}/files` page by page.
+///
+/// The endpoint serves at most 100 files per page and 3,000 in total. A page
+/// shorter than 100 is the last one; a full page always asks for the next, so
+/// a pull request with exactly 100·N files ends on an empty page. Any failed or
+/// non-array page is an error — the caller must not treat a partial walk as the
+/// complete listing.
+pub fn fetch_file_patches(
+    client: &mut GhClient,
+    repo_key: &str,
+    number: i64,
+) -> Result<PatchListing> {
+    let mut listing = PatchListing::default();
+    let max_pages = REST_FILE_LIMIT.div_ceil(REST_FILES_PER_PAGE);
+    for page in 1..=max_pages {
+        let path = format!(
+            "repos/{repo_key}/pulls/{number}/files?per_page={REST_FILES_PER_PAGE}&page={page}"
+        );
+        let value = client.rest(&path)?;
+        listing.pages += 1;
+        let served = value.as_array().map(Vec::len).ok_or_else(|| {
+            Error::GitHubApi(format!("PR #{number} files page {page} is not a list"))
+        })?;
+        listing.files.extend(parse_rest_file_patches(&value));
+        if served < REST_FILES_PER_PAGE {
+            return Ok(listing);
+        }
+    }
+    listing.provider_capped = true;
+    Ok(listing)
 }
 
 /// Parse the REST `/repos/{owner}/{name}/pulls/{number}/files` response into
@@ -418,128 +851,4 @@ pub fn parse_rest_file_patches(value: &Value) -> Vec<(String, Option<String>, Op
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use serde_json::json;
-
-    fn sample_page() -> Value {
-        json!({
-            "repository": {
-                "nameWithOwner": "octocat/hello",
-                "primaryLanguage": {"name": "Rust"},
-                "isFork": false,
-                "isPrivate": false,
-                "defaultBranchRef": {"name": "main"},
-                "createdAt": "2020-01-01T00:00:00Z",
-                "pullRequests": {
-                    "pageInfo": {"hasNextPage": true, "endCursor": "CURSOR1"},
-                    "nodes": [{
-                        "number": 7,
-                        "title": "Add rate limiter",
-                        "body": "Implements client-side pacing",
-                        "state": "MERGED",
-                        "isDraft": false,
-                        "createdAt": "2026-01-05T18:00:00Z",
-                        "updatedAt": "2026-01-06T09:00:00Z",
-                        "mergedAt": "2026-01-06T09:00:00Z",
-                        "closedAt": "2026-01-06T09:00:00Z",
-                        "baseRefName": "main",
-                        "headRefName": "feature/rate-limit",
-                        "additions": 120,
-                        "deletions": 4,
-                        "changedFiles": 3,
-                        "author": {"login": "octocat", "__typename": "User"},
-                        "mergedBy": {"login": "hubot", "__typename": "User"},
-                        "reviews": {"nodes": [{
-                            "id": "REV1", "state": "APPROVED", "body": "LGTM",
-                            "submittedAt": "2026-01-06T08:00:00Z",
-                            "author": {"login": "hubot", "__typename": "User"}
-                        }]},
-                        "reviewThreads": {"nodes": [{
-                            "comments": {"nodes": [{
-                                "id": "RC1", "body": "nit: rename",
-                                "path": "src/lib.rs", "line": 10,
-                                "createdAt": "2026-01-05T20:00:00Z",
-                                "author": {"login": "hubot", "__typename": "User"},
-                                "replyTo": null
-                            }]}
-                        }]},
-                        "comments": {"nodes": [{
-                            "id": "IC1", "body": "Looks good overall",
-                            "createdAt": "2026-01-05T19:00:00Z",
-                            "author": {"login": "dependabot[bot]", "__typename": "Bot"}
-                        }]},
-                        "files": {"nodes": [{
-                            "path": "src/lib.rs", "changeType": "MODIFIED",
-                            "additions": 100, "deletions": 2
-                        }]},
-                        "commits": {"nodes": [{
-                            "commit": {
-                                "oid": "abc123",
-                                "checkSuites": {"nodes": [{
-                                    "checkRuns": {"nodes": [{
-                                        "id": "CHK1", "name": "build",
-                                        "status": "COMPLETED", "conclusion": "SUCCESS",
-                                        "startedAt": "2026-01-05T18:05:00Z",
-                                        "completedAt": "2026-01-05T18:10:00Z"
-                                    }]}
-                                }]}
-                            }
-                        }]}
-                    }]
-                }
-            }
-        })
-    }
-
-    #[test]
-    fn parses_full_page() {
-        let page = parse_pull_request_page(&sample_page()).expect("parse page");
-        assert_eq!(page.repository.name_with_owner, "octocat/hello");
-        assert_eq!(page.repository.primary_language.as_deref(), Some("Rust"));
-        assert!(page.has_next_page);
-        assert_eq!(page.end_cursor.as_deref(), Some("CURSOR1"));
-        assert_eq!(page.pull_requests.len(), 1);
-
-        let pull_request = &page.pull_requests[0];
-        assert_eq!(pull_request.number, 7);
-        assert_eq!(pull_request.state, "MERGED");
-        assert_eq!(pull_request.author.as_ref().unwrap().login, "octocat");
-        assert_eq!(pull_request.reviews.len(), 1);
-        assert_eq!(pull_request.reviews[0].state, "APPROVED");
-        assert_eq!(pull_request.review_comments.len(), 1);
-        assert_eq!(
-            pull_request.review_comments[0].path.as_deref(),
-            Some("src/lib.rs")
-        );
-        assert_eq!(pull_request.conversation_comments.len(), 1);
-        assert_eq!(
-            pull_request.conversation_comments[0]
-                .author
-                .as_ref()
-                .unwrap()
-                .type_name,
-            "Bot"
-        );
-        assert_eq!(pull_request.files.len(), 1);
-        assert_eq!(pull_request.head_sha.as_deref(), Some("abc123"));
-        assert_eq!(pull_request.check_runs.len(), 1);
-        assert_eq!(
-            pull_request.check_runs[0].conclusion.as_deref(),
-            Some("SUCCESS")
-        );
-    }
-
-    #[test]
-    fn parses_rest_file_patches() {
-        let value = json!([
-            {"filename": "src/lib.rs", "patch": "@@ -1 +1 @@"},
-            {"filename": "renamed.rs", "previous_filename": "old.rs", "patch": null}
-        ]);
-        let patches = parse_rest_file_patches(&value);
-        assert_eq!(patches.len(), 2);
-        assert_eq!(patches[0].0, "src/lib.rs");
-        assert_eq!(patches[0].2.as_deref(), Some("@@ -1 +1 @@"));
-        assert_eq!(patches[1].1.as_deref(), Some("old.rs"));
-    }
-}
+mod tests;

@@ -1,6 +1,6 @@
 [package]
 name = "githubdw"
-version = "0.2.4"
+version = "0.3.0"
 edition = "2024"
 license = "MIT"
 readme = "README.md"
@@ -44,7 +44,7 @@ summaries = ["dep:mixtape-core", "dep:aws-config"]
 
 [[bin]]
 name = "githubdw"
-path = "src/bin/githubdw.rs"
+path = "src/bin/githubdw/main.rs"
 
 [lib]
 name = "githubdw"

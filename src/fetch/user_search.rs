@@ -83,7 +83,13 @@ pub fn user_search_expression(login: &str, role: UserRole, window: Option<(&str,
 /// node so both paths feed the same parser, with `repository` added because a
 /// search page spans repositories.
 pub fn user_pull_requests_query(page_size: u32) -> String {
-    USER_PULL_REQUESTS_QUERY_TEMPLATE.replace("{PAGE_SIZE}", &page_size.to_string())
+    USER_PULL_REQUESTS_QUERY_TEMPLATE
+        .replace("{PAGE_SIZE}", &page_size.to_string())
+        .replace(
+            "{REPOSITORY}",
+            super::pull_requests::REPOSITORY_HEADER_SELECTION,
+        )
+        .replace("{NODE}", super::pull_requests::PULL_REQUEST_NODE_SELECTION)
 }
 
 const USER_PULL_REQUESTS_QUERY_TEMPLATE: &str = r#"
@@ -94,59 +100,9 @@ query($q: String!, $cursor: String) {
     pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
-        number title body state isDraft
-        createdAt updatedAt mergedAt closedAt
-        baseRefName headRefName
-        additions deletions changedFiles
-        author { login __typename }
-        mergedBy { login __typename }
+        {NODE}
         repository {
-          nameWithOwner
-          primaryLanguage { name }
-          isFork
-          isPrivate
-          defaultBranchRef { name }
-          createdAt
-        }
-        reviews(first: 50) {
-          nodes {
-            id state body submittedAt
-            author { login __typename }
-          }
-        }
-        reviewThreads(first: 50) {
-          nodes {
-            comments(first: 50) {
-              nodes {
-                id body path line createdAt
-                author { login __typename }
-                replyTo { id }
-              }
-            }
-          }
-        }
-        comments(first: 50) {
-          nodes {
-            id body createdAt
-            author { login __typename }
-          }
-        }
-        files(first: 100) {
-          nodes { path changeType additions deletions }
-        }
-        commits(last: 1) {
-          nodes {
-            commit {
-              oid
-              checkSuites(first: 10) {
-                nodes {
-                  checkRuns(first: 20) {
-                    nodes { id name status conclusion startedAt completedAt }
-                  }
-                }
-              }
-            }
-          }
+          {REPOSITORY}
         }
       }
     }
@@ -191,28 +147,23 @@ pub fn parse_user_search_page(data: &Value) -> Result<UserSearchPage> {
         .get("issueCount")
         .and_then(Value::as_i64)
         .ok_or_else(|| Error::GitHubApi("search.issueCount missing".into()))?;
-    let page_info = search.get("pageInfo");
-    let has_next_page = page_info
-        .and_then(|info| info.get("hasNextPage"))
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let end_cursor = page_info
-        .and_then(|info| info.get("endCursor"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
+    let (has_next_page, end_cursor) = super::pull_requests::page_status(search, "search")?;
 
     let mut items = Vec::new();
-    for node in search
+    let nodes = search
         .get("nodes")
         .and_then(Value::as_array)
-        .map(|array| array.iter())
-        .into_iter()
-        .flatten()
-    {
-        // `type: ISSUE` also matches issues; `is:pr` filters them out, but a
-        // node with no PR fields would otherwise fail the parse. Skipping the
-        // empty inline-fragment case keeps the walk robust.
-        if node.is_null() || node.get("number").is_none() {
+        .ok_or_else(|| Error::GitHubApi("search has no nodes array".into()))?;
+    for node in nodes {
+        // `type: ISSUE` also matches issues; `is:pr` filters them out, and an
+        // issue that slips through answers the `... on PullRequest` fragment
+        // with an EMPTY object, which is skipped. A null node or a node that
+        // carries PR fields but is malformed fails the page instead of
+        // silently dropping a pull request.
+        if node.is_null() {
+            return Err(Error::GitHubApi("search contains a null node".into()));
+        }
+        if node.as_object().is_some_and(serde_json::Map::is_empty) {
             continue;
         }
         let repository = node
@@ -267,10 +218,10 @@ mod tests {
                         "defaultBranchRef": {"name": "main"},
                         "createdAt": "2020-01-01T00:00:00Z"
                     },
-                    "reviews": {"nodes": []},
-                    "reviewThreads": {"nodes": []},
-                    "comments": {"nodes": []},
-                    "files": {"nodes": []},
+                    "reviews": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []},
+                    "reviewThreads": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []},
+                    "comments": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []},
+                    "files": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []},
                     "commits": {"nodes": []}
                 })
             })
@@ -336,5 +287,27 @@ mod tests {
             .push(json!({}));
         let page = parse_user_search_page(&response).unwrap();
         assert_eq!(page.items.len(), 1);
+    }
+
+    #[test]
+    fn a_null_or_malformed_search_node_fails_the_page() {
+        let mut response = search_response(1, &[7]);
+        response["search"]["nodes"]
+            .as_array_mut()
+            .unwrap()
+            .push(Value::Null);
+        assert!(parse_user_search_page(&response).is_err(), "null node");
+        let mut response = search_response(1, &[7]);
+        response["search"]["nodes"][0]["reviews"] = Value::Null;
+        assert!(
+            parse_user_search_page(&response).is_err(),
+            "null connection"
+        );
+        let mut response = search_response(1, &[7]);
+        response["search"]["nodes"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("number");
+        assert!(parse_user_search_page(&response).is_err(), "no number");
     }
 }

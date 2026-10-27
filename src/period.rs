@@ -161,31 +161,28 @@ impl Period {
     /// Inclusive `(start, end)` dates of the period.
     pub fn date_range(&self) -> (NaiveDate, NaiveDate) {
         match self {
-            Period::Year(year) => (
-                NaiveDate::from_ymd_opt(*year, 1, 1).unwrap(),
-                NaiveDate::from_ymd_opt(*year, 12, 31).unwrap(),
-            ),
+            Period::Year(year) => (ymd(*year, 1, 1), ymd(*year, 12, 31)),
             Period::Half(year, half) => {
                 let (start_month, end_month) = if *half == 1 { (1, 6) } else { (7, 12) };
                 (
-                    NaiveDate::from_ymd_opt(*year, start_month, 1).unwrap(),
+                    ymd(*year, start_month, 1),
                     last_day_of_month(*year, end_month),
                 )
             }
             Period::Quarter(year, quarter) => {
                 let start_month = (*quarter as u32 - 1) * 3 + 1;
                 (
-                    NaiveDate::from_ymd_opt(*year, start_month, 1).unwrap(),
+                    ymd(*year, start_month, 1),
                     last_day_of_month(*year, start_month + 2),
                 )
             }
             Period::Month(year, month) => (
-                NaiveDate::from_ymd_opt(*year, *month as u32, 1).unwrap(),
+                ymd(*year, *month as u32, 1),
                 last_day_of_month(*year, *month as u32),
             ),
             Period::Week(year, week) => {
                 let start = NaiveDate::from_isoywd_opt(*year, *week as u32, chrono::Weekday::Mon)
-                    .unwrap_or_else(|| NaiveDate::from_ymd_opt(*year, 1, 1).unwrap());
+                    .unwrap_or_else(|| ymd(*year, 1, 1));
                 (start, start + Duration::days(6))
             }
             Period::Rolling(days, end) => (*end - Duration::days(*days as i64 - 1), *end),
@@ -204,10 +201,7 @@ impl Period {
             Period::Month(year, month) => Period::Month(*year, month - 1),
             Period::Week(year, week) => {
                 if *week <= 1 {
-                    let last_week = NaiveDate::from_ymd_opt(year - 1, 12, 28)
-                        .unwrap()
-                        .iso_week()
-                        .week() as u8;
+                    let last_week = ymd(year - 1, 12, 28).iso_week().week() as u8;
                     Period::Week(year - 1, last_week)
                 } else {
                     Period::Week(*year, week - 1)
@@ -284,13 +278,25 @@ impl Period {
     }
 }
 
+/// A calendar date, clamped to chrono's range for years it cannot represent
+/// (only reachable through a hand-built `Period` far outside any data).
+fn ymd(year: i32, month: u32, day: u32) -> NaiveDate {
+    NaiveDate::from_ymd_opt(year, month, day).unwrap_or(if year < 0 {
+        NaiveDate::MIN
+    } else {
+        NaiveDate::MAX
+    })
+}
+
 fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
     let (next_year, next_month) = if month == 12 {
         (year + 1, 1)
     } else {
         (year, month + 1)
     };
-    NaiveDate::from_ymd_opt(next_year, next_month, 1).unwrap() - Duration::days(1)
+    ymd(next_year, next_month, 1)
+        .pred_opt()
+        .unwrap_or(NaiveDate::MIN)
 }
 
 #[cfg(test)]
@@ -302,7 +308,7 @@ mod tests {
 
     /// Reference date for the absolute forms, where it is not consulted.
     fn any_reference() -> NaiveDate {
-        NaiveDate::from_ymd_opt(2026, 7, 24).unwrap()
+        ymd(2026, 7, 24)
     }
 
     fn parse(text: &str) -> Result<Period> {
@@ -350,8 +356,8 @@ mod tests {
         // Rolling window: ends on the local day, not the UTC one.
         let rolling = Period::parse_as_of("last-30", evening_pdt, Los_Angeles).unwrap();
         let (start, end) = rolling.date_range();
-        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 6, 30).unwrap());
-        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 6, 1).unwrap());
+        assert_eq!(end, ymd(2026, 6, 30));
+        assert_eq!(start, ymd(2026, 6, 1));
 
         // For contrast, the UTC calendar gives the wrong quarter and a window
         // shifted a day forward — including a day still in progress locally.
@@ -397,7 +403,7 @@ mod tests {
 
     #[test]
     fn relative_forms_resolve_against_reference() {
-        let reference = NaiveDate::from_ymd_opt(2026, 7, 24).unwrap();
+        let reference = ymd(2026, 7, 24);
         assert_eq!(
             Period::parse_with_reference("this-quarter", reference).unwrap(),
             Period::Quarter(2026, 3)
@@ -415,16 +421,16 @@ mod tests {
     #[test]
     fn date_ranges_handle_leap_years_and_quarters() {
         let (start, end) = Period::Month(2024, 2).date_range();
-        assert_eq!(start, NaiveDate::from_ymd_opt(2024, 2, 1).unwrap());
-        assert_eq!(end, NaiveDate::from_ymd_opt(2024, 2, 29).unwrap());
+        assert_eq!(start, ymd(2024, 2, 1));
+        assert_eq!(end, ymd(2024, 2, 29));
 
         let (start, end) = Period::Quarter(2026, 4).date_range();
-        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 10, 1).unwrap());
-        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 12, 31).unwrap());
+        assert_eq!(start, ymd(2026, 10, 1));
+        assert_eq!(end, ymd(2026, 12, 31));
 
         let (start, end) = Period::Half(2026, 1).date_range();
-        assert_eq!(start, NaiveDate::from_ymd_opt(2026, 1, 1).unwrap());
-        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 6, 30).unwrap());
+        assert_eq!(start, ymd(2026, 1, 1));
+        assert_eq!(end, ymd(2026, 6, 30));
     }
 
     #[test]
@@ -435,16 +441,16 @@ mod tests {
         );
         assert_eq!(Period::Month(2026, 1).previous(), Period::Month(2025, 12));
         assert_eq!(Period::Half(2026, 1).previous(), Period::Half(2025, 2));
-        let rolling = Period::Rolling(30, NaiveDate::from_ymd_opt(2026, 7, 24).unwrap());
+        let rolling = Period::Rolling(30, ymd(2026, 7, 24));
         let previous = rolling.previous();
         let (_, end) = previous.date_range();
-        assert_eq!(end, NaiveDate::from_ymd_opt(2026, 6, 24).unwrap());
+        assert_eq!(end, ymd(2026, 6, 24));
     }
 
     #[test]
     fn partial_period_machinery() {
         let quarter = Period::Quarter(2026, 3);
-        let reference = NaiveDate::from_ymd_opt(2026, 7, 25).unwrap(); // day 25 of Q3
+        let reference = ymd(2026, 7, 25); // day 25 of Q3
         assert!(quarter.is_partial(reference));
         assert_eq!(quarter.days_elapsed(reference), 25);
         assert_eq!(quarter.effective_end_date(reference), reference);

@@ -11,6 +11,7 @@
 //! Data is fetched via the `gh` CLI as a subprocess, so authentication is
 //! entirely delegated to `gh auth`. GitHub Enterprise works via `GH_HOST`.
 
+pub mod check_history;
 pub mod error;
 pub mod fetch;
 mod githubdw;
@@ -19,6 +20,7 @@ pub mod mcp;
 pub mod metrics;
 pub mod period;
 pub mod query;
+pub mod refresh;
 pub mod search;
 pub mod storage;
 pub mod sync;

@@ -1,6 +1,6 @@
 //! Core upsert/read repository for facts and dimensions.
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::error::Result;
 use crate::fetch::pull_requests::ActorReference;
@@ -232,7 +232,11 @@ pub fn upsert_review_comment(
             in_reply_to = excluded.in_reply_to,
             path = excluded.path,
             line = excluded.line,
-            body = excluded.body",
+            body = excluded.body
+        WHERE fact_review_comments.in_reply_to IS NOT excluded.in_reply_to
+           OR fact_review_comments.path IS NOT excluded.path
+           OR fact_review_comments.line IS NOT excluded.line
+           OR fact_review_comments.body IS NOT excluded.body",
         params![
             comment_key,
             pr_key,
@@ -269,7 +273,9 @@ pub fn upsert_issue_comment(
         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
         ON CONFLICT (comment_key) DO UPDATE SET
             body = excluded.body,
-            in_reply_to = excluded.in_reply_to",
+            in_reply_to = excluded.in_reply_to
+        WHERE fact_issue_comments.body IS NOT excluded.body
+           OR fact_issue_comments.in_reply_to IS NOT excluded.in_reply_to",
         params![
             comment_key,
             parent_type,
@@ -305,7 +311,9 @@ pub fn upsert_check_run(
             status = excluded.status,
             conclusion = excluded.conclusion,
             started_at = excluded.started_at,
-            completed_at = excluded.completed_at",
+            completed_at = excluded.completed_at
+        WHERE fact_check_runs.pr_key = excluded.pr_key
+          AND fact_check_runs.head_sha = excluded.head_sha",
         params![
             check_run_key,
             pr_key,
@@ -318,6 +326,103 @@ pub fn upsert_check_run(
         ],
     )?;
     Ok(())
+}
+
+/// What [`record_check_run`] did with one provider run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CheckRunWrite {
+    Inserted,
+    /// Same PR and commit; status, conclusion, or times changed.
+    Updated,
+    Unchanged,
+    /// The key is already stored under another pull request. A check run
+    /// row carries exactly one `pr_key`, so the row is left as it is.
+    OwnedByOtherPullRequest(String),
+    /// The key is stored for this pull request against another commit.
+    /// Never rewritten silently; reported for investigation.
+    HeadMismatch(String),
+}
+
+/// Store one check run without ever moving an existing row to another pull
+/// request or commit. Only status, conclusion, and times of a row already
+/// owned by `(pr_key, head_sha)` are updated.
+#[allow(clippy::too_many_arguments)]
+pub fn record_check_run(
+    conn: &Connection,
+    check_run_key: &str,
+    pr_key: &str,
+    head_sha: &str,
+    name: &str,
+    status: &str,
+    conclusion: Option<&str>,
+    started_at: Option<&str>,
+    completed_at: Option<&str>,
+) -> Result<CheckRunWrite> {
+    type Stored = (
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
+    let existing: Option<Stored> = conn
+        .query_row(
+            "SELECT pr_key, head_sha, status, conclusion, started_at, completed_at
+             FROM fact_check_runs WHERE check_run_key = ?1",
+            [check_run_key],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((stored_pr, stored_sha, old_status, old_conclusion, old_started, old_completed)) =
+        existing
+    else {
+        conn.execute(
+            "INSERT INTO fact_check_runs (
+                check_run_key, pr_key, head_sha, name, status, conclusion, started_at, completed_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                check_run_key,
+                pr_key,
+                head_sha,
+                name,
+                status,
+                conclusion,
+                started_at,
+                completed_at
+            ],
+        )?;
+        return Ok(CheckRunWrite::Inserted);
+    };
+    if stored_pr != pr_key {
+        return Ok(CheckRunWrite::OwnedByOtherPullRequest(stored_pr));
+    }
+    if !stored_sha.eq_ignore_ascii_case(head_sha) {
+        return Ok(CheckRunWrite::HeadMismatch(stored_sha));
+    }
+    if old_status == status
+        && old_conclusion.as_deref() == conclusion
+        && old_started.as_deref() == started_at
+        && old_completed.as_deref() == completed_at
+    {
+        return Ok(CheckRunWrite::Unchanged);
+    }
+    conn.execute(
+        "UPDATE fact_check_runs
+         SET status = ?2, conclusion = ?3, started_at = ?4, completed_at = ?5
+         WHERE check_run_key = ?1",
+        params![check_run_key, status, conclusion, started_at, completed_at],
+    )?;
+    Ok(CheckRunWrite::Updated)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -375,6 +480,35 @@ pub fn set_file_diff_patch(
     Ok(())
 }
 
+/// Stored file paths of one pull request that are absent from `keep`.
+pub fn file_diffs_absent_from(
+    conn: &Connection,
+    pr_key: &str,
+    keep: &std::collections::HashSet<&str>,
+) -> Result<Vec<String>> {
+    let mut statement =
+        conn.prepare("SELECT file_path FROM fact_file_diffs WHERE pr_key = ?1 ORDER BY file_path")?;
+    let paths = statement
+        .query_map([pr_key], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(paths
+        .into_iter()
+        .filter(|path| !keep.contains(path.as_str()))
+        .collect())
+}
+
+/// Delete the named file rows of one pull request. Only call this with paths
+/// from [`file_diffs_absent_from`] against a provably complete file set.
+pub fn delete_file_diffs(conn: &Connection, pr_key: &str, paths: &[String]) -> Result<usize> {
+    let mut statement =
+        conn.prepare("DELETE FROM fact_file_diffs WHERE pr_key = ?1 AND file_path = ?2")?;
+    let mut deleted = 0;
+    for path in paths {
+        deleted += statement.execute(params![pr_key, path])?;
+    }
+    Ok(deleted)
+}
+
 /// The configured bot login suffix (default `[bot]`).
 pub fn bot_login_suffix(conn: &Connection) -> String {
     conn.query_row(
@@ -389,6 +523,163 @@ pub fn bot_login_suffix(conn: &Connection) -> String {
 mod tests {
     use super::*;
     use crate::GithubDW;
+
+    fn comment_warehouse() -> (GithubDW, String, String) {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        ensure_entity(
+            conn,
+            &ActorReference {
+                login: "octocat".into(),
+                type_name: "User".into(),
+            },
+            "[bot]",
+        )
+        .unwrap();
+        upsert_repository(conn, "octocat/hello", None, false, false, None, None).unwrap();
+        let keys = crate::storage::time_dimension::ensure_keys_for_timestamp(
+            conn,
+            "2026-01-05T18:00:00Z",
+            chrono_tz::UTC,
+            (9, 17),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fact_pull_requests (pr_key, number, repo_key, author_key, state,
+             created_at, created_date_key, created_time_key)
+             VALUES ('octocat/hello#1', 1, 'octocat/hello', 'user:octocat', 'OPEN',
+             '2026-01-05T18:00:00Z', ?1, ?2)",
+            params![keys.date_key, keys.time_key],
+        )
+        .unwrap();
+        (warehouse, keys.date_key, keys.time_key)
+    }
+
+    #[test]
+    fn unchanged_review_comment_does_not_rebuild_search_index() {
+        let (warehouse, date, time) = comment_warehouse();
+        let conn = warehouse.connection();
+        let put =
+            |reply: Option<&str>, path: Option<&str>, line: Option<i64>, body: Option<&str>| {
+                upsert_review_comment(
+                    conn,
+                    "comment1",
+                    "octocat/hello#1",
+                    "user:octocat",
+                    reply,
+                    path,
+                    line,
+                    body,
+                    "2026-01-05T18:00:00Z",
+                    &date,
+                    &time,
+                )
+                .unwrap();
+            };
+        put(None, None, None, None);
+        let before = conn.total_changes();
+        put(None, None, None, None);
+        assert_eq!(
+            conn.total_changes(),
+            before,
+            "unchanged NULL fields must be a no-op"
+        );
+        for (reply, path, line, body) in [
+            (None, None, None, Some("original searchable text")),
+            (Some("parent"), None, None, Some("original searchable text")),
+            (
+                Some("parent"),
+                Some("src/lib.rs"),
+                None,
+                Some("original searchable text"),
+            ),
+            (
+                Some("parent"),
+                Some("src/lib.rs"),
+                Some(7),
+                Some("original searchable text"),
+            ),
+            (None, None, None, Some("replacement searchable text")),
+        ] {
+            let before = conn.total_changes();
+            put(reply, path, line, body);
+            assert!(
+                conn.total_changes() > before,
+                "changed fields must still be persisted"
+            );
+            let before = conn.total_changes();
+            put(reply, path, line, body);
+            assert_eq!(
+                conn.total_changes(),
+                before,
+                "repeat must not touch the index"
+            );
+        }
+        let hits: i64 = conn.query_row(
+            "SELECT count(*) FROM review_comments_fts WHERE review_comments_fts MATCH 'replacement'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(hits, 1);
+        put(None, None, None, None);
+        let hits: i64 = conn.query_row(
+            "SELECT count(*) FROM review_comments_fts WHERE review_comments_fts MATCH 'replacement'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            hits, 0,
+            "clearing the body must remove stale search results"
+        );
+    }
+
+    #[test]
+    fn unchanged_issue_comment_does_not_rebuild_search_index() {
+        let (warehouse, date, time) = comment_warehouse();
+        let conn = warehouse.connection();
+        let put = |reply: Option<&str>, body: Option<&str>| {
+            upsert_issue_comment(
+                conn,
+                "comment1",
+                "pull_request",
+                "octocat/hello#1",
+                "user:octocat",
+                reply,
+                body,
+                "2026-01-05T18:00:00Z",
+                &date,
+                &time,
+            )
+            .unwrap();
+        };
+        for (reply, body) in [
+            (None, None),
+            (None, Some("original searchable text")),
+            (Some("parent"), Some("original searchable text")),
+            (None, Some("replacement searchable text")),
+            (None, None),
+        ] {
+            let before = conn.total_changes();
+            put(reply, body);
+            assert!(
+                conn.total_changes() > before,
+                "changed fields must still be persisted"
+            );
+            let before = conn.total_changes();
+            put(reply, body);
+            assert_eq!(
+                conn.total_changes(),
+                before,
+                "repeat must not touch the index"
+            );
+        }
+        let hits: i64 = conn.query_row(
+            "SELECT count(*) FROM issue_comments_fts WHERE issue_comments_fts MATCH 'replacement'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            hits, 0,
+            "clearing the body must remove stale search results"
+        );
+    }
 
     #[test]
     fn entity_resolution_detects_bots() {

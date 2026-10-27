@@ -42,6 +42,20 @@ impl GithubDW {
         })
     }
 
+    /// Open an existing warehouse without creating directories or applying migrations.
+    /// Mutating SQL is rejected by SQLite on this connection.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let database_path = path.as_ref().to_path_buf();
+        let connection = Connection::open_with_flags(
+            &database_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        Ok(Self {
+            connection,
+            database_path,
+        })
+    }
+
     /// Open an in-memory warehouse (used by tests).
     pub fn open_in_memory() -> Result<Self> {
         let mut connection = Connection::open_in_memory()?;
@@ -78,6 +92,51 @@ impl GithubDW {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn read_only_open_never_migrates_or_accepts_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("existing.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE original(value TEXT); INSERT INTO original VALUES ('kept');",
+        )
+        .unwrap();
+        drop(conn);
+        let warehouse = GithubDW::open_read_only(&path).unwrap();
+        assert_eq!(
+            warehouse
+                .connection()
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type='table'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+        assert!(
+            warehouse
+                .connection()
+                .execute("DELETE FROM original", [])
+                .is_err()
+        );
+        assert_eq!(
+            warehouse
+                .connection()
+                .query_row("SELECT value FROM original", [], |r| r.get::<_, String>(0))
+                .unwrap(),
+            "kept"
+        );
+    }
+
+    #[test]
+    fn read_only_open_does_not_create_a_missing_warehouse() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("missing").join("warehouse.db");
+        assert!(GithubDW::open_read_only(&path).is_err());
+        assert!(!path.parent().unwrap().exists());
+    }
 
     #[test]
     fn opens_at_explicit_path() {
