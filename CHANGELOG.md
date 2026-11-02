@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-11-02
+
+### Performance
+
+- Migration 6 adds covering indexes for per-author activity over a date
+  window: pull requests opened (with additions, deletions and changed files),
+  reviews submitted, and review comments written. Callers that count these
+  per author (user metrics, leaderboards, or their own SQL over the
+  warehouse) no longer read the full rows. On a 16 GB test warehouse, counts
+  for a dozen authors went from seconds to milliseconds on a cold page cache.
+
+### Upgrade notes
+
+- Like migration 5, migration 6 builds its indexes in one transaction the
+  first time a warehouse is opened (tens of seconds on a large warehouse)
+  and adds about 16 MB there. Binaries older than 0.3.2 refuse an upgraded
+  warehouse.
+
 ## [0.3.1] - 2026-11-02
 
 ### Performance
