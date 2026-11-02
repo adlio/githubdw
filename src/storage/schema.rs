@@ -13,6 +13,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/003_pr_summaries.sql")),
         M::up(include_str!("migrations/004_entity_invariants.sql")),
         M::up(include_str!("migrations/005_read_indexes.sql")),
+        M::up(include_str!("migrations/006_author_indexes.sql")),
     ])
 }
 
@@ -112,7 +113,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 5);
+        assert_eq!(version, 6);
     }
 
     /// Seed one well-formed entity, the shape every writer is expected to
@@ -254,7 +255,10 @@ mod tests {
         );
     }
 
-    const READ_INDEXES: [&str; 7] = [
+    const READ_INDEXES: [&str; 10] = [
+        "idx_pr_author_created_cover",
+        "idx_reviews_reviewer_cover",
+        "idx_review_comments_author_cover",
         "idx_check_runs_pr_conclusion",
         "idx_issue_comments_author_cover",
         "idx_issue_comments_parent_cover",
@@ -277,6 +281,20 @@ mod tests {
                     == 1
             })
             .count()
+    }
+
+    /// A warehouse already at v5 (0.3.1) takes only migration 006 and keeps
+    /// its rows.
+    #[test]
+    fn upgrade_from_v5_adds_only_the_author_indexes() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        migrations()
+            .to_version(&mut conn, 5)
+            .expect("migrate to v5");
+        assert_eq!(read_index_count(&conn), READ_INDEXES.len() - 3);
+        init(&mut conn).expect("upgrade to v6");
+        assert_eq!(schema_version(&conn).unwrap(), 6);
+        assert_eq!(read_index_count(&conn), READ_INDEXES.len());
     }
 
     /// Migration 005 only adds indexes: a v4 warehouse with rows upgrades
@@ -309,8 +327,8 @@ mod tests {
         .expect("seed v4 data");
         assert_eq!(read_index_count(&conn), 0);
 
-        init(&mut conn).expect("upgrade to v5");
-        assert_eq!(schema_version(&conn).unwrap(), 5);
+        init(&mut conn).expect("upgrade to the latest version");
+        assert_eq!(schema_version(&conn).unwrap(), 6);
         assert_eq!(read_index_count(&conn), READ_INDEXES.len());
         let rows: (i64, i64) = conn
             .query_row(
@@ -325,8 +343,10 @@ mod tests {
         init(&mut conn).expect("a second open is a no-op");
         conn.execute_batch(include_str!("migrations/005_read_indexes.sql"))
             .expect("the statements themselves are idempotent");
+        conn.execute_batch(include_str!("migrations/006_author_indexes.sql"))
+            .expect("the statements themselves are idempotent");
         assert_eq!(read_index_count(&conn), READ_INDEXES.len());
-        assert_eq!(schema_version(&conn).unwrap(), 5);
+        assert_eq!(schema_version(&conn).unwrap(), 6);
 
         // `IF NOT EXISTS` would keep a same-named index with other columns, so
         // check the definitions, not just the names.
@@ -376,6 +396,25 @@ mod tests {
         assert_eq!(
             columns("idx_issue_comments_author_cover"),
             ["author_key", "parent_type", "created_date_key"]
+        );
+        assert_eq!(
+            columns("idx_pr_author_created_cover"),
+            [
+                "author_key",
+                "created_date_key",
+                "additions",
+                "deletions",
+                "changed_files",
+                "pr_key"
+            ]
+        );
+        assert_eq!(
+            columns("idx_reviews_reviewer_cover"),
+            ["reviewer_key", "submitted_date_key", "pr_key"]
+        );
+        assert_eq!(
+            columns("idx_review_comments_author_cover"),
+            ["author_key", "created_date_key", "pr_key"]
         );
     }
 
