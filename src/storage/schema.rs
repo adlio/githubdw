@@ -254,9 +254,11 @@ mod tests {
         );
     }
 
-    const READ_INDEXES: [&str; 5] = [
+    const READ_INDEXES: [&str; 7] = [
         "idx_check_runs_pr_conclusion",
+        "idx_issue_comments_author_cover",
         "idx_issue_comments_parent_cover",
+        "idx_pr_author_state_merged",
         "idx_pr_repo_created_cover",
         "idx_review_comments_pr_cover",
         "idx_reviews_pr_cover",
@@ -366,6 +368,14 @@ mod tests {
         assert_eq!(
             columns("idx_reviews_pr_cover"),
             ["pr_key", "submitted_date_key", "reviewer_key"]
+        );
+        assert_eq!(
+            columns("idx_pr_author_state_merged"),
+            ["author_key", "state", "merged_date_key"]
+        );
+        assert_eq!(
+            columns("idx_issue_comments_author_cover"),
+            ["author_key", "parent_type", "created_date_key"]
         );
     }
 

@@ -13,7 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Migration 5 adds covering indexes for the repository metrics and
   leaderboards: pull requests by repository and creation date, check-run
-  outcomes, review and issue comments, and reviews per pull request. On a
+  outcomes, review and issue comments, and reviews per pull request; and
+  per-author merged pull requests and pull-request conversation comments. On a
   warehouse whose pages are not cached, `repo_metrics` and `repo_aggregations`
   previously read every pull-request, comment and check-run row they touched,
   including the wide title and body columns; they now read index pages only. On a 16 GB test warehouse the

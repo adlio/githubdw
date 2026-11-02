@@ -26,3 +26,12 @@ CREATE INDEX IF NOT EXISTS idx_review_comments_pr_cover
     ON fact_review_comments(pr_key, created_date_key, author_key);
 CREATE INDEX IF NOT EXISTS idx_reviews_pr_cover
     ON fact_reviews(pr_key, submitted_date_key, reviewer_key);
+
+-- Per-author activity (merged pull requests by merge date, pull-request
+-- conversation comments by date). The single-column author indexes leave
+-- these filtering wide rows; with the second equality column SQLite picks
+-- these without statistics.
+CREATE INDEX IF NOT EXISTS idx_pr_author_state_merged
+    ON fact_pull_requests(author_key, state, merged_date_key);
+CREATE INDEX IF NOT EXISTS idx_issue_comments_author_cover
+    ON fact_issue_comments(author_key, parent_type, created_date_key);
