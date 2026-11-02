@@ -12,6 +12,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/002_groups.sql")),
         M::up(include_str!("migrations/003_pr_summaries.sql")),
         M::up(include_str!("migrations/004_entity_invariants.sql")),
+        M::up(include_str!("migrations/005_read_indexes.sql")),
     ])
 }
 
@@ -39,8 +40,7 @@ pub fn init(conn: &mut Connection) -> Result<()> {
     // opens the warehouse from four concurrent request handlers. Gating it on a
     // version change keeps the guarantee exactly — the check still runs after
     // any migration that could have broken integrity — while taking the scan
-    // off the hot path. Compare cruxdw, which has no such check and opens a
-    // larger database in 0.07s.
+    // off the hot path.
     if schema_version(conn)? != version_before {
         assert_referential_integrity(conn)?;
     }
@@ -112,7 +112,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 4);
+        assert_eq!(version, 5);
     }
 
     /// Seed one well-formed entity, the shape every writer is expected to
@@ -251,6 +251,121 @@ mod tests {
         assert!(
             conn.execute_batch("PRAGMA foreign_key_check").is_ok(),
             "the rebuilt schema passes a foreign key check"
+        );
+    }
+
+    const READ_INDEXES: [&str; 5] = [
+        "idx_check_runs_pr_conclusion",
+        "idx_issue_comments_parent_cover",
+        "idx_pr_repo_created_cover",
+        "idx_review_comments_pr_cover",
+        "idx_reviews_pr_cover",
+    ];
+
+    fn read_index_count(conn: &Connection) -> usize {
+        READ_INDEXES
+            .iter()
+            .filter(|name| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                    [name],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+                    == 1
+            })
+            .count()
+    }
+
+    /// Migration 005 only adds indexes: a v4 warehouse with rows upgrades
+    /// with every row intact, and running the step again changes nothing.
+    #[test]
+    fn upgrade_to_read_indexes_keeps_rows_and_is_repeatable() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        migrations()
+            .to_version(&mut conn, 4)
+            .expect("migrate to v4");
+        conn.execute_batch(
+            "INSERT INTO dim_entities (entity_key, entity_type, login, is_human, is_bot, name)
+             VALUES ('user:octocat', 'user', 'octocat', 1, 0, 'Octocat');
+             INSERT INTO dim_repositories (repo_key, owner, name)
+             VALUES ('octocat/hello', 'octocat', 'hello');
+             INSERT INTO dim_date (date_key, year, quarter, month, day_of_month, day_of_week,
+                 is_weekend, week_of_year, week_key, month_key, quarter_key, year_key, half_key)
+             VALUES ('2026-01-05', 2026, 1, 1, 5, 1, 0, 2, '2026-W02', '2026-01', '2026-Q1',
+                 '2026', '2026-H1');
+             INSERT INTO dim_time (time_key, hour, hour_12, am_pm, time_bucket, is_core_hours)
+             VALUES ('10:00', 10, 10, 'AM', 'Morning', 1);
+             INSERT INTO fact_pull_requests (pr_key, number, repo_key, author_key, state,
+                 title, created_at, created_date_key, created_time_key)
+             VALUES ('octocat/hello#1', 1, 'octocat/hello', 'user:octocat', 'OPEN',
+                 'A change', '2026-01-05T18:00:00Z', '2026-01-05', '10:00');
+             INSERT INTO fact_check_runs (check_run_key, pr_key, head_sha, name, status, conclusion)
+             VALUES ('C1', 'octocat/hello#1', 'abc', 'ci', 'COMPLETED', 'FAILURE'),
+                    ('C2', 'octocat/hello#1', 'abc', 'ci', 'COMPLETED', NULL);",
+        )
+        .expect("seed v4 data");
+        assert_eq!(read_index_count(&conn), 0);
+
+        init(&mut conn).expect("upgrade to v5");
+        assert_eq!(schema_version(&conn).unwrap(), 5);
+        assert_eq!(read_index_count(&conn), READ_INDEXES.len());
+        let rows: (i64, i64) = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM fact_pull_requests),
+                        (SELECT COUNT(*) FROM fact_check_runs)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(rows, (1, 2), "an index-only step keeps every row");
+
+        init(&mut conn).expect("a second open is a no-op");
+        conn.execute_batch(include_str!("migrations/005_read_indexes.sql"))
+            .expect("the statements themselves are idempotent");
+        assert_eq!(read_index_count(&conn), READ_INDEXES.len());
+        assert_eq!(schema_version(&conn).unwrap(), 5);
+
+        // `IF NOT EXISTS` would keep a same-named index with other columns, so
+        // check the definitions, not just the names.
+        let columns = |name: &str| -> Vec<String> {
+            conn.prepare("SELECT name FROM pragma_index_info(?1) ORDER BY seqno")
+                .unwrap()
+                .query_map([name], |row| row.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            columns("idx_pr_repo_created_cover"),
+            [
+                "repo_key",
+                "created_date_key",
+                "state",
+                "author_key",
+                "pr_key"
+            ]
+        );
+        assert_eq!(
+            columns("idx_check_runs_pr_conclusion"),
+            ["pr_key", "conclusion"]
+        );
+        assert_eq!(
+            columns("idx_issue_comments_parent_cover"),
+            [
+                "parent_type",
+                "parent_key",
+                "created_date_key",
+                "author_key"
+            ]
+        );
+        assert_eq!(
+            columns("idx_review_comments_pr_cover"),
+            ["pr_key", "created_date_key", "author_key"]
+        );
+        assert_eq!(
+            columns("idx_reviews_pr_cover"),
+            ["pr_key", "submitted_date_key", "reviewer_key"]
         );
     }
 

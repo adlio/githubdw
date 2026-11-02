@@ -210,3 +210,126 @@ fn group_metrics() {
     assert_eq!(repo_group.prs_opened.current, 3);
     assert_eq!(repo_group.total_reviews.as_ref().unwrap().current, 2);
 }
+
+/// Comments on two repositories, on an issue (not a pull request), in both
+/// windows and outside them, so the repository comment source has rows to
+/// wrongly include as well as rows to keep.
+fn seed_comments(warehouse: &GithubDW) {
+    seed(warehouse);
+    let conn = warehouse.connection();
+    for date in ["2026-03-31", "2026-04-11", "2026-05-02", "2026-07-02"] {
+        time_dimension::ensure_date_row(conn, date).unwrap();
+    }
+    conn.execute_batch(
+        "INSERT INTO dim_repositories (repo_key, owner, name) VALUES ('octo/beta', 'octo', 'beta');
+         INSERT INTO fact_pull_requests (pr_key, number, repo_key, author_key, state, title,
+             created_at, created_date_key, created_time_key, additions, deletions)
+         VALUES ('octo/beta#1', 1, 'octo/beta', 'user:bob', 'OPEN', 'beta change',
+                 '2026-04-11T18:00:00Z', '2026-04-11', '10:00', 1, 1);
+         INSERT INTO fact_review_comments (comment_key, pr_key, author_key, created_at,
+             created_date_key, created_time_key)
+         VALUES ('RC1', 'octo/alpha#2', 'user:bob', '2026-04-05T19:00:00Z', '2026-04-05', '10:00'),
+                ('RC2', 'octo/alpha#2', 'user:bob', '2026-04-11T19:00:00Z', '2026-04-11', '10:00'),
+                -- Same (author, pr, day) as RC2: a de-duplicating UNION would drop it.
+                ('RC2b', 'octo/alpha#2', 'user:bob', '2026-04-11T20:00:00Z', '2026-04-11', '10:00'),
+                ('RC3', 'octo/alpha#1', 'user:alice', '2026-01-10T19:00:00Z', '2026-01-10', '10:00'),
+                ('RC4', 'octo/beta#1', 'user:alice', '2026-04-11T19:00:00Z', '2026-04-11', '10:00'),
+                ('RC5', 'octo/alpha#4', 'user:alice', '2026-07-02T19:00:00Z', '2026-07-02', '10:00');
+         INSERT INTO fact_issue_comments (comment_key, parent_type, parent_key, author_key,
+             created_at, created_date_key, created_time_key)
+         VALUES ('IC1', 'pull_request', 'octo/alpha#3', 'user:alice', '2026-04-11T19:00:00Z', '2026-04-11', '10:00'),
+                ('IC2', 'pull_request', 'octo/alpha#4', 'user:bob', '2026-05-02T19:00:00Z', '2026-05-02', '10:00'),
+                ('IC3', 'pull_request', 'octo/alpha#1', 'user:bob', '2026-03-31T19:00:00Z', '2026-03-31', '10:00'),
+                ('IC4', 'pull_request', 'octo/beta#1', 'user:bob', '2026-04-11T19:00:00Z', '2026-04-11', '10:00'),
+                ('IC5', 'issue', 'octo/alpha#2', 'user:alice', '2026-04-11T19:00:00Z', '2026-04-11', '10:00'),
+                ('IC6', 'pull_request', 'octo/gone#9', 'user:bob', '2026-04-11T19:00:00Z', '2026-04-11', '10:00');",
+    )
+    .unwrap();
+}
+
+/// The comment source as it was before it was restricted per branch: every
+/// comment, unioned, then joined to the pull requests to filter by repository.
+/// Kept as the reference the restricted shape must agree with.
+const LEGACY_COMMENTS: &str =
+    "(SELECT author_key, pr_key, created_date_key FROM fact_review_comments
+      UNION ALL
+      SELECT author_key, parent_key AS pr_key, created_date_key
+      FROM fact_issue_comments WHERE parent_type = 'pull_request') fc
+     JOIN fact_pull_requests p ON p.pr_key = fc.pr_key";
+
+#[test]
+fn repo_comment_metrics_match_the_unrestricted_union() {
+    let warehouse = GithubDW::open_in_memory().unwrap();
+    seed_comments(&warehouse);
+    let conn = warehouse.connection();
+    let period = Period::Quarter(2026, 2);
+    for as_of in [
+        NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+        // Partial current quarter: the previous window is truncated too.
+        NaiveDate::from_ymd_opt(2026, 4, 12).unwrap(),
+    ] {
+        let engine = MetricsEngine::new(conn).as_of(as_of);
+        let windows = engine.windows(&period);
+        let repo = vec![SqlValue::Text("octo/alpha".into())];
+
+        let legacy_total = engine
+            .split_measure(
+                LEGACY_COMMENTS,
+                "fc.created_date_key",
+                "AND p.repo_key = ?",
+                "1",
+                &repo,
+                &windows,
+            )
+            .unwrap();
+        let legacy_board = engine
+            .leaderboard(
+                "fc.author_key",
+                LEGACY_COMMENTS,
+                "fc.created_date_key",
+                "AND p.repo_key = ?",
+                &repo,
+                &windows,
+                10,
+            )
+            .unwrap();
+        let legacy_group = engine
+            .split_measure(
+                LEGACY_COMMENTS,
+                "fc.created_date_key",
+                "AND p.repo_key IN (?, ?)",
+                "1",
+                &[
+                    SqlValue::Text("octo/alpha".into()),
+                    SqlValue::Text("octo/beta".into()),
+                ],
+                &windows,
+            )
+            .unwrap();
+
+        let metrics = engine.repo_metrics("octo/alpha", &period).unwrap();
+        let board = engine
+            .repo_aggregations("octo/alpha", &period, 10)
+            .unwrap()
+            .top_commenters;
+        let group = engine
+            .repo_group_metrics("both", &["octo/alpha".into(), "octo/beta".into()], &period)
+            .unwrap()
+            .total_comments
+            .unwrap();
+
+        assert_eq!(metrics.total_comments, legacy_total, "as of {as_of}");
+        assert_eq!(
+            serde_json::to_value(&board).unwrap(),
+            serde_json::to_value(&legacy_board).unwrap(),
+            "as of {as_of}"
+        );
+        assert_eq!(group, legacy_group, "as of {as_of}");
+    }
+    // The fixture exercises the filter: alpha's current quarter has comments
+    // from both kinds, and beta's, the issue's and the orphan's are excluded.
+    let engine = MetricsEngine::new(conn).as_of(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+    let metrics = engine.repo_metrics("octo/alpha", &period).unwrap();
+    assert_eq!(metrics.total_comments.current, 5, "RC1 RC2 RC2b IC1 IC2");
+    assert_eq!(metrics.total_comments.previous, 2, "RC3 IC3");
+}

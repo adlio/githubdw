@@ -399,15 +399,11 @@ impl<'a> MetricsEngine<'a> {
             &windows,
         )?;
         let total_comments = self.split_measure(
-            "(SELECT author_key, pr_key, created_date_key FROM fact_review_comments
-              UNION ALL
-              SELECT author_key, parent_key AS pr_key, created_date_key
-              FROM fact_issue_comments WHERE parent_type = 'pull_request') fc
-             JOIN fact_pull_requests p ON p.pr_key = fc.pr_key",
+            &repo_comments("= ?"),
             "fc.created_date_key",
-            "AND p.repo_key = ?",
+            "",
             "1",
-            &repo_parameter,
+            &[repo_parameter.clone(), repo_parameter.clone()].concat(),
             &windows,
         )?;
 
@@ -489,14 +485,10 @@ impl<'a> MetricsEngine<'a> {
         )?;
         let top_commenters = self.leaderboard(
             "fc.author_key",
-            "(SELECT author_key, pr_key, created_date_key FROM fact_review_comments
-              UNION ALL
-              SELECT author_key, parent_key AS pr_key, created_date_key
-              FROM fact_issue_comments WHERE parent_type = 'pull_request') fc
-             JOIN fact_pull_requests p ON p.pr_key = fc.pr_key",
+            &repo_comments("= ?"),
             "fc.created_date_key",
-            "AND p.repo_key = ?",
-            &repo_parameter,
+            "",
+            &[repo_parameter.clone(), repo_parameter.clone()].concat(),
             &windows,
             top,
         )?;
@@ -613,15 +605,11 @@ impl<'a> MetricsEngine<'a> {
             &windows,
         )?;
         let total_comments = self.split_measure(
-            "(SELECT author_key, pr_key, created_date_key FROM fact_review_comments
-              UNION ALL
-              SELECT author_key, parent_key AS pr_key, created_date_key
-              FROM fact_issue_comments WHERE parent_type = 'pull_request') fc
-             JOIN fact_pull_requests p ON p.pr_key = fc.pr_key",
+            &repo_comments(&format!("IN ({placeholders})")),
             "fc.created_date_key",
-            &format!("AND p.repo_key IN ({placeholders})"),
+            "",
             "1",
-            &repo_parameters,
+            &[repo_parameters.clone(), repo_parameters.clone()].concat(),
             &windows,
         )?;
 
@@ -649,6 +637,27 @@ impl<'a> MetricsEngine<'a> {
             GroupKind::Repo => self.repo_group_metrics(group_name, &members, period),
         }
     }
+}
+
+/// Every review and issue comment on the pull requests of the repositories
+/// `repo_condition` selects (`"= ?"` or `"IN (?, ...)"`), as `fc(author_key,
+/// pr_key, created_date_key)`. The condition is used twice, once per branch,
+/// so its parameters must be passed twice, in order.
+///
+/// Each branch is restricted to the repositories' pull requests before the
+/// union, so SQLite probes the per-pull-request comment indexes for those pull
+/// requests only. The earlier shape unioned every comment in the warehouse and
+/// then joined to the pull requests to filter by repository; the result is the
+/// same row set, since every comment kept here belongs to one of them.
+fn repo_comments(repo_condition: &str) -> String {
+    format!(
+        "(SELECT author_key, pr_key, created_date_key FROM fact_review_comments
+          WHERE pr_key IN (SELECT pr_key FROM fact_pull_requests WHERE repo_key {repo_condition})
+          UNION ALL
+          SELECT author_key, parent_key AS pr_key, created_date_key FROM fact_issue_comments
+          WHERE parent_type = 'pull_request'
+            AND parent_key IN (SELECT pr_key FROM fact_pull_requests WHERE repo_key {repo_condition})) fc"
+    )
 }
 
 #[cfg(test)]
