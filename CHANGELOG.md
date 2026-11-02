@@ -31,7 +31,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes minutes on a large warehouse, followed by the one-time foreign key
   check every schema change triggers. The migration runs in one transaction:
   if interrupted, the warehouse stays at version 4 and the next open retries.
-- The indexes add about 1.5% to the database size, most of it check runs. As
+- The indexes add about 1.6% to the database size, most of it check runs. As
   with every migration, a binary built before this release refuses to open a
   warehouse that has been upgraded.
 
