@@ -7,7 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.3.0] - unreleased
+## [0.3.1] - 2026-11-02
+
+### Performance
+
+- Migration 5 adds covering indexes for the repository metrics and
+  leaderboards: pull requests by repository and creation date, check-run
+  outcomes, review and issue comments, and reviews per pull request; and
+  per-author merged pull requests and pull-request conversation comments. On a
+  warehouse whose pages are not cached, `repo_metrics` and `repo_aggregations`
+  previously read every pull-request, comment and check-run row they touched,
+  including the wide title and body columns; they now read index pages only. On a 16 GB test warehouse the
+  slowest queries went from tens of seconds to under two seconds on a cold
+  page cache, and the comment counts from about 1 s to under 0.2 s warm.
+- Repository comment counts and the top-commenters leaderboard restrict each
+  side of the review/issue comment union to the repository's pull requests
+  before combining them, instead of reading every comment in the warehouse.
+  Results are unchanged.
+
+### Upgrade notes
+
+- Migration 5 builds the indexes the first time a warehouse is opened, which
+  takes minutes on a large warehouse, followed by the one-time foreign key
+  check every schema change triggers. The migration runs in one transaction:
+  if interrupted, the warehouse stays at version 4 and the next open retries.
+- The indexes add about 1.6% to the database size, most of it check runs. As
+  with every migration, a binary built before this release refuses to open a
+  warehouse that has been upgraded.
+
+## [0.3.0] - 2026-10-27
 
 ### Breaking
 
