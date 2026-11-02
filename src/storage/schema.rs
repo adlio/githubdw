@@ -14,6 +14,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/004_entity_invariants.sql")),
         M::up(include_str!("migrations/005_read_indexes.sql")),
         M::up(include_str!("migrations/006_author_indexes.sql")),
+        M::up(include_str!("migrations/007_listing_indexes.sql")),
     ])
 }
 
@@ -113,7 +114,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 6);
+        assert_eq!(version, 7);
     }
 
     /// Seed one well-formed entity, the shape every writer is expected to
@@ -255,7 +256,9 @@ mod tests {
         );
     }
 
-    const READ_INDEXES: [&str; 10] = [
+    const READ_INDEXES: [&str; 12] = [
+        "idx_pr_created_at",
+        "idx_pr_author_created_title",
         "idx_pr_author_created_cover",
         "idx_reviews_reviewer_cover",
         "idx_review_comments_author_cover",
@@ -283,17 +286,90 @@ mod tests {
             .count()
     }
 
-    /// A warehouse already at v5 (0.3.1) takes only migration 006 and keeps
-    /// its rows.
+    /// `ORDER BY created_at DESC` has no tie-break, so pull requests that share
+    /// a created_at come out in plan order. Before migration 7 that was a
+    /// table scan plus a stable sort (rowid ascending); the DESC index read
+    /// forward must give the same order, so listings do not reshuffle.
     #[test]
-    fn upgrade_from_v5_adds_only_the_author_indexes() {
+    fn created_at_index_keeps_the_listing_tie_order() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        migrations()
+            .to_version(&mut conn, 6)
+            .expect("migrate to v6");
+        conn.execute_batch(
+            "INSERT INTO dim_entities (entity_key, entity_type, login, is_human, is_bot, name)
+             VALUES ('user:octocat', 'user', 'octocat', 1, 0, 'Octocat');
+             INSERT INTO dim_repositories (repo_key, owner, name)
+             VALUES ('octocat/hello', 'octocat', 'hello');
+             INSERT INTO dim_date (date_key, year, quarter, month, day_of_month, day_of_week,
+                 is_weekend, week_of_year, week_key, month_key, quarter_key, year_key, half_key)
+             VALUES ('2026-01-05', 2026, 1, 1, 5, 1, 0, 2, '2026-W02', '2026-01', '2026-Q1',
+                 '2026', '2026-H1');
+             INSERT INTO dim_time (time_key, hour, hour_12, am_pm, time_bucket, is_core_hours)
+             VALUES ('10:00', 10, 10, 'AM', 'Morning', 1);",
+        )
+        .unwrap();
+        // Keys inserted out of order, three sharing one instant.
+        for (number, at) in [
+            (7, "2026-01-05T18:00:00Z"),
+            (3, "2026-01-05T19:00:00Z"),
+            (9, "2026-01-05T18:00:00Z"),
+            (1, "2026-01-05T17:00:00Z"),
+            (5, "2026-01-05T18:00:00Z"),
+        ] {
+            conn.execute(
+                "INSERT INTO fact_pull_requests (pr_key, number, repo_key, author_key, state,
+                     title, created_at, created_date_key, created_time_key)
+                 VALUES (?1, ?2, 'octocat/hello', 'user:octocat', 'OPEN', 't', ?3,
+                     '2026-01-05', '10:00')",
+                rusqlite::params![format!("octocat/hello#{number}"), number, at],
+            )
+            .unwrap();
+        }
+        let listing = |conn: &Connection, sql: &str| -> Vec<i64> {
+            conn.prepare(sql)
+                .unwrap()
+                .query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect()
+        };
+        let before = listing(
+            &conn,
+            "SELECT number FROM fact_pull_requests ORDER BY created_at DESC",
+        );
+        assert_eq!(before, [3, 7, 9, 5, 1]);
+        init(&mut conn).expect("upgrade to v7");
+        let through_index = listing(
+            &conn,
+            "SELECT number FROM fact_pull_requests INDEXED BY idx_pr_created_at
+             ORDER BY created_at DESC",
+        );
+        assert_eq!(through_index, before);
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT number FROM fact_pull_requests
+                 INDEXED BY idx_pr_created_at ORDER BY created_at DESC",
+                [],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            !plan.contains("TEMP B-TREE"),
+            "the index order is the listing order: {plan}"
+        );
+    }
+
+    /// A warehouse already at v5 (0.3.1) takes migrations 6 and 7 only.
+    #[test]
+    fn upgrade_from_v5_adds_the_later_indexes() {
         let mut conn = Connection::open_in_memory().expect("open in-memory db");
         migrations()
             .to_version(&mut conn, 5)
             .expect("migrate to v5");
-        assert_eq!(read_index_count(&conn), READ_INDEXES.len() - 3);
-        init(&mut conn).expect("upgrade to v6");
-        assert_eq!(schema_version(&conn).unwrap(), 6);
+        assert_eq!(read_index_count(&conn), READ_INDEXES.len() - 5);
+        init(&mut conn).expect("upgrade to the latest version");
+        assert_eq!(schema_version(&conn).unwrap(), 7);
         assert_eq!(read_index_count(&conn), READ_INDEXES.len());
     }
 
@@ -328,7 +404,7 @@ mod tests {
         assert_eq!(read_index_count(&conn), 0);
 
         init(&mut conn).expect("upgrade to the latest version");
-        assert_eq!(schema_version(&conn).unwrap(), 6);
+        assert_eq!(schema_version(&conn).unwrap(), 7);
         assert_eq!(read_index_count(&conn), READ_INDEXES.len());
         let rows: (i64, i64) = conn
             .query_row(
@@ -345,8 +421,10 @@ mod tests {
             .expect("the statements themselves are idempotent");
         conn.execute_batch(include_str!("migrations/006_author_indexes.sql"))
             .expect("the statements themselves are idempotent");
+        conn.execute_batch(include_str!("migrations/007_listing_indexes.sql"))
+            .expect("the statements themselves are idempotent");
         assert_eq!(read_index_count(&conn), READ_INDEXES.len());
-        assert_eq!(schema_version(&conn).unwrap(), 6);
+        assert_eq!(schema_version(&conn).unwrap(), 7);
 
         // `IF NOT EXISTS` would keep a same-named index with other columns, so
         // check the definitions, not just the names.
@@ -416,6 +494,19 @@ mod tests {
             columns("idx_review_comments_author_cover"),
             ["author_key", "created_date_key", "pr_key"]
         );
+        assert_eq!(columns("idx_pr_created_at"), ["created_at"]);
+        assert_eq!(
+            columns("idx_pr_author_created_title"),
+            ["author_key", "created_date_key", "repo_key", "title"]
+        );
+        let descending: i64 = conn
+            .query_row(
+                "SELECT desc FROM pragma_index_xinfo('idx_pr_created_at') WHERE name = 'created_at'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(descending, 1, "created_at is indexed DESC");
     }
 
     /// Failing loudly is the migration's job: a warehouse carrying a row the

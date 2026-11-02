@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-11-02
+
+### Performance
+
+- Migration 7 adds `fact_pull_requests(created_at DESC)`, so newest-first
+  pull-request listings stop sorting the whole table: on a 16 GB test
+  warehouse with nothing cached, the first page went from about 30 s to
+  24 ms. The index is descending on purpose. Pull requests that share a
+  `created_at` keep the order the old scan-and-sort returned.
+- It also adds `fact_pull_requests(author_key, created_date_key, repo_key,
+  title)`, so per-author work lists over a date window (repository and title)
+  read only the index.
+
+### Upgrade notes
+
+- Migration 7 adds about 6 MB and builds in one transaction at first open.
+  Binaries older than 0.3.3 refuse an upgraded warehouse.
+
 ## [0.3.2] - 2026-11-02
 
 ### Performance
