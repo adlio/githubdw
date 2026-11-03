@@ -207,7 +207,21 @@ pub struct ReviewFrontier {
     pub sealed_at: DateTime<Utc>,
 }
 
+/// True when the collection tables exist (a read-only connection to a
+/// warehouse never opened by this version has none).
+pub fn collection_tables_present(conn: &Connection) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
+         AND name IN ('collection_coverage', 'collection_review_frontier', 'pr_detail_state')",
+        [],
+        |row| row.get::<_, i64>(0),
+    )? == 3)
+}
+
 pub fn review_frontier(conn: &Connection, login: &str) -> Result<Option<ReviewFrontier>> {
+    if !collection_tables_present(conn)? {
+        return Ok(None);
+    }
     let row: Option<(String, String)> = conn
         .query_row(
             "SELECT oldest_day, sealed_at FROM collection_review_frontier WHERE login = ?1",
@@ -257,6 +271,7 @@ pub fn collect_day(
     if login.is_empty() || login.contains(char::is_whitespace) {
         return Err(Error::InvalidArgument(format!("bad login '{login}'")));
     }
+    crate::storage::schema::ensure_collection_tables(conn)?;
     let timezone = time_dimension::configured_timezone(conn)?;
     let today = time_dimension::local_date_for(now, timezone);
     if day > today {
@@ -701,6 +716,7 @@ pub(crate) fn mark_detail_fetched(
     pull_request: &PullRequestData,
     diff_stored: bool,
 ) -> Result<()> {
+    crate::storage::schema::ensure_collection_tables(conn)?;
     let at = now_text(Utc::now());
     conn.execute(
         "INSERT INTO pr_detail_state (pr_key, detail_fetched_at, diff_stored_at, base_oid, head_oid)
@@ -786,6 +802,7 @@ pub fn day_counts(
     let start_text = start.format("%Y-%m-%d").to_string();
     let end_text = end.format("%Y-%m-%d").to_string();
     let timezone = time_dimension::configured_timezone(conn)?;
+    let tables = collection_tables_present(conn)?;
     let mut out = Vec::new();
     for raw in logins {
         let login = crate::query::to_bare_login(raw);
@@ -829,7 +846,7 @@ pub fn day_counts(
         )?;
         let mut coverage: std::collections::HashMap<(String, String), RoleCoverage> =
             Default::default();
-        {
+        if tables {
             let mut statement = conn.prepare_cached(
                 "SELECT role, day, complete_as_of, complete_day_closed, inaccessible,
                         last_status, last_reason, wake_at
@@ -948,6 +965,7 @@ pub fn fetch_pull_request_detail(
     client.set_cancellation(control.cancel.clone());
     client.set_defer_waits_over(control.defer_waits_over);
     let pr_key = format!("{}#{number}", target.repository);
+    crate::storage::schema::ensure_collection_tables(conn)?;
     let before: Option<String> = conn
         .query_row(
             "SELECT diff_stored_at FROM pr_detail_state WHERE pr_key = ?1",
@@ -1230,6 +1248,9 @@ pub struct DetailState {
 
 pub fn detail_state(conn: &Connection, pr_key: &str) -> Result<Option<DetailState>> {
     let pr_key = pr_key.to_lowercase();
+    if !collection_tables_present(conn)? {
+        return Ok(None);
+    }
     Ok(conn
         .query_row(
             "SELECT light_seen_at, detail_fetched_at, diff_stored_at, base_oid, head_oid

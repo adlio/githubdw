@@ -1371,3 +1371,62 @@ fn heavy_world_counts_match_and_cost_is_measured() {
         std::fs::write(path, serde_json::to_vec_pretty(&report).unwrap()).unwrap();
     }
 }
+
+/// The collection tables are not a numbered migration, so a warehouse used
+/// by this version still opens under the 0.3.3 migration set (user_version
+/// stays 7), and a read-only reader of a warehouse that never saw this
+/// version gets "unknown" counts rather than an error.
+#[test]
+fn schema_stays_openable_by_the_previous_release() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("compat.db");
+    {
+        let dw = GithubDW::open(&path).unwrap();
+        let github = FakeGitHub::new(pinned_world());
+        let mut client = github.client();
+        collect_day(
+            dw.connection(),
+            &mut client,
+            "alice",
+            day("2026-11-03"),
+            &CountRole::all(),
+            &CollectionControl::default(),
+            now(),
+        )
+        .unwrap();
+    }
+    let mut conn = Connection::open(&path).unwrap();
+    assert_eq!(scalar(&conn, "PRAGMA user_version"), 7);
+    // The 0.3.3 migration list is exactly the first seven steps.
+    crate::storage::schema::migrations()
+        .to_latest(&mut conn)
+        .expect("0.3.3 migrations accept the file");
+
+    // A pre-existing 0.3.3 warehouse read through a read-only handle.
+    let old = dir.path().join("old.db");
+    {
+        let mut c = Connection::open(&old).unwrap();
+        crate::storage::schema::migrations()
+            .to_latest(&mut c)
+            .unwrap();
+    }
+    let ro = GithubDW::open_read_only(&old).unwrap();
+    let counts = day_counts(
+        ro.connection(),
+        &["alice"],
+        day("2026-11-02"),
+        day("2026-11-03"),
+    )
+    .unwrap();
+    assert!(
+        counts
+            .iter()
+            .all(|c| c.authored.is_none() && c.reviews.is_none())
+    );
+    assert!(review_frontier(ro.connection(), "alice").unwrap().is_none());
+    assert!(
+        detail_state(ro.connection(), "acme/app#1")
+            .unwrap()
+            .is_none()
+    );
+}

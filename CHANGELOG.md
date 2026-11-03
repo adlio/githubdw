@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `retention`: a shared collection policy file
+  (`$XDG_CONFIG_HOME/adlio-collection/policy.json`) re-read at every write.
+  A valid file caps diff retention (`none`, `transient`, `retain`); an
+  invalid file stores no new diff text; no file keeps the old behaviour.
+  While a file exists, every sync path preserves stored payloads: an empty
+  provider value never replaces a stored title, body, comment or patch, and
+  no stored row is deleted.
+- `collection`: counts-first collection by warehouse day (`collect_day`)
+  with per-day coverage, a review frontier for reviews on pull requests
+  updated later, `day_counts` that returns `None` for days not collected,
+  on-demand detail (`fetch_pull_request_detail`), in-memory diffs
+  (`fetch_pull_request_diff_live`) and revision fingerprints.
+- `GhClient` cancellation (`set_cancellation`) and deferred rate-limit
+  waits (`set_defer_waits_over`), reported as `Error::Cancelled` and
+  `Error::RateLimited`.
+
+### Compatibility
+
+- The three new tables are created with `CREATE TABLE IF NOT EXISTS` on
+  open, not by a numbered migration. `user_version` stays 7, so 0.3.3
+  binaries still open a warehouse this version has used.
+
 ## [0.3.3] - 2026-11-02
 
 ### Performance
