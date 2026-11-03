@@ -15,6 +15,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/005_read_indexes.sql")),
         M::up(include_str!("migrations/006_author_indexes.sql")),
         M::up(include_str!("migrations/007_listing_indexes.sql")),
+        M::up(include_str!("migrations/008_collection_modes.sql")),
     ])
 }
 
@@ -114,7 +115,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     /// Seed one well-formed entity, the shape every writer is expected to
@@ -369,7 +370,7 @@ mod tests {
             .expect("migrate to v5");
         assert_eq!(read_index_count(&conn), READ_INDEXES.len() - 5);
         init(&mut conn).expect("upgrade to the latest version");
-        assert_eq!(schema_version(&conn).unwrap(), 7);
+        assert_eq!(schema_version(&conn).unwrap(), 8);
         assert_eq!(read_index_count(&conn), READ_INDEXES.len());
     }
 
@@ -404,7 +405,7 @@ mod tests {
         assert_eq!(read_index_count(&conn), 0);
 
         init(&mut conn).expect("upgrade to the latest version");
-        assert_eq!(schema_version(&conn).unwrap(), 7);
+        assert_eq!(schema_version(&conn).unwrap(), 8);
         assert_eq!(read_index_count(&conn), READ_INDEXES.len());
         let rows: (i64, i64) = conn
             .query_row(
@@ -424,7 +425,7 @@ mod tests {
         conn.execute_batch(include_str!("migrations/007_listing_indexes.sql"))
             .expect("the statements themselves are idempotent");
         assert_eq!(read_index_count(&conn), READ_INDEXES.len());
-        assert_eq!(schema_version(&conn).unwrap(), 7);
+        assert_eq!(schema_version(&conn).unwrap(), 8);
 
         // `IF NOT EXISTS` would keep a same-named index with other columns, so
         // check the definitions, not just the names.

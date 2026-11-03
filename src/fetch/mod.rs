@@ -9,7 +9,8 @@ pub mod rate_limit;
 pub mod user_search;
 
 use std::process::Command;
-use std::thread::sleep;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -76,6 +77,13 @@ pub struct GhClient {
     /// When set, every call reads the provider's `x-ratelimit-*` response
     /// headers and refuses locally before spending into the reserve.
     quota_guard: Option<QuotaGuard>,
+    /// Checked before every request and during every wait.
+    cancel: Option<Arc<AtomicBool>>,
+    /// When set, a rate-limit wait longer than this is not slept: the call
+    /// returns [`Error::RateLimited`] with the wake time instead.
+    defer_waits_over: Option<Duration>,
+    /// Response bytes received (stdout length), for cost measurement.
+    bytes_received: u64,
 }
 
 /// Rate-limit state observed from data responses (never from the separate
@@ -176,7 +184,70 @@ impl GhClient {
             request_allowance: None,
             requests_issued: 0,
             quota_guard: None,
+            cancel: None,
+            defer_waits_over: None,
+            bytes_received: 0,
         }
+    }
+
+    /// Observe `flag`: once it is set, the next request (or the current wait)
+    /// returns [`Error::Cancelled`].
+    pub fn set_cancellation(&mut self, flag: Option<Arc<AtomicBool>>) {
+        self.cancel = flag;
+    }
+
+    /// Return [`Error::RateLimited`] instead of sleeping through a rate-limit
+    /// wait longer than `limit`. `None` restores the blocking behaviour.
+    pub fn set_defer_waits_over(&mut self, limit: Option<Duration>) {
+        self.defer_waits_over = limit;
+    }
+
+    /// Response bytes received over the transport so far.
+    pub fn bytes_received(&self) -> u64 {
+        self.bytes_received
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|flag| flag.load(Ordering::SeqCst))
+    }
+
+    /// Sleep in short slices so a cancellation is noticed within ~200 ms.
+    fn wait(&self, duration: Duration) -> Result<()> {
+        if !self.sleeping_enabled {
+            return if self.cancelled() {
+                Err(Error::Cancelled)
+            } else {
+                Ok(())
+            };
+        }
+        let deadline = Instant::now() + duration;
+        loop {
+            if self.cancelled() {
+                return Err(Error::Cancelled);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(());
+            }
+            std::thread::sleep((deadline - now).min(Duration::from_millis(200)));
+        }
+    }
+
+    /// Wait out a rate limit, or report it when the wait is too long.
+    fn wait_for_rate_limit(&self, resource: &str, wait: Duration, reason: &str) -> Result<()> {
+        if let Some(limit) = self.defer_waits_over
+            && wait > limit
+        {
+            return Err(Error::RateLimited {
+                resource: resource.to_string(),
+                wake_at: chrono::Utc::now()
+                    + chrono::Duration::from_std(wait).unwrap_or(chrono::Duration::hours(1)),
+                reason: reason.to_string(),
+            });
+        }
+        self.wait(wait)
     }
 
     /// Enforce a quota reserve from the provider's own response headers:
@@ -251,8 +322,7 @@ impl GhClient {
             })
     }
 
-    /// Execute a GraphQL query with string variables, returning the `data` value.
-    pub fn graphql(&mut self, query: &str, variables: &[(&str, &str)]) -> Result<Value> {
+    fn graphql_arguments(query: &str, variables: &[(&str, &str)]) -> Vec<String> {
         let mut arguments: Vec<String> = vec![
             "api".into(),
             "graphql".into(),
@@ -263,6 +333,58 @@ impl GhClient {
             arguments.push("-F".into());
             arguments.push(format!("{name}={value}"));
         }
+        arguments
+    }
+
+    /// Execute a search query and return `data` together with any GraphQL
+    /// `errors`, without failing on them. The caller classifies each error
+    /// (an inaccessible node is an expected skip; anything else is a
+    /// failure). Fails only when the response carries no `data` at all.
+    pub fn graphql_search_with_errors(
+        &mut self,
+        query: &str,
+        variables: &[(&str, &str)],
+    ) -> Result<(Value, Vec<Value>)> {
+        self.pace_search()?;
+        let arguments = Self::graphql_arguments(query, variables);
+        let response: Value = self.run_with_retry(&arguments)?;
+        let errors = response
+            .get("errors")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let data = response
+            .get("data")
+            .filter(|data| !data.is_null())
+            .cloned()
+            .ok_or_else(|| {
+                Error::GitHubApi(format!(
+                    "response has no data: {}",
+                    errors
+                        .iter()
+                        .filter_map(|e| e.get("message").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                ))
+            })?;
+        self.observe_rate_limit(&data);
+        Ok((data, errors))
+    }
+
+    fn pace_search(&mut self) -> Result<()> {
+        if let Some(previous) = self.last_search_at {
+            let elapsed = previous.elapsed();
+            if elapsed < SEARCH_MIN_INTERVAL {
+                self.wait(SEARCH_MIN_INTERVAL - elapsed)?;
+            }
+        }
+        self.last_search_at = Some(Instant::now());
+        Ok(())
+    }
+
+    /// Execute a GraphQL query with string variables, returning the `data` value.
+    pub fn graphql(&mut self, query: &str, variables: &[(&str, &str)]) -> Result<Value> {
+        let arguments = Self::graphql_arguments(query, variables);
         let response: Value = self.run_with_retry(&arguments)?;
         if let Some(errors) = response.get("errors").and_then(Value::as_array)
             && !errors.is_empty()
@@ -295,13 +417,7 @@ impl GhClient {
     /// user-scoped walk stays inside search's own 30-requests-per-minute budget
     /// instead of tripping a secondary rate limit halfway through.
     pub fn graphql_search(&mut self, query: &str, variables: &[(&str, &str)]) -> Result<Value> {
-        if let Some(previous) = self.last_search_at {
-            let elapsed = previous.elapsed();
-            if elapsed < SEARCH_MIN_INTERVAL && self.sleeping_enabled {
-                sleep(SEARCH_MIN_INTERVAL - elapsed);
-            }
-        }
-        self.last_search_at = Some(Instant::now());
+        self.pace_search()?;
         self.graphql(query, variables)
     }
 
@@ -312,16 +428,20 @@ impl GhClient {
     }
 
     fn run_with_retry(&mut self, arguments: &[String]) -> Result<Value> {
-        if let Some(delay) = self.inter_request_delay
-            && self.sleeping_enabled
-        {
-            sleep(delay);
+        if self.cancelled() {
+            return Err(Error::Cancelled);
         }
-        // Primary rate limit: sleep until reset before issuing the call.
-        if let Some(wait) = self.rate_limit.wait_needed()
-            && self.sleeping_enabled
-        {
-            sleep(wait);
+        if let Some(delay) = self.inter_request_delay {
+            self.wait(delay)?;
+        }
+        // Primary rate limit: sleep until reset before issuing the call, or
+        // report the wake time when the caller defers long waits.
+        if let Some(wait) = self.rate_limit.wait_needed() {
+            self.wait_for_rate_limit(
+                "graphql",
+                wait,
+                "primary GraphQL budget below its safety floor",
+            )?;
         }
         let mut attempt: u32 = 0;
         // With a quota guard: which bucket this call draws from, and the
@@ -343,6 +463,9 @@ impl GhClient {
             arguments
         };
         loop {
+            if self.cancelled() {
+                return Err(Error::Cancelled);
+            }
             // A first call against an unobserved bucket is a single probe.
             let mut probe = false;
             if let Some(guard) = &mut self.quota_guard {
@@ -379,6 +502,7 @@ impl GhClient {
             self.requests_issued += 1;
             match self.transport.run(sent) {
                 Ok(stdout) => {
+                    self.bytes_received += stdout.len() as u64;
                     let Some(guard) = &mut self.quota_guard else {
                         return serde_json::from_str(&stdout).map_err(Error::from);
                     };
@@ -405,8 +529,17 @@ impl GhClient {
                         return Err(error);
                     }
                     let backoff_index = (attempt as usize - 1).min(BACKOFF_SECONDS.len() - 1);
-                    if self.sleeping_enabled {
-                        sleep(Duration::from_secs(BACKOFF_SECONDS[backoff_index]));
+                    let backoff = Duration::from_secs(BACKOFF_SECONDS[backoff_index]);
+                    if is_rate_limit(&error) {
+                        // GitHub asks for at least a minute after a secondary
+                        // limit; a deferring caller gets that wake time.
+                        self.wait_for_rate_limit(
+                            resource,
+                            backoff.max(Duration::from_secs(60)),
+                            "provider rate limit response",
+                        )?;
+                    } else {
+                        self.wait(backoff)?;
                     }
                 }
             }
@@ -423,6 +556,17 @@ impl GhClient {
 impl Default for GhClient {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// A throttle response (primary or secondary rate limit).
+fn is_rate_limit(error: &Error) -> bool {
+    match error {
+        Error::GhCommand { stderr, .. } => {
+            let lowered = stderr.to_lowercase();
+            lowered.contains("rate limit") || lowered.contains("http 429")
+        }
+        _ => false,
     }
 }
 

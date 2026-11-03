@@ -167,16 +167,22 @@ impl Syncer<'_> {
                 // Fetch patches before the savepoint, then land all database
                 // writes together. A patch-write failure rolls back the PR,
                 // its file-set prune, and the repository row too.
-                let patches = (!options.skip_diffs && !pull_request.files.is_empty()).then(|| {
+                let decision = self.decide(options.skip_diffs);
+                let want_patches = decision.allowed == crate::retention::DiffRetention::Retain;
+                let patches = (want_patches && !pull_request.files.is_empty()).then(|| {
                     pull_requests::fetch_file_patches(self.client, &repo_key, pull_request.number)
                 });
                 let recovered = recover_files(
                     self.client,
-                    self.git_recovery.as_ref(),
+                    if recovery_allowed(&decision) {
+                        self.git_recovery.as_ref()
+                    } else {
+                        None
+                    },
                     &repo_key,
                     &pull_request,
                     patches.as_ref(),
-                    !options.skip_diffs,
+                    want_patches,
                 );
                 let connection = self.connection;
                 within_savepoint(connection, || {

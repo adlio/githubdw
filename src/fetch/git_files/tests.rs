@@ -72,6 +72,8 @@ pub(crate) fn pull_request_for(git: &[GitFile], served: usize, head: &str) -> Pu
         conversation_comments: vec![],
         files,
         head_sha: Some(head.into()),
+        base_oid: None,
+        head_oid: None,
         check_runs: vec![],
         node_id: None,
         pending: vec![],

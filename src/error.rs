@@ -56,6 +56,19 @@ pub enum Error {
     #[error("quota reserve reached: {0}")]
     QuotaReserve(String),
 
+    /// The caller cancelled the operation. Nothing partial was claimed.
+    #[error("cancelled")]
+    Cancelled,
+
+    /// The provider's rate limit requires a wait longer than the caller
+    /// allows. Nothing was slept; retry at `wake_at`.
+    #[error("rate limited on {resource} until {wake_at}: {reason}")]
+    RateLimited {
+        resource: String,
+        wake_at: chrono::DateTime<chrono::Utc>,
+        reason: String,
+    },
+
     /// LLM / agent failure (only present with the `summaries` feature).
     #[cfg(feature = "summaries")]
     #[error("LLM error: {0}")]

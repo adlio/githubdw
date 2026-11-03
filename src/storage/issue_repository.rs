@@ -95,6 +95,77 @@ pub fn upsert_issue(
     Ok(())
 }
 
+/// App-mode issue upsert: a NULL or empty incoming title or body never
+/// replaces a stored one.
+pub fn upsert_issue_preserving(
+    conn: &Connection,
+    repo_key: &str,
+    issue: &IssueData,
+    author_key: Option<&str>,
+    created_date_key: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO issues (
+            id, repo_key, number, title, body, state, state_reason, author_key,
+            milestone_id, comment_count, created_at, updated_at, closed_at, created_date_key
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+        ON CONFLICT (id) DO UPDATE SET
+            title = COALESCE(NULLIF(excluded.title, ''), issues.title),
+            body = COALESCE(NULLIF(excluded.body, ''), issues.body),
+            state = excluded.state,
+            state_reason = excluded.state_reason,
+            author_key = COALESCE(excluded.author_key, issues.author_key),
+            milestone_id = excluded.milestone_id,
+            comment_count = excluded.comment_count,
+            updated_at = excluded.updated_at,
+            closed_at = excluded.closed_at,
+            created_date_key = COALESCE(excluded.created_date_key, issues.created_date_key)",
+        params![
+            issue.id,
+            repo_key,
+            issue.number,
+            issue.title,
+            issue.body,
+            issue.state,
+            issue.state_reason,
+            author_key,
+            issue.milestone.as_ref().map(|milestone| &milestone.id),
+            issue.comments.len() as i64,
+            issue.created_at,
+            issue.updated_at,
+            issue.closed_at,
+            created_date_key,
+        ],
+    )?;
+    Ok(())
+}
+
+/// App-mode label bridge write: adds links, never deletes one.
+pub fn add_issue_labels(conn: &Connection, issue_id: &str, label_ids: &[String]) -> Result<()> {
+    for label_id in label_ids {
+        conn.execute(
+            "INSERT OR IGNORE INTO issue_labels (issue_id, label_id) VALUES (?1, ?2)",
+            params![issue_id, label_id],
+        )?;
+    }
+    Ok(())
+}
+
+/// App-mode assignee bridge write: adds links, never deletes one.
+pub fn add_issue_assignees(
+    conn: &Connection,
+    issue_id: &str,
+    entity_keys: &[String],
+) -> Result<()> {
+    for entity_key in entity_keys {
+        conn.execute(
+            "INSERT OR IGNORE INTO issue_assignees (issue_id, entity_key) VALUES (?1, ?2)",
+            params![issue_id, entity_key],
+        )?;
+    }
+    Ok(())
+}
+
 /// Replace the label set for an issue.
 pub fn replace_issue_labels(conn: &Connection, issue_id: &str, label_ids: &[String]) -> Result<()> {
     conn.execute("DELETE FROM issue_labels WHERE issue_id = ?1", [issue_id])?;
