@@ -51,6 +51,9 @@ pub struct FakePr {
     pub head_oid: String,
     /// Served as a FORBIDDEN (SAML) node.
     pub inaccessible: bool,
+    /// What the search index still holds as `updatedAt` (index lag). The
+    /// served node always shows the current values.
+    pub search_updated_at: Option<String>,
 }
 
 impl FakePr {
@@ -75,7 +78,12 @@ impl FakePr {
             base_oid: format!("base{number:04}"),
             head_oid: format!("head{number:04}"),
             inaccessible: false,
+            search_updated_at: None,
         }
+    }
+
+    pub fn node_id(&self) -> String {
+        format!("PR_{}_{}", self.repo, self.number)
     }
 
     pub fn merged(mut self, at: &str) -> Self {
@@ -113,6 +121,7 @@ pub struct Requests {
     pub single_pr: usize,
     pub revision: usize,
     pub rest_files: usize,
+    pub review_pages: usize,
     pub other: usize,
     pub queries: Vec<String>,
 }
@@ -123,6 +132,8 @@ pub struct World {
     pub requests: Requests,
     /// Errors returned (once each) before answering normally.
     pub fail_next: Vec<Error>,
+    /// Answer every review-list continuation with a non-retryable error.
+    pub fail_review_pages: bool,
 }
 
 #[derive(Clone)]
@@ -228,7 +239,9 @@ fn matches(pr: &FakePr, filter: &Filter) -> bool {
     if let Some((field, start, end)) = &filter.field {
         let value = match field.as_str() {
             "created" => Some(seconds(&pr.created_at)),
-            "updated" => Some(seconds(&pr.updated_at)),
+            "updated" => Some(seconds(
+                pr.search_updated_at.as_deref().unwrap_or(&pr.updated_at),
+            )),
             _ => pr.merged_at.as_deref().map(seconds),
         };
         match value {
@@ -263,7 +276,8 @@ fn state(pr: &FakePr) -> &'static str {
     }
 }
 
-fn light_node(pr: &FakePr, login: &str) -> Value {
+/// One 100-review page of `login`'s reviews after `after`.
+fn login_reviews(pr: &FakePr, login: &str, after: usize) -> Value {
     let mine: Vec<Value> = pr
         .reviews
         .iter()
@@ -273,8 +287,18 @@ fn light_node(pr: &FakePr, login: &str) -> Value {
                    "author": actor(&r.reviewer)})
         })
         .collect();
+    let total = mine.len();
+    let end = (after + 100).min(total);
+    let has_next = end < total;
+    json!({"totalCount": total,
+           "pageInfo": {"hasNextPage": has_next,
+                        "endCursor": if has_next { Some(format!("r{end}")) } else { None }},
+           "nodes": mine[after.min(total)..end]})
+}
+
+fn light_node(pr: &FakePr, login: &str) -> Value {
     json!({
-        "number": pr.number, "title": pr.title, "body": pr.body, "state": state(pr),
+        "id": pr.node_id(), "number": pr.number, "title": pr.title, "body": pr.body, "state": state(pr),
         "isDraft": false, "createdAt": pr.created_at, "updatedAt": pr.updated_at,
         "mergedAt": pr.merged_at, "closedAt": pr.merged_at,
         "baseRefName": "main", "headRefName": format!("f/{}", pr.number),
@@ -286,8 +310,7 @@ fn light_node(pr: &FakePr, login: &str) -> Value {
         "mergedBy": pr.merged_at.as_ref().map(|_| actor("merger")),
         "comments": {"totalCount": pr.comments.len()},
         "reviews": {"totalCount": pr.reviews.len()},
-        "loginReviews": {"totalCount": mine.len(), "pageInfo": {"hasNextPage": false},
-                         "nodes": mine},
+        "loginReviews": login_reviews(pr, login, 0),
         "repository": repo_json(&pr.repo),
     })
 }
@@ -320,7 +343,6 @@ pub fn full_node(pr: &FakePr) -> Value {
     let mut node = light_node(pr, "");
     let object = node.as_object_mut().unwrap();
     object.remove("loginReviews");
-    object.insert("id".into(), json!(format!("PR_{}", pr.number)));
     object.insert("reviews".into(), empty_page(reviews));
     object.insert("reviewThreads".into(), empty_page(vec![]));
     object.insert("comments".into(), empty_page(comments));
@@ -446,6 +468,30 @@ impl GhTransport for FakeGitHub {
             return Ok(world
                 .search(&q, &login, light, page_size, after)
                 .to_string());
+        }
+        if query.contains("node(id: $id)") && query.contains("loginReviews") {
+            world.requests.review_pages += 1;
+            if world.fail_review_pages {
+                return Err(Error::GhCommand {
+                    exit_code: Some(1),
+                    stderr: "HTTP 502: bad gateway, gave up".into(),
+                });
+            }
+            let id = variable(arguments, "id").unwrap_or_default().to_string();
+            let login = variable(arguments, "login").unwrap_or_default().to_string();
+            let after: usize = variable(arguments, "cursor")
+                .and_then(|c| c.strip_prefix('r'))
+                .and_then(|c| c.parse().ok())
+                .unwrap_or(0);
+            let Some(pr) = world.prs.iter().find(|pr| pr.node_id() == id) else {
+                return Ok(json!({"data": {"node": null}}).to_string());
+            };
+            return Ok(json!({"data": {
+                "rateLimit": {"limit": 5000, "cost": 1, "remaining": 4999,
+                              "resetAt": "2099-01-01T00:00:00Z"},
+                "node": {"loginReviews": login_reviews(pr, &login, after)}
+            }})
+            .to_string());
         }
         if query.contains("pullRequest(number: $number)") {
             let owner = variable(arguments, "owner").unwrap_or_default().to_string();

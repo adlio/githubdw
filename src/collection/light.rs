@@ -23,7 +23,7 @@ query($q: String!, $login: String!, $cursor: String) {
     pageInfo { hasNextPage endCursor }
     nodes {
       ... on PullRequest {
-        number title body state isDraft
+        id number title body state isDraft
         createdAt updatedAt mergedAt closedAt
         baseRefName headRefName baseRefOid headRefOid
         additions deletions changedFiles
@@ -33,7 +33,7 @@ query($q: String!, $login: String!, $cursor: String) {
         reviews { totalCount }
         loginReviews: reviews(author: $login, first: 100) {
           totalCount
-          pageInfo { hasNextPage }
+          pageInfo { hasNextPage endCursor }
           nodes { id state submittedAt author { login __typename } }
         }
         repository {
@@ -72,8 +72,126 @@ pub struct LightPullRequest {
     /// All reviews on the pull request (`reviews.totalCount`).
     pub review_total: i64,
     pub login_reviews: Vec<ReviewData>,
-    /// More than 100 reviews by the login; the rest were not read.
+    /// The login's review list has pages not yet read. Cleared once
+    /// [`complete_login_reviews`] reads them all.
     pub login_reviews_truncated: bool,
+    /// GraphQL node id, used to continue the review list.
+    pub node_id: Option<String>,
+    /// Cursor after the last review read.
+    pub login_reviews_cursor: Option<String>,
+}
+
+/// Continuation of one pull request's `loginReviews` connection.
+pub const LOGIN_REVIEWS_CONTINUATION_QUERY: &str = r#"
+query($id: ID!, $login: String!, $cursor: String) {
+  rateLimit { limit cost remaining resetAt }
+  node(id: $id) {
+    ... on PullRequest {
+      loginReviews: reviews(author: $login, first: 100, after: $cursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes { id state submittedAt author { login __typename } }
+      }
+    }
+  }
+}
+"#;
+
+/// Page through the rest of the login's reviews on `item`. On success the
+/// list is complete and `login_reviews_truncated` is cleared. Any error is
+/// returned with the item left marked truncated.
+pub fn complete_login_reviews(
+    client: &mut crate::fetch::GhClient,
+    item: &mut LightPullRequest,
+    login: &str,
+) -> crate::Result<()> {
+    let id = item.node_id.clone().ok_or_else(|| {
+        crate::Error::GitHubApi(format!(
+            "PR #{} has no node id to continue reviews",
+            item.number
+        ))
+    })?;
+    let mut cursor = item.login_reviews_cursor.clone();
+    let mut seen: std::collections::HashSet<String> =
+        item.login_reviews.iter().map(|r| r.id.clone()).collect();
+    // A provider that kept answering would otherwise loop forever.
+    for _ in 0..1000 {
+        let Some(after) = cursor.clone() else {
+            return Err(crate::Error::GitHubApi(format!(
+                "PR #{}: review list reports more pages but no cursor",
+                item.number
+            )));
+        };
+        let data = client.graphql(
+            LOGIN_REVIEWS_CONTINUATION_QUERY,
+            &[
+                ("id", id.as_str()),
+                ("login", login),
+                ("cursor", after.as_str()),
+            ],
+        )?;
+        let connection = data
+            .get("node")
+            .and_then(|n| n.get("loginReviews"))
+            .filter(|c| !c.is_null())
+            .ok_or_else(|| {
+                crate::Error::GitHubApi(format!("PR #{}: review continuation missing", item.number))
+            })?;
+        let (reviews, has_next, end) =
+            parse_review_connection(connection, item.number).map_err(crate::Error::GitHubApi)?;
+        for review in reviews {
+            if seen.insert(review.id.clone()) {
+                item.login_reviews.push(review);
+            }
+        }
+        if !has_next {
+            item.login_reviews_truncated = false;
+            item.login_reviews_cursor = None;
+            return Ok(());
+        }
+        if end == cursor {
+            return Err(crate::Error::GitHubApi(format!(
+                "PR #{}: review cursor repeated",
+                item.number
+            )));
+        }
+        cursor = end;
+    }
+    Err(crate::Error::GitHubApi(format!(
+        "PR #{}: review list did not end after 1000 pages",
+        item.number
+    )))
+}
+
+type ReviewPage = (Vec<ReviewData>, bool, Option<String>);
+
+fn parse_review_connection(connection: &Value, number: i64) -> Result<ReviewPage, String> {
+    let info = connection
+        .get("pageInfo")
+        .filter(|v| !v.is_null())
+        .ok_or(format!("PR #{number} loginReviews has no pageInfo"))?;
+    let has_next = info
+        .get("hasNextPage")
+        .and_then(Value::as_bool)
+        .ok_or(format!("PR #{number} loginReviews has no hasNextPage"))?;
+    let end = text(info, "endCursor");
+    let mut reviews = Vec::new();
+    for review in connection
+        .get("nodes")
+        .and_then(Value::as_array)
+        .ok_or(format!("PR #{number} loginReviews has no nodes"))?
+    {
+        if review.is_null() {
+            return Err(format!("PR #{number} loginReviews contains a null node"));
+        }
+        reviews.push(ReviewData {
+            id: text(review, "id").ok_or(format!("PR #{number} review has no id"))?,
+            state: text(review, "state").unwrap_or_else(|| "COMMENTED".into()),
+            body: None,
+            submitted_at: text(review, "submittedAt"),
+            author: actor(review, "author"),
+        });
+    }
+    Ok((reviews, has_next, end))
 }
 
 pub(super) struct LightPage {
@@ -227,28 +345,8 @@ fn parse_light_node(node: &Value) -> Result<LightPullRequest, String> {
         .get("loginReviews")
         .filter(|v| !v.is_null())
         .ok_or(format!("PR #{number} has no loginReviews"))?;
-    let truncated = login_reviews_value
-        .get("pageInfo")
-        .and_then(|p| p.get("hasNextPage"))
-        .and_then(Value::as_bool)
-        .ok_or(format!("PR #{number} loginReviews has no pageInfo"))?;
-    let mut login_reviews = Vec::new();
-    for review in login_reviews_value
-        .get("nodes")
-        .and_then(Value::as_array)
-        .ok_or(format!("PR #{number} loginReviews has no nodes"))?
-    {
-        if review.is_null() {
-            return Err(format!("PR #{number} loginReviews contains a null node"));
-        }
-        login_reviews.push(ReviewData {
-            id: text(review, "id").ok_or(format!("PR #{number} review has no id"))?,
-            state: text(review, "state").unwrap_or_else(|| "COMMENTED".into()),
-            body: None,
-            submitted_at: text(review, "submittedAt"),
-            author: actor(review, "author"),
-        });
-    }
+    let (login_reviews, truncated, review_cursor) =
+        parse_review_connection(login_reviews_value, number)?;
     Ok(LightPullRequest {
         repository,
         number,
@@ -276,5 +374,7 @@ fn parse_light_node(node: &Value) -> Result<LightPullRequest, String> {
         review_total: total("reviews")?,
         login_reviews,
         login_reviews_truncated: truncated,
+        node_id: text(node, "id"),
+        login_reviews_cursor: review_cursor,
     })
 }

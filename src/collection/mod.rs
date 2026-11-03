@@ -194,9 +194,23 @@ fn now_text(now: DateTime<Utc>) -> String {
     now.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
-/// How far before the previous seal the reviewed catch-up query starts, to
-/// absorb provider search-index lag and clock skew.
-pub const REVIEW_SEAL_MARGIN_SECONDS: i64 = 15 * 60;
+/// The provider search-index lag this module allows for, and its only
+/// completeness assumption beyond the provider's own answers.
+///
+/// * The reviewed catch-up re-walks every pull request updated in the hour
+///   before the previous seal, so an update that reached the search index up
+///   to an hour late is still found by the next call.
+/// * A day's coverage is `settled` only when its covering fetch (or, for
+///   reviews, its seal) happened at least this long after the day ended.
+///   Before that, a count is "complete as of" its fetch, and the caller should
+///   re-collect the day once it can settle.
+///
+/// An update indexed later than this is not guaranteed to be found.
+pub const INDEX_LAG_ALLOWANCE_SECONDS: i64 = 60 * 60;
+
+/// Kept for API stability: the reviewed catch-up margin, now equal to
+/// [`INDEX_LAG_ALLOWANCE_SECONDS`].
+pub const REVIEW_SEAL_MARGIN_SECONDS: i64 = INDEX_LAG_ALLOWANCE_SECONDS;
 
 /// The reviewed-role frontier for one login: every review the login
 /// submitted on any day in `[oldest_day, local date of sealed_at]` was
@@ -212,10 +226,11 @@ pub struct ReviewFrontier {
 pub fn collection_tables_present(conn: &Connection) -> Result<bool> {
     Ok(conn.query_row(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table'
-         AND name IN ('collection_coverage', 'collection_review_frontier', 'pr_detail_state')",
+         AND name IN ('collection_coverage', 'collection_review_frontier', 'pr_detail_state',
+                      'collection_review_observation')",
         [],
         |row| row.get::<_, i64>(0),
-    )? == 3)
+    )? == 4)
 }
 
 pub fn review_frontier(conn: &Connection, login: &str) -> Result<Option<ReviewFrontier>> {
@@ -249,11 +264,17 @@ pub fn review_frontier(conn: &Connection, login: &str) -> Result<Option<ReviewFr
 ///   per-login frontier. Each call queries (a) a catch-up range from the last
 ///   seal (minus [`REVIEW_SEAL_MARGIN_SECONDS`]) to now, and (b) the gap
 ///   between `day` and the frontier's oldest day (or, with no frontier, from
-///   `day` to now). Every pull request in those ranges carries ALL of the
-///   login's reviews (up to 100 per pull request), so after a successful call
-///   every day from `min(day, oldest_day)` through today is complete as of
-///   the new seal. Newest-first calls keep each range to one day plus the
-///   catch-up.
+///   `day` to now). Every pull request in those ranges is read with ALL of
+///   the login's reviews (pages past the first 100 are continued), so after
+///   a successful call every day from `min(day, oldest_day)` through today is
+///   complete as of the new seal, provided the provider's search index lagged
+///   by no more than [`INDEX_LAG_ALLOWANCE_SECONDS`]. Newest-first calls keep
+///   each range to one day plus the catch-up.
+///
+/// Counts read by [`day_counts`] are current observations: a pull request
+/// counts for a day only if the walk that completed the day served it, and a
+/// review only while the walk last listed it for the login (dismissed reviews
+/// are reported apart). Stored rows are never deleted.
 ///
 /// Windows over GitHub's 1,000-result cap are bisected by seconds. Light rows
 /// land in the existing fact tables through preserving upserts. Coverage is
@@ -322,7 +343,9 @@ pub fn collect_day(
             if walk.status.is_some() {
                 break;
             }
-            walk_range(conn, client, &login, qualifier, start, end, 0, &mut walk)?;
+            walk_range(
+                conn, client, &login, qualifier, start, end, 0, now, &mut walk,
+            )?;
         }
         let status = walk.status.take().unwrap_or(WindowStatus::Complete);
         let role_outcome = RoleOutcome {
@@ -460,6 +483,7 @@ fn walk_range(
     start: i64,
     end: i64,
     depth: u32,
+    now: DateTime<Utc>,
     walk: &mut Walk,
 ) -> Result<()> {
     if start > end {
@@ -521,6 +545,7 @@ fn walk_range(
                         start,
                         middle,
                         depth + 1,
+                        now,
                         walk,
                     )?;
                     if walk.status.is_none() {
@@ -532,6 +557,7 @@ fn walk_range(
                             middle + 1,
                             end,
                             depth + 1,
+                            now,
                             walk,
                         )?;
                     }
@@ -548,15 +574,22 @@ fn walk_range(
         seen += page.items.len() as i64 + page.inaccessible;
         walk.inaccessible += page.inaccessible;
         for item in &page.items {
-            if item.login_reviews_truncated {
-                walk.status.get_or_insert(WindowStatus::Partial {
-                    reason: format!(
-                        "{}#{}: more than 100 reviews by {login}; only the first 100 were read",
-                        item.repository.name_with_owner, item.number
-                    ),
-                });
+            let mut item = item.clone();
+            if item.login_reviews_truncated
+                && let Err(error) = light::complete_login_reviews(client, &mut item, login)
+            {
+                let status = match status_for_error(client, error)? {
+                    WindowStatus::Failed { reason } => WindowStatus::Partial {
+                        reason: format!(
+                            "{}#{}: reading {login}'s reviews past the first page failed: {reason}",
+                            item.repository.name_with_owner, item.number
+                        ),
+                    },
+                    other => other,
+                };
+                walk.status.get_or_insert(status);
             }
-            store_light(conn, item)?;
+            store_light(conn, &item, login, now)?;
             walk.served += 1;
         }
         if !page.has_next_page || (page.items.is_empty() && page.inaccessible == 0) {
@@ -610,9 +643,14 @@ fn resolve(conn: &Connection, actor: Option<&ActorReference>, suffix: &str) -> R
 }
 
 /// Land one light node through preserving upserts, in one savepoint.
-fn store_light(conn: &Connection, item: &LightPullRequest) -> Result<()> {
+fn store_light(
+    conn: &Connection,
+    item: &LightPullRequest,
+    login: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
     conn.execute_batch("SAVEPOINT githubdw_light")?;
-    let result = store_light_inner(conn, item);
+    let result = store_light_inner(conn, item, login, now);
     match result {
         Ok(()) => conn.execute_batch("RELEASE SAVEPOINT githubdw_light")?,
         Err(_) => conn.execute_batch(
@@ -622,7 +660,13 @@ fn store_light(conn: &Connection, item: &LightPullRequest) -> Result<()> {
     result
 }
 
-fn store_light_inner(conn: &Connection, item: &LightPullRequest) -> Result<()> {
+fn store_light_inner(
+    conn: &Connection,
+    item: &LightPullRequest,
+    login: &str,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    let observed_at = now_text(now);
     let timezone = time_dimension::configured_timezone(conn)?;
     let core_hours = time_dimension::configured_core_hours(conn);
     let suffix = repository::bot_login_suffix(conn);
@@ -679,11 +723,22 @@ fn store_light_inner(conn: &Connection, item: &LightPullRequest) -> Result<()> {
         },
         CounterSource::Light,
     )?;
+    let mut seen: Vec<String> = Vec::new();
     for review in &item.login_reviews {
         let Some(submitted_at) = review.submitted_at.as_deref() else {
             continue;
         };
         let reviewer_key = resolve(conn, review.author.as_ref(), &suffix)?;
+        conn.execute(
+            "INSERT INTO collection_review_observation
+                 (review_key, pr_key, reviewer_key, present, observed_at)
+             VALUES (?1, ?2, ?3, 1, ?4)
+             ON CONFLICT (review_key) DO UPDATE SET
+                 pr_key = excluded.pr_key, reviewer_key = excluded.reviewer_key,
+                 present = 1, observed_at = excluded.observed_at",
+            params![review.id, pr_key, reviewer_key, observed_at],
+        )?;
+        seen.push(review.id.clone());
         let submitted = keys(submitted_at)?;
         repository::upsert_review_preserving(
             conn,
@@ -697,14 +752,36 @@ fn store_light_inner(conn: &Connection, item: &LightPullRequest) -> Result<()> {
             &submitted.time_key,
         )?;
     }
+    // The login's complete review list on this pull request was read, so any
+    // stored review by the login that the provider no longer lists (deleted,
+    // or re-attributed to another account) is observed absent. Its fact row
+    // stays; counts stop reading it.
+    if !item.login_reviews_truncated {
+        let login_key = format!("user:{login}");
+        conn.execute(
+            "INSERT INTO collection_review_observation
+                 (review_key, pr_key, reviewer_key, present, observed_at)
+             SELECT review_key, pr_key, reviewer_key, 0, ?3 FROM fact_reviews
+             WHERE pr_key = ?1 AND reviewer_key = ?2
+               AND review_key NOT IN (SELECT value FROM json_each(?4))
+             ON CONFLICT (review_key) DO UPDATE SET
+                 present = 0, observed_at = excluded.observed_at",
+            params![
+                pr_key,
+                login_key,
+                observed_at,
+                serde_json::to_string(&seen)?
+            ],
+        )?;
+    }
     conn.execute(
         "INSERT INTO pr_detail_state (pr_key, light_seen_at, base_oid, head_oid)
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (pr_key) DO UPDATE SET
-             light_seen_at = excluded.light_seen_at,
+             light_seen_at = MAX(COALESCE(pr_detail_state.light_seen_at, ''), excluded.light_seen_at),
              base_oid = COALESCE(excluded.base_oid, pr_detail_state.base_oid),
              head_oid = COALESCE(excluded.head_oid, pr_detail_state.head_oid)",
-        params![pr_key, now_text(Utc::now()), item.base_oid, item.head_oid],
+        params![pr_key, observed_at, item.base_oid, item.head_oid],
     )?;
     Ok(())
 }
@@ -748,13 +825,25 @@ pub struct RoleCoverage {
     pub complete_as_of: Option<String>,
     /// True when the day had ended before the covering fetch.
     pub day_closed: Option<bool>,
+    /// True when the covering fetch (for reviews, the seal) came at least
+    /// [`INDEX_LAG_ALLOWANCE_SECONDS`] after the day ended, so late search
+    /// indexing cannot still add to it. A known but unsettled count is
+    /// "complete as of `complete_as_of`"; re-collect the day to settle it.
+    pub settled: Option<bool>,
     pub inaccessible: Option<i64>,
     pub last_status: Option<String>,
     pub last_reason: Option<String>,
     pub wake_at: Option<String>,
 }
 
+/// What a [`DayCount`] covers, for display next to the numbers.
+pub const COUNT_SCOPE: &str = "Pull requests and reviews that GitHub search attributes to this \
+login when collected, in repositories the collecting account can see. Work done under a \
+former login of a renamed account, or by a deleted account (shown by GitHub as ghost), is \
+outside this scope. Inaccessible matches are counted in `inaccessible`, not in the totals.";
+
 /// Counts for one login on one day. `None` = not collected; never a fake 0.
+/// See [`COUNT_SCOPE`] for what is and is not covered.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct DayCount {
     pub login: String,
@@ -763,8 +852,13 @@ pub struct DayCount {
     pub merged: Option<i64>,
     /// Reviews submitted (each review event counts once).
     pub reviews: Option<i64>,
-    /// Distinct pull requests reviewed that day.
+    /// Distinct pull requests reviewed that day (not counting dismissed).
     pub reviewed_prs: Option<i64>,
+    /// Reviews submitted that day and since dismissed. Not in `reviews`.
+    pub reviews_dismissed: Option<i64>,
+    /// Stored reviews the provider no longer lists for this login (deleted
+    /// or re-attributed). Kept in the warehouse; never counted.
+    pub reviews_absent: Option<i64>,
     pub authored_coverage: RoleCoverage,
     pub merged_coverage: RoleCoverage,
     pub reviewed_coverage: RoleCoverage,
@@ -773,15 +867,19 @@ pub struct DayCount {
     pub legacy_range_claim: bool,
 }
 
+/// Run a per-day `(day, count)` query bound to `?1 key, ?2 start, ?3 end,
+/// ?4 login`. Returns nothing when the collection tables are absent.
 fn grouped(
     conn: &Connection,
+    tables: bool,
     sql: &str,
-    key: &str,
-    start: &str,
-    end: &str,
+    (key, start, end, login): (&str, &str, &str, &str),
 ) -> Result<std::collections::HashMap<String, i64>> {
+    if !tables {
+        return Ok(Default::default());
+    }
     let mut statement = conn.prepare_cached(sql)?;
-    let rows = statement.query_map(params![key, start, end], |row| {
+    let rows = statement.query_map(params![key, start, end, login], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })?;
     Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -807,42 +905,71 @@ pub fn day_counts(
     for raw in logins {
         let login = crate::query::to_bare_login(raw);
         let key = format!("user:{login}");
+        let bind = (
+            key.as_str(),
+            start_text.as_str(),
+            end_text.as_str(),
+            login.as_str(),
+        );
+        // A pull request counts only when the walk that completed its day saw
+        // it then or later (`light_seen_at >= complete_as_of`). A stored row
+        // the provider no longer serves (deleted, or no longer visible) does
+        // not count toward a day the provider was re-asked about.
         let authored = grouped(
             conn,
-            "SELECT created_date_key, COUNT(*) FROM fact_pull_requests
-             WHERE author_key = ?1 AND created_date_key BETWEEN ?2 AND ?3
-             GROUP BY created_date_key",
-            &key,
-            &start_text,
-            &end_text,
+            tables,
+            "SELECT p.created_date_key, COUNT(*) FROM fact_pull_requests p
+             JOIN pr_detail_state s ON s.pr_key = p.pr_key
+             JOIN collection_coverage c ON c.login = ?4 AND c.role = 'authored'
+                  AND c.day = p.created_date_key
+             WHERE p.author_key = ?1 AND p.created_date_key BETWEEN ?2 AND ?3
+               AND s.light_seen_at >= c.complete_as_of
+             GROUP BY p.created_date_key",
+            bind,
         )?;
         let merged = grouped(
             conn,
-            "SELECT merged_date_key, COUNT(*) FROM fact_pull_requests
-             WHERE author_key = ?1 AND state = 'MERGED'
-               AND merged_date_key BETWEEN ?2 AND ?3
-             GROUP BY merged_date_key",
-            &key,
-            &start_text,
-            &end_text,
+            tables,
+            "SELECT p.merged_date_key, COUNT(*) FROM fact_pull_requests p
+             JOIN pr_detail_state s ON s.pr_key = p.pr_key
+             JOIN collection_coverage c ON c.login = ?4 AND c.role = 'merged'
+                  AND c.day = p.merged_date_key
+             WHERE p.author_key = ?1 AND p.state = 'MERGED'
+               AND p.merged_date_key BETWEEN ?2 AND ?3
+               AND s.light_seen_at >= c.complete_as_of
+             GROUP BY p.merged_date_key",
+            bind,
         )?;
-        let reviews = grouped(
-            conn,
-            "SELECT submitted_date_key, COUNT(*) FROM fact_reviews
-             WHERE reviewer_key = ?1 AND submitted_date_key BETWEEN ?2 AND ?3
-             GROUP BY submitted_date_key",
-            &key,
-            &start_text,
-            &end_text,
-        )?;
+        // Reviews count only while the walk last observed them as present for
+        // this login. Dismissed reviews are reported separately.
+        let review_sql = |filter: &str| {
+            format!(
+                "SELECT r.submitted_date_key, {{AGG}} FROM fact_reviews r
+                 JOIN collection_review_observation o ON o.review_key = r.review_key
+                 WHERE r.reviewer_key = ?1 AND r.submitted_date_key BETWEEN ?2 AND ?3
+                   AND length(?4) > 0 AND {filter}
+                 GROUP BY r.submitted_date_key"
+            )
+        };
+        let current = review_sql("o.present = 1 AND r.state <> 'DISMISSED'");
+        let reviews = grouped(conn, tables, &current.replace("{AGG}", "COUNT(*)"), bind)?;
         let reviewed_prs = grouped(
             conn,
-            "SELECT submitted_date_key, COUNT(DISTINCT pr_key) FROM fact_reviews
-             WHERE reviewer_key = ?1 AND submitted_date_key BETWEEN ?2 AND ?3
-             GROUP BY submitted_date_key",
-            &key,
-            &start_text,
-            &end_text,
+            tables,
+            &current.replace("{AGG}", "COUNT(DISTINCT r.pr_key)"),
+            bind,
+        )?;
+        let dismissed = grouped(
+            conn,
+            tables,
+            &review_sql("o.present = 1 AND r.state = 'DISMISSED'").replace("{AGG}", "COUNT(*)"),
+            bind,
+        )?;
+        let absent = grouped(
+            conn,
+            tables,
+            &review_sql("o.present = 0").replace("{AGG}", "COUNT(*)"),
+            bind,
         )?;
         let mut coverage: std::collections::HashMap<(String, String), RoleCoverage> =
             Default::default();
@@ -860,6 +987,7 @@ pub fn day_counts(
                         known: complete.is_some(),
                         complete_as_of: complete,
                         day_closed: row.get::<_, Option<i64>>(3)?.map(|v| v != 0),
+                        settled: None,
                         inaccessible: row.get(4)?,
                         last_status: row.get(5)?,
                         last_reason: row.get(6)?,
@@ -885,14 +1013,22 @@ pub fn day_counts(
                         known: false,
                         complete_as_of: None,
                         day_closed: None,
+                        settled: None,
                         inaccessible: None,
                         last_status: None,
                         last_reason: None,
                         wake_at: None,
                     })
             };
-            let authored_coverage = role_cov("authored");
-            let merged_coverage = role_cov("merged");
+            let settle_after = day_bounds(timezone, day)?.1 + 1 + INDEX_LAG_ALLOWANCE_SECONDS;
+            let settle = |mut coverage: RoleCoverage| -> RoleCoverage {
+                coverage.settled = coverage.complete_as_of.as_deref().map(|at| {
+                    time_dimension::parse_utc(at).is_ok_and(|at| at.timestamp() >= settle_after)
+                });
+                coverage
+            };
+            let authored_coverage = settle(role_cov("authored"));
+            let merged_coverage = settle(role_cov("merged"));
             let mut reviewed_coverage = role_cov("reviewed");
             // Reviews are known only inside the sealed frontier.
             let sealed = frontier.as_ref().is_some_and(|f| {
@@ -904,6 +1040,7 @@ pub fn day_counts(
                 reviewed_coverage.day_closed =
                     Some(day < time_dimension::local_date_for(f.sealed_at, timezone));
             }
+            let reviewed_coverage = settle(reviewed_coverage);
             let pick = |known: bool, map: &std::collections::HashMap<String, i64>| {
                 known.then(|| map.get(&text).copied().unwrap_or(0))
             };
@@ -914,6 +1051,8 @@ pub fn day_counts(
                 merged: pick(merged_coverage.known, &merged),
                 reviews: pick(reviewed_coverage.known, &reviews),
                 reviewed_prs: pick(reviewed_coverage.known, &reviewed_prs),
+                reviews_dismissed: pick(reviewed_coverage.known, &dismissed),
+                reviews_absent: pick(reviewed_coverage.known, &absent),
                 legacy_range_claim: legacy.as_ref().is_some_and(|(a, b)| {
                     a.as_str() <= text.as_str() && text.as_str() <= b.as_str()
                 }),

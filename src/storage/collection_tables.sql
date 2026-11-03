@@ -43,3 +43,17 @@ CREATE TABLE IF NOT EXISTS pr_detail_state (
     head_oid             TEXT,
     revision_fingerprint TEXT
 );
+
+-- What the counts walk last observed for each review by the login it was
+-- walking. A review the provider no longer lists for that login on a pull
+-- request whose full review list was read is marked present = 0. Fact rows
+-- are never deleted; counts read only present = 1.
+CREATE TABLE IF NOT EXISTS collection_review_observation (
+    review_key   TEXT PRIMARY KEY,
+    pr_key       TEXT NOT NULL,
+    reviewer_key TEXT NOT NULL,
+    present      INTEGER NOT NULL CHECK (present IN (0, 1)),
+    observed_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_review_observation_pr
+    ON collection_review_observation (pr_key, reviewer_key);

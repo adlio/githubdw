@@ -1430,3 +1430,350 @@ fn schema_stays_openable_by_the_previous_release() {
             .is_none()
     );
 }
+
+// ------------------------------------------ correctness follow-ups (round 2)
+
+/// A review deleted at the provider (or re-attributed) after it was stored
+/// stays in the warehouse but stops counting once the walk re-reads that
+/// pull request; a dismissed review moves to `reviews_dismissed`.
+#[test]
+fn deleted_and_dismissed_reviews_stop_counting_without_deleting_rows() {
+    let dir = tempfile::tempdir().unwrap();
+    let dw = warehouse(dir.path(), "dismissed.db");
+    let conn = dw.connection();
+    let github = FakeGitHub::new(vec![
+        FakePr::new(
+            "acme/lib",
+            20,
+            "bob",
+            "2026-11-02T17:00:00Z",
+            "2026-11-02T18:30:00Z",
+        )
+        .reviewed("D1", "alice", "2026-11-02T18:00:00Z")
+        .reviewed("D2", "alice", "2026-11-02T18:30:00Z"),
+        FakePr::new(
+            "acme/lib",
+            21,
+            "bob",
+            "2026-11-02T17:00:00Z",
+            "2026-11-02T19:00:00Z",
+        )
+        .reviewed("D3", "alice", "2026-11-02T19:00:00Z"),
+    ]);
+    let mut client = github.client();
+    let reviewed = [CountRole::Reviewed];
+    collect_day(
+        conn,
+        &mut client,
+        "alice",
+        day("2026-11-02"),
+        &reviewed,
+        &CollectionControl::default(),
+        now(),
+    )
+    .unwrap();
+    let c = &day_counts(conn, &["alice"], day("2026-11-02"), day("2026-11-02")).unwrap()[0];
+    assert_eq!(
+        (
+            c.reviews,
+            c.reviewed_prs,
+            c.reviews_dismissed,
+            c.reviews_absent
+        ),
+        (Some(3), Some(2), Some(0), Some(0))
+    );
+
+    // D2 is deleted, D3 is dismissed; both PRs are touched, so the next
+    // call's catch-up re-reads them.
+    let later = now() + chrono::Duration::hours(2);
+    let touched = (later - chrono::Duration::minutes(5)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    github.with(|w| {
+        w.prs[0].reviews.retain(|r| r.id != "D2");
+        w.prs[0].updated_at = touched.clone();
+        w.prs[1].reviews[0].state = "DISMISSED".into();
+        w.prs[1].updated_at = touched.clone();
+    });
+    let outcome = collect_day(
+        conn,
+        &mut client,
+        "alice",
+        day("2026-11-03"),
+        &reviewed,
+        &CollectionControl::default(),
+        later,
+    )
+    .unwrap();
+    assert!(outcome.complete());
+    let c = &day_counts(conn, &["alice"], day("2026-11-02"), day("2026-11-02")).unwrap()[0];
+    assert_eq!(c.reviews, Some(1), "only D1 is a current review");
+    assert_eq!(c.reviewed_prs, Some(1));
+    assert_eq!(c.reviews_dismissed, Some(1), "D3");
+    assert_eq!(c.reviews_absent, Some(1), "D2");
+    // Nothing was deleted.
+    assert_eq!(
+        scalar(
+            conn,
+            "SELECT COUNT(*) FROM fact_reviews WHERE review_key IN ('D1','D2','D3')"
+        ),
+        3
+    );
+    // Re-appearing (for example a re-attribution undone) counts again.
+    github.with(|w| {
+        w.prs[0].reviews.push(fake::FakeReview {
+            id: "D2".into(),
+            reviewer: "alice".into(),
+            state: "APPROVED".into(),
+            body: String::new(),
+            submitted_at: "2026-11-02T18:30:00Z".into(),
+        });
+        w.prs[0].updated_at =
+            (later + chrono::Duration::minutes(10)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    });
+    collect_day(
+        conn,
+        &mut client,
+        "alice",
+        day("2026-11-03"),
+        &reviewed,
+        &CollectionControl::default(),
+        later + chrono::Duration::minutes(20),
+    )
+    .unwrap();
+    let c = &day_counts(conn, &["alice"], day("2026-11-02"), day("2026-11-02")).unwrap()[0];
+    assert_eq!((c.reviews, c.reviews_absent), (Some(2), Some(0)));
+}
+
+/// A stored pull request the provider no longer serves for a day it was
+/// re-asked about is not counted for that day (its row stays).
+#[test]
+fn a_stored_pr_the_provider_stops_serving_is_not_counted_after_a_recheck() {
+    let dir = tempfile::tempdir().unwrap();
+    let dw = warehouse(dir.path(), "gone.db");
+    let conn = dw.connection();
+    let github = FakeGitHub::new(vec![
+        FakePr::new(
+            "acme/app",
+            30,
+            "alice",
+            "2026-11-02T17:00:00Z",
+            "2026-11-02T17:00:00Z",
+        ),
+        FakePr::new(
+            "acme/app",
+            31,
+            "alice",
+            "2026-11-02T18:00:00Z",
+            "2026-11-02T18:00:00Z",
+        ),
+    ]);
+    let mut client = github.client();
+    collect_day(
+        conn,
+        &mut client,
+        "alice",
+        day("2026-11-02"),
+        &[CountRole::Authored],
+        &CollectionControl::default(),
+        now(),
+    )
+    .unwrap();
+    assert_eq!(
+        day_counts(conn, &["alice"], day("2026-11-02"), day("2026-11-02")).unwrap()[0].authored,
+        Some(2)
+    );
+    github.with(|w| w.prs.retain(|p| p.number != 31));
+    collect_day(
+        conn,
+        &mut client,
+        "alice",
+        day("2026-11-02"),
+        &[CountRole::Authored],
+        &CollectionControl::default(),
+        now() + chrono::Duration::hours(1),
+    )
+    .unwrap();
+    assert_eq!(
+        day_counts(conn, &["alice"], day("2026-11-02"), day("2026-11-02")).unwrap()[0].authored,
+        Some(1)
+    );
+    assert_eq!(
+        scalar(
+            conn,
+            "SELECT COUNT(*) FROM fact_pull_requests WHERE pr_key = 'acme/app#31'"
+        ),
+        1,
+        "row kept"
+    );
+}
+
+/// More than 100 reviews by one login on one pull request are read in full
+/// through the review-list continuation; a failed continuation is Partial.
+#[test]
+fn reviews_beyond_the_first_page_are_paginated() {
+    let dir = tempfile::tempdir().unwrap();
+    let dw = warehouse(dir.path(), "many.db");
+    let conn = dw.connection();
+    let mut pr = FakePr::new(
+        "acme/lib",
+        40,
+        "bob",
+        "2026-11-02T16:00:00Z",
+        "2026-11-02T23:00:00Z",
+    );
+    let base = Utc.with_ymd_and_hms(2026, 11, 2, 17, 0, 0).unwrap();
+    for i in 0..230 {
+        let at = (base + chrono::Duration::minutes(i)).to_rfc3339_opts(SecondsFormat::Secs, true);
+        pr = pr.reviewed(&format!("M{i}"), "alice", &at);
+    }
+    let github = FakeGitHub::new(vec![pr]);
+    let mut client = github.client();
+    let outcome = collect_day(
+        conn,
+        &mut client,
+        "alice",
+        day("2026-11-02"),
+        &[CountRole::Reviewed],
+        &CollectionControl::default(),
+        now(),
+    )
+    .unwrap();
+    assert!(outcome.complete(), "{outcome:?}");
+    assert_eq!(
+        github.requests().review_pages,
+        2,
+        "pages 2 and 3 of 230 reviews"
+    );
+    let c = &day_counts(conn, &["alice"], day("2026-11-02"), day("2026-11-03")).unwrap();
+    let total: i64 = c.iter().filter_map(|c| c.reviews).sum();
+    assert_eq!(total, 230);
+
+    // A continuation that fails leaves the role Partial, never complete.
+    let dir2 = tempfile::tempdir().unwrap();
+    let dw2 = warehouse(dir2.path(), "many2.db");
+    let github2 = FakeGitHub::new(github.with(|w| w.prs.clone()));
+    let mut client2 = github2.client();
+    github2.with(|w| w.fail_review_pages = true);
+    let outcome = collect_day(
+        dw2.connection(),
+        &mut client2,
+        "alice",
+        day("2026-11-02"),
+        &[CountRole::Reviewed],
+        &CollectionControl::default(),
+        now(),
+    )
+    .unwrap();
+    assert!(
+        matches!(outcome.roles[0].status, WindowStatus::Partial { .. }),
+        "{outcome:?}"
+    );
+    assert!(
+        review_frontier(dw2.connection(), "alice")
+            .unwrap()
+            .is_none(),
+        "no seal"
+    );
+    // The truncated list must not mark the unread reviews absent.
+    assert_eq!(
+        scalar(
+            dw2.connection(),
+            "SELECT COUNT(*) FROM collection_review_observation WHERE present = 0"
+        ),
+        0
+    );
+}
+
+/// An update the search index reports late (within the one-hour allowance)
+/// is found by the next call's catch-up; coverage reports `settled` only once
+/// the covering fetch is an allowance past the day's end.
+#[test]
+fn late_indexed_updates_within_the_allowance_are_reconciled() {
+    let dir = tempfile::tempdir().unwrap();
+    let dw = warehouse(dir.path(), "lag.db");
+    let conn = dw.connection();
+    // Reviewed and updated 30 minutes before the first call, but the index
+    // still shows the PR's old update time.
+    let t0 = now();
+    let review_at = (t0 - chrono::Duration::minutes(30)).to_rfc3339_opts(SecondsFormat::Secs, true);
+    let mut pr = FakePr::new("acme/lib", 50, "bob", "2026-10-01T16:00:00Z", &review_at)
+        .reviewed("L1", "alice", &review_at);
+    pr.search_updated_at = Some("2026-10-01T16:00:00Z".into());
+    let github = FakeGitHub::new(vec![pr]);
+    let mut client = github.client();
+    let reviewed = [CountRole::Reviewed];
+    collect_day(
+        conn,
+        &mut client,
+        "alice",
+        day("2026-11-03"),
+        &reviewed,
+        &CollectionControl::default(),
+        t0,
+    )
+    .unwrap();
+    assert_eq!(
+        scalar(conn, "SELECT COUNT(*) FROM fact_reviews"),
+        0,
+        "index not caught up yet"
+    );
+    let today = &day_counts(conn, &["alice"], day("2026-11-03"), day("2026-11-03")).unwrap()[0];
+    assert_eq!(today.reviews, Some(0));
+    assert_eq!(
+        today.reviewed_coverage.settled,
+        Some(false),
+        "a count as of t0, not settled"
+    );
+    // The index catches up 40 minutes later; the next call (for an older
+    // day) re-walks the hour before the previous seal and finds it.
+    github.with(|w| w.prs[0].search_updated_at = None);
+    let t1 = t0 + chrono::Duration::minutes(40);
+    collect_day(
+        conn,
+        &mut client,
+        "alice",
+        day("2026-11-02"),
+        &reviewed,
+        &CollectionControl::default(),
+        t1,
+    )
+    .unwrap();
+    let today = &day_counts(conn, &["alice"], day("2026-11-03"), day("2026-11-03")).unwrap()[0];
+    assert_eq!(today.reviews, Some(1));
+
+    // Settled: Nov 2 authored, collected at t0 (12 h after Nov 2 ended).
+    collect_day(
+        conn,
+        &mut client,
+        "alice",
+        day("2026-11-02"),
+        &[CountRole::Authored],
+        &CollectionControl::default(),
+        t0,
+    )
+    .unwrap();
+    let nov2 = &day_counts(conn, &["alice"], day("2026-11-02"), day("2026-11-02")).unwrap()[0];
+    assert_eq!(nov2.authored_coverage.settled, Some(true));
+    assert_eq!(nov2.reviewed_coverage.settled, Some(true));
+    // Collected 10 minutes after midnight: complete as of then, not settled.
+    let just_after = Utc.with_ymd_and_hms(2026, 11, 3, 8, 10, 0).unwrap();
+    let dw2 = warehouse(dir.path(), "lag2.db");
+    collect_day(
+        dw2.connection(),
+        &mut client,
+        "alice",
+        day("2026-11-02"),
+        &[CountRole::Authored],
+        &CollectionControl::default(),
+        just_after,
+    )
+    .unwrap();
+    let nov2 = &day_counts(
+        dw2.connection(),
+        &["alice"],
+        day("2026-11-02"),
+        day("2026-11-02"),
+    )
+    .unwrap()[0];
+    assert_eq!(nov2.authored_coverage.day_closed, Some(true));
+    assert_eq!(nov2.authored_coverage.settled, Some(false));
+}
