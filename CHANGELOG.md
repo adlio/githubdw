@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.5] - 2026-11-04
+
 ### Added
 
 - `retention`: a shared collection policy file
@@ -28,8 +30,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Compatibility
 
 - The three new tables are created with `CREATE TABLE IF NOT EXISTS` on
-  open, not by a numbered migration. `user_version` is not bumped by them
-  (it is 8 after the 0.3.4 migration below).
+  open, not by a numbered migration. `user_version` stays 8, so a 0.3.4
+  binary still opens a warehouse 0.3.5 has used.
 
 ## [0.3.4] - 2026-11-04
 
