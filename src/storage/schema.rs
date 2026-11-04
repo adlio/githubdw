@@ -15,6 +15,7 @@ pub fn migrations() -> Migrations<'static> {
         M::up(include_str!("migrations/005_read_indexes.sql")),
         M::up(include_str!("migrations/006_author_indexes.sql")),
         M::up(include_str!("migrations/007_listing_indexes.sql")),
+        M::up(include_str!("migrations/008_fts_rowid_triggers.sql")),
     ])
 }
 
@@ -114,7 +115,7 @@ mod tests {
         let version: i64 = conn
             .query_row("PRAGMA user_version", [], |row| row.get(0))
             .expect("user_version");
-        assert_eq!(version, 7);
+        assert_eq!(version, 8);
     }
 
     /// Seed one well-formed entity, the shape every writer is expected to
@@ -360,7 +361,7 @@ mod tests {
         );
     }
 
-    /// A warehouse already at v5 (0.3.1) takes migrations 6 and 7 only.
+    /// A warehouse already at v5 (0.3.1) takes migrations 6 through 8 only.
     #[test]
     fn upgrade_from_v5_adds_the_later_indexes() {
         let mut conn = Connection::open_in_memory().expect("open in-memory db");
@@ -369,7 +370,7 @@ mod tests {
             .expect("migrate to v5");
         assert_eq!(read_index_count(&conn), READ_INDEXES.len() - 5);
         init(&mut conn).expect("upgrade to the latest version");
-        assert_eq!(schema_version(&conn).unwrap(), 7);
+        assert_eq!(schema_version(&conn).unwrap(), 8);
         assert_eq!(read_index_count(&conn), READ_INDEXES.len());
     }
 
@@ -404,7 +405,7 @@ mod tests {
         assert_eq!(read_index_count(&conn), 0);
 
         init(&mut conn).expect("upgrade to the latest version");
-        assert_eq!(schema_version(&conn).unwrap(), 7);
+        assert_eq!(schema_version(&conn).unwrap(), 8);
         assert_eq!(read_index_count(&conn), READ_INDEXES.len());
         let rows: (i64, i64) = conn
             .query_row(
@@ -424,7 +425,7 @@ mod tests {
         conn.execute_batch(include_str!("migrations/007_listing_indexes.sql"))
             .expect("the statements themselves are idempotent");
         assert_eq!(read_index_count(&conn), READ_INDEXES.len());
-        assert_eq!(schema_version(&conn).unwrap(), 7);
+        assert_eq!(schema_version(&conn).unwrap(), 8);
 
         // `IF NOT EXISTS` would keep a same-named index with other columns, so
         // check the definitions, not just the names.
@@ -615,6 +616,117 @@ mod tests {
             )
             .expect("trigram substring match");
         assert_eq!(hit, "octocat/hello#1");
+    }
+
+    /// Parent rows an issue comment references, valid at every schema version.
+    const COMMENT_PARENTS: &str =
+        "INSERT INTO dim_entities (entity_key, entity_type, login, is_human, is_bot, name)
+         VALUES ('user:octocat', 'user', 'octocat', 1, 0, 'Octocat');
+         INSERT INTO dim_date (date_key, year, quarter, month, day_of_month, day_of_week,
+             is_weekend, week_of_year, week_key, month_key, quarter_key, year_key, half_key)
+         VALUES ('2026-01-05', 2026, 1, 1, 5, 1, 0, 2, '2026-W02', '2026-01', '2026-Q1',
+             '2026', '2026-H1');
+         INSERT INTO dim_time (time_key, hour, hour_12, am_pm, time_bucket, is_core_hours)
+         VALUES ('10:00', 10, 10, 'AM', 'Morning', 1);";
+
+    /// The triggers address FTS rows by the source rowid. Prove the index
+    /// follows inserts, upserts that change the body, upserts that do not,
+    /// and deletes, one row at a time, without disturbing a neighbour.
+    #[test]
+    fn fts_triggers_track_upserts_and_deletes_by_rowid() {
+        let conn = open_in_memory();
+        conn.execute_batch(COMMENT_PARENTS).expect("seed parents");
+        let upsert = |key: &str, body: &str| {
+            conn.execute(
+                "INSERT INTO fact_issue_comments (comment_key, parent_type, parent_key,
+                     author_key, body, created_at, created_date_key, created_time_key)
+                 VALUES (?1, 'issue', 'o/r#1', 'user:octocat', ?2,
+                     '2026-01-05T18:00:00Z', '2026-01-05', '10:00')
+                 ON CONFLICT (comment_key) DO UPDATE SET body = excluded.body",
+                rusqlite::params![key, body],
+            )
+            .expect("upsert comment");
+        };
+        let hits = |term: &str| -> Vec<String> {
+            let mut statement = conn
+                .prepare(
+                    "SELECT comment_key FROM issue_comments_fts
+                     WHERE issue_comments_fts MATCH ?1 ORDER BY comment_key",
+                )
+                .expect("prepare");
+            statement
+                .query_map([term], |row| row.get(0))
+                .expect("query")
+                .collect::<rusqlite::Result<_>>()
+                .expect("rows")
+        };
+        let fts_rows = || -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM issue_comments_fts", [], |row| {
+                row.get(0)
+            })
+            .expect("count")
+        };
+
+        upsert("c1", "alpha flake");
+        upsert("c2", "beta flake");
+        assert_eq!(hits("flake"), vec!["c1", "c2"]);
+
+        upsert("c1", "gamma rewrite");
+        assert_eq!(hits("flake"), vec!["c2"]);
+        assert_eq!(hits("rewrite"), vec!["c1"]);
+
+        upsert("c2", "beta flake");
+        assert_eq!(
+            fts_rows(),
+            2,
+            "a no-op upsert neither adds nor drops an entry"
+        );
+        assert_eq!(hits("flake"), vec!["c2"]);
+
+        conn.execute(
+            "DELETE FROM fact_issue_comments WHERE comment_key = 'c1'",
+            [],
+        )
+        .expect("delete");
+        assert!(hits("rewrite").is_empty());
+        assert_eq!(hits("flake"), vec!["c2"]);
+        assert_eq!(fts_rows(), 1);
+    }
+
+    /// Upgrading a v7 (0.3.3) warehouse rebuilds every FTS table from its
+    /// source rows, keyed by their rowids.
+    #[test]
+    fn upgrade_from_v7_rebuilds_fts_by_rowid() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        conn.pragma_update(None, "foreign_keys", "OFF")
+            .expect("fk off");
+        migrations()
+            .to_version(&mut conn, 7)
+            .expect("migrate to v7");
+        conn.execute_batch(COMMENT_PARENTS).expect("seed parents");
+        conn.execute_batch(
+            "INSERT INTO fact_issue_comments (comment_key, parent_type, parent_key,
+                 author_key, body, created_at, created_date_key, created_time_key)
+             VALUES ('c0', 'issue', 'o/r#1', 'user:octocat', 'filler',
+                 '2026-01-05T18:00:00Z', '2026-01-05', '10:00'),
+                    ('c1', 'issue', 'o/r#1', 'user:octocat', 'legacy body',
+                 '2026-01-05T18:00:00Z', '2026-01-05', '10:00');
+             DELETE FROM fact_issue_comments WHERE comment_key = 'c0';",
+        )
+        .expect("seed v7 rows");
+        init(&mut conn).expect("upgrade to latest");
+        assert_eq!(schema_version(&conn).unwrap(), 8);
+
+        let (fts_rowid, source_rowid): (i64, i64) = conn
+            .query_row(
+                "SELECT f.rowid, c.rowid FROM issue_comments_fts f
+                 JOIN fact_issue_comments c ON c.comment_key = f.comment_key
+                 WHERE issue_comments_fts MATCH 'legacy'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("rebuilt entry");
+        assert_eq!(fts_rowid, source_rowid);
     }
 
     #[test]
