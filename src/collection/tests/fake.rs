@@ -296,7 +296,7 @@ fn login_reviews(pr: &FakePr, login: &str, after: usize) -> Value {
            "nodes": mine[after.min(total)..end]})
 }
 
-fn light_node(pr: &FakePr, login: &str) -> Value {
+pub fn light_node(pr: &FakePr, login: &str) -> Value {
     json!({
         "id": pr.node_id(), "number": pr.number, "title": pr.title, "body": pr.body, "state": state(pr),
         "isDraft": false, "createdAt": pr.created_at, "updatedAt": pr.updated_at,

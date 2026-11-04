@@ -1,6 +1,7 @@
 //! Collection-mode tests against a pinned in-memory GitHub and real SQLite
 //! files.
 
+mod edges;
 mod fake;
 
 use std::path::{Path, PathBuf};

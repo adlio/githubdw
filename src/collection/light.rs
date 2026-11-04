@@ -378,3 +378,253 @@ fn parse_light_node(node: &Value) -> Result<LightPullRequest, String> {
         login_reviews_cursor: review_cursor,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use serde_json::json;
+
+    use super::*;
+    use crate::fetch::test_support::FixtureTransport;
+    use crate::fetch::{GhClient, GhTransport};
+
+    fn review_page(ids: &[&str], has_next: bool, end: Option<&str>) -> Value {
+        let nodes: Vec<Value> = ids
+            .iter()
+            .map(|id| {
+                json!({"id": id, "state": "APPROVED", "submittedAt": "2026-11-02T10:00:00Z",
+                       "author": {"login": "alice", "__typename": "User"}})
+            })
+            .collect();
+        json!({"totalCount": ids.len(), "pageInfo": {"hasNextPage": has_next, "endCursor": end},
+               "nodes": nodes})
+    }
+
+    fn node(number: i64, reviews: Value) -> Value {
+        json!({
+            "id": format!("PR_{number}"), "number": number, "title": "t", "body": "b",
+            "state": "OPEN", "isDraft": false, "createdAt": "2026-11-02T09:00:00Z",
+            "updatedAt": "2026-11-02T10:00:00Z", "mergedAt": null, "closedAt": null,
+            "additions": 1, "deletions": 0, "changedFiles": 1,
+            "author": {"login": "bob"},
+            "comments": {"totalCount": 0}, "reviews": {"totalCount": 1},
+            "loginReviews": reviews,
+            "repository": {"nameWithOwner": "acme/app", "primaryLanguage": null,
+                           "isFork": false, "isPrivate": false,
+                           "defaultBranchRef": {"name": "main"},
+                           "createdAt": "2020-01-01T00:00:00Z"}
+        })
+    }
+
+    fn search(nodes: Vec<Value>, total: i64, has_next: bool, end: Option<&str>) -> Value {
+        json!({"search": {"issueCount": total,
+                          "pageInfo": {"hasNextPage": has_next, "endCursor": end},
+                          "nodes": nodes}})
+    }
+
+    fn page(data: &Value, errors: &[Value]) -> Result<LightPage, String> {
+        parse_light_page(data, errors).map_err(|error| match error {
+            PageError::RateLimited(reason) => format!("rate-limited: {reason}"),
+            PageError::Failed(reason) => format!("failed: {reason}"),
+        })
+    }
+
+    fn truncated_item() -> LightPullRequest {
+        let parsed = parse_light_node(&node(7, review_page(&["R1"], true, Some("c1")))).unwrap();
+        assert!(parsed.login_reviews_truncated);
+        parsed
+    }
+
+    fn continuation(page: Value) -> crate::Result<String> {
+        Ok(json!({"data": {"node": {"loginReviews": page}}}).to_string())
+    }
+
+    fn client(responses: Vec<crate::Result<String>>) -> GhClient {
+        GhClient::with_transport(Box::new(FixtureTransport::new(responses))).without_sleeping()
+    }
+
+    #[test]
+    fn the_light_node_parses_identity_sizes_and_the_login_reviews() {
+        let item = parse_light_node(&node(7, review_page(&["R1", "R2"], false, None))).unwrap();
+        assert_eq!(item.number, 7);
+        assert_eq!(item.repository.name_with_owner, "acme/app");
+        assert_eq!(item.author.as_ref().unwrap().type_name, "User");
+        assert_eq!(item.login_reviews.len(), 2);
+        assert!(
+            item.login_reviews[0].body.is_none(),
+            "light reads carry no bodies"
+        );
+        assert!(!item.login_reviews_truncated);
+        assert!(light_search_query().contains("nameWithOwner"));
+    }
+
+    #[test]
+    fn malformed_review_connections_are_rejected() {
+        let mut no_flag = review_page(&["R1"], false, None);
+        no_flag["pageInfo"] = json!({"endCursor": null});
+        let error = parse_light_node(&node(7, no_flag)).unwrap_err();
+        assert_eq!(error, "PR #7 loginReviews has no hasNextPage");
+        let mut null_node = review_page(&[], false, None);
+        null_node["nodes"] = json!([null]);
+        let error = parse_light_node(&node(7, null_node)).unwrap_err();
+        assert_eq!(error, "PR #7 loginReviews contains a null node");
+    }
+
+    #[test]
+    fn continuing_reviews_reads_every_page_once() {
+        let mut item = truncated_item();
+        let mut client = client(vec![
+            continuation(review_page(&["R1", "R2"], true, Some("c2"))),
+            continuation(review_page(&["R3"], false, None)),
+        ]);
+        complete_login_reviews(&mut client, &mut item, "alice").unwrap();
+        let ids: Vec<&str> = item.login_reviews.iter().map(|r| r.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["R1", "R2", "R3"],
+            "R1 repeated on page two is kept once"
+        );
+        assert!(!item.login_reviews_truncated);
+        assert_eq!(item.login_reviews_cursor, None);
+    }
+
+    #[test]
+    fn continuing_reviews_fails_without_an_id_or_cursor_and_on_a_missing_node() {
+        let mut item = truncated_item();
+        item.node_id = None;
+        let error = complete_login_reviews(&mut client(vec![]), &mut item, "alice").unwrap_err();
+        assert!(error.to_string().contains("has no node id"), "{error}");
+
+        let mut item = truncated_item();
+        item.login_reviews_cursor = None;
+        let error = complete_login_reviews(&mut client(vec![]), &mut item, "alice").unwrap_err();
+        assert!(
+            error.to_string().contains("more pages but no cursor"),
+            "{error}"
+        );
+
+        let mut item = truncated_item();
+        let mut missing = client(vec![Ok(json!({"data": {"node": null}}).to_string())]);
+        let error = complete_login_reviews(&mut missing, &mut item, "alice").unwrap_err();
+        assert!(
+            error.to_string().contains("review continuation missing"),
+            "{error}"
+        );
+        assert!(
+            item.login_reviews_truncated,
+            "a failure leaves the item truncated"
+        );
+    }
+
+    #[test]
+    fn a_repeated_cursor_or_an_endless_list_is_an_error() {
+        let mut item = truncated_item();
+        let mut repeating = client(vec![continuation(review_page(&["R2"], true, Some("c1")))]);
+        let error = complete_login_reviews(&mut repeating, &mut item, "alice").unwrap_err();
+        assert!(
+            error.to_string().contains("review cursor repeated"),
+            "{error}"
+        );
+
+        struct Endless(Mutex<usize>);
+        impl GhTransport for Endless {
+            fn run(&self, _arguments: &[String]) -> crate::Result<String> {
+                let mut calls = self.0.lock().unwrap();
+                *calls += 1;
+                let id = format!("E{calls}");
+                let cursor = format!("e{calls}");
+                continuation(review_page(&[id.as_str()], true, Some(cursor.as_str())))
+            }
+        }
+        let mut item = truncated_item();
+        let mut endless =
+            GhClient::with_transport(Box::new(Endless(Mutex::new(0)))).without_sleeping();
+        let error = complete_login_reviews(&mut endless, &mut item, "alice").unwrap_err();
+        assert!(
+            error.to_string().contains("did not end after 1000 pages"),
+            "{error}"
+        );
+        assert_eq!(endless.requests_issued(), 1000);
+    }
+
+    #[test]
+    fn page_errors_are_classified() {
+        let data = search(vec![node(1, review_page(&[], false, None))], 1, false, None);
+        let limited = page(
+            &data,
+            &[json!({"type": "RATE_LIMITED", "message": "slow down"})],
+        );
+        assert_eq!(limited.err().unwrap(), "rate-limited: slow down");
+        let limited = page(&data, &[json!({"message": "API rate limit exceeded"})]);
+        assert!(limited.err().unwrap().starts_with("rate-limited"));
+        let other = page(
+            &data,
+            &[json!({"type": "INTERNAL", "path": ["search", "nodes", 0]})],
+        );
+        assert_eq!(other.err().unwrap(), "failed: unknown GraphQL error");
+        let outside = page(
+            &data,
+            &[json!({"type": "FORBIDDEN", "message": "no", "path": ["viewer"]})],
+        );
+        assert_eq!(
+            outside.err().unwrap(),
+            "failed: no",
+            "a non-node error is not a skip"
+        );
+    }
+
+    #[test]
+    fn inaccessible_nodes_are_recognised_by_type_or_message() {
+        for error in [
+            json!({"type": "NOT_FOUND", "message": "gone"}),
+            json!({"message": "Resource protected by organization SAML enforcement."}),
+            json!({"message": "Blocked by the IP allow list"}),
+            json!({"message": "Resource not accessible by integration"}),
+        ] {
+            let mut error = error;
+            error["path"] = json!(["search", "nodes", 0]);
+            let data = search(
+                vec![Value::Null, node(2, review_page(&[], false, None))],
+                2,
+                false,
+                None,
+            );
+            let parsed = page(&data, &[error]).unwrap();
+            assert_eq!((parsed.items.len(), parsed.inaccessible), (1, 1));
+        }
+        // A skipped node index past the served nodes is still counted once.
+        let data = search(vec![], 1, false, None);
+        let error = json!({"type": "FORBIDDEN", "path": ["search", "nodes", 3]});
+        assert_eq!(page(&data, &[error]).unwrap().inaccessible, 1);
+    }
+
+    #[test]
+    fn malformed_pages_fail_and_issue_nodes_are_skipped() {
+        let no_cursor = search(vec![], 5, true, None);
+        assert_eq!(
+            page(&no_cursor, &[]).err().unwrap(),
+            "failed: search reports another page but no endCursor"
+        );
+        let null_node = search(vec![Value::Null], 1, false, None);
+        assert_eq!(
+            page(&null_node, &[]).err().unwrap(),
+            "failed: search contains a null node with no error"
+        );
+        let with_issue = search(
+            vec![json!({}), node(3, review_page(&[], false, None))],
+            2,
+            true,
+            Some("n2"),
+        );
+        let parsed = page(&with_issue, &[]).unwrap();
+        assert_eq!(
+            parsed.items.len(),
+            1,
+            "an issue node answers the fragment with {{}}"
+        );
+        assert_eq!(parsed.items[0].number, 3);
+        assert_eq!(parsed.end_cursor.as_deref(), Some("n2"));
+        assert!(parsed.has_next_page);
+    }
+}

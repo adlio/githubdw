@@ -812,6 +812,119 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_client_sends_nothing() {
+        let transport = std::sync::Arc::new(FixtureTransport::new(vec![Ok("{}".into())]));
+        struct Shared(std::sync::Arc<FixtureTransport>);
+        impl GhTransport for Shared {
+            fn run(&self, arguments: &[String]) -> Result<String> {
+                self.0.run(arguments)
+            }
+        }
+        let mut client =
+            GhClient::with_transport(Box::new(Shared(transport.clone()))).without_sleeping();
+        client.set_cancellation(Some(Arc::new(AtomicBool::new(true))));
+        assert!(matches!(client.rest("a"), Err(Error::Cancelled)));
+        assert!(transport.calls.lock().unwrap().is_empty());
+        assert_eq!(client.requests_issued(), 0);
+    }
+
+    #[test]
+    fn the_inter_request_delay_is_waited_before_each_call() {
+        let transport = FixtureTransport::new(vec![Ok("{}".into()), Ok("{}".into())]);
+        let mut client = GhClient::with_transport(Box::new(transport))
+            .with_inter_request_delay(Duration::from_millis(5));
+        let started = Instant::now();
+        client.rest("a").unwrap();
+        client.rest("b").unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(10));
+        assert_eq!(client.requests_issued(), 2);
+    }
+
+    #[test]
+    fn cancellation_interrupts_the_search_pacing_wait() {
+        // The first search sets the flag; the second must stop in its pacing
+        // wait (2.1 s) without reaching the transport.
+        struct CancelOnFirst {
+            flag: Arc<AtomicBool>,
+            calls: std::sync::Mutex<usize>,
+        }
+        impl GhTransport for CancelOnFirst {
+            fn run(&self, _arguments: &[String]) -> Result<String> {
+                *self.calls.lock().unwrap() += 1;
+                self.flag.store(true, Ordering::SeqCst);
+                Ok(r#"{"data": {"search": {}}}"#.into())
+            }
+        }
+        let flag = Arc::new(AtomicBool::new(false));
+        let transport = Arc::new(CancelOnFirst {
+            flag: flag.clone(),
+            calls: std::sync::Mutex::new(0),
+        });
+        struct Shared(Arc<CancelOnFirst>);
+        impl GhTransport for Shared {
+            fn run(&self, arguments: &[String]) -> Result<String> {
+                self.0.run(arguments)
+            }
+        }
+        let mut client = GhClient::with_transport(Box::new(Shared(transport.clone())));
+        client.set_cancellation(Some(flag));
+        let started = Instant::now();
+        client.graphql_search_with_errors("query {}", &[]).unwrap();
+        let error = client
+            .graphql_search_with_errors("query {}", &[])
+            .unwrap_err();
+        assert!(matches!(error, Error::Cancelled), "{error}");
+        assert!(started.elapsed() < SEARCH_MIN_INTERVAL);
+        assert_eq!(*transport.calls.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn a_search_response_without_data_reports_its_errors() {
+        let transport = FixtureTransport::new(vec![
+            Ok(r#"{"data": null, "errors": [{"message": "first"}, {"type": "X"}, {"message": "second"}]}"#.into()),
+            Ok(r#"{"data": {"search": {"issueCount": 0}}, "errors": [{"message": "partial"}]}"#.into()),
+        ]);
+        let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
+        let error = client
+            .graphql_search_with_errors("query {}", &[])
+            .unwrap_err();
+        match error {
+            Error::GitHubApi(message) => assert_eq!(message, "response has no data: first; second"),
+            other => panic!("unexpected {other}"),
+        }
+        let (data, errors) = client.graphql_search_with_errors("query {}", &[]).unwrap();
+        assert_eq!(data["search"]["issueCount"], 0);
+        assert_eq!(
+            errors.len(),
+            1,
+            "errors beside data are returned, not raised"
+        );
+    }
+
+    #[test]
+    fn an_exhausted_primary_budget_is_deferred_or_waited() {
+        let exhausted = r#"{"data": {"rateLimit": {"limit": 5000, "cost": 1, "remaining": 0, "resetAt": "2099-01-01T00:00:00Z"}}}"#;
+        let transport = FixtureTransport::new(vec![Ok(exhausted.into()), Ok(exhausted.into())]);
+        let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
+        client.graphql("query {}", &[]).unwrap();
+        client.set_defer_waits_over(Some(Duration::from_secs(1)));
+        match client.graphql("query {}", &[]).unwrap_err() {
+            Error::RateLimited {
+                resource, reason, ..
+            } => {
+                assert_eq!(resource, "graphql");
+                assert!(reason.contains("primary GraphQL budget"), "{reason}");
+            }
+            other => panic!("unexpected {other}"),
+        }
+        assert_eq!(client.requests_issued(), 1, "the deferred call never ran");
+        // Without deferral the (non-sleeping) client waits, then sends.
+        client.set_defer_waits_over(None);
+        client.graphql("query {}", &[]).unwrap();
+        assert_eq!(client.requests_issued(), 2);
+    }
+
+    #[test]
     fn does_not_retry_fatal_errors() {
         let transport = FixtureTransport::new(vec![
             Err(Error::GhCommand {

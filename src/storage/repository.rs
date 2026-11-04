@@ -963,6 +963,239 @@ mod tests {
     }
 
     #[test]
+    fn preserving_review_writes_keep_stored_bodies_and_skip_no_op_updates() {
+        let (warehouse, date, time) = comment_warehouse();
+        let conn = warehouse.connection();
+        let review = |state: &str, body: Option<&str>| {
+            upsert_review_preserving(
+                conn,
+                "review1",
+                "octocat/hello#1",
+                "user:octocat",
+                state,
+                body,
+                "2026-01-05T18:00:00Z",
+                &date,
+                &time,
+            )
+            .unwrap();
+        };
+        let stored = || -> (String, Option<String>) {
+            conn.query_row(
+                "SELECT state, body FROM fact_reviews WHERE review_key = 'review1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        review("COMMENTED", Some("looks good"));
+        // A light read carries no body: the stored one stays.
+        review("APPROVED", None);
+        assert_eq!(stored(), ("APPROVED".into(), Some("looks good".into())));
+        review("APPROVED", Some(""));
+        assert_eq!(stored().1.as_deref(), Some("looks good"));
+        let before = conn.total_changes();
+        review("APPROVED", None);
+        assert_eq!(conn.total_changes(), before, "unchanged review is a no-op");
+        review("APPROVED", Some("ship it"));
+        assert_eq!(stored().1.as_deref(), Some("ship it"));
+    }
+
+    #[test]
+    fn preserving_review_comment_writes_fill_in_and_never_blank() {
+        let (warehouse, date, time) = comment_warehouse();
+        let conn = warehouse.connection();
+        let put =
+            |reply: Option<&str>, path: Option<&str>, line: Option<i64>, body: Option<&str>| {
+                upsert_review_comment_preserving(
+                    conn,
+                    "rc1",
+                    "octocat/hello#1",
+                    "user:octocat",
+                    reply,
+                    path,
+                    line,
+                    body,
+                    "2026-01-05T18:00:00Z",
+                    &date,
+                    &time,
+                )
+                .unwrap();
+            };
+        type Stored = (Option<String>, Option<String>, Option<i64>, Option<String>);
+        let stored = || -> Stored {
+            conn.query_row(
+                "SELECT in_reply_to, path, line, body FROM fact_review_comments
+                 WHERE comment_key = 'rc1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+        put(
+            Some("rc0"),
+            Some("src/lib.rs"),
+            Some(7),
+            Some("nit: rename"),
+        );
+        put(None, None, None, None);
+        assert_eq!(
+            stored(),
+            (
+                Some("rc0".into()),
+                Some("src/lib.rs".into()),
+                Some(7),
+                Some("nit: rename".into())
+            ),
+            "absent values never blank stored ones"
+        );
+        let before = conn.total_changes();
+        put(Some("rc0"), Some("src/lib.rs"), Some(7), Some(""));
+        assert_eq!(conn.total_changes(), before, "unchanged comment is a no-op");
+        put(None, Some("src/main.rs"), Some(9), Some("nit: rename it"));
+        assert_eq!(
+            stored(),
+            (
+                Some("rc0".into()),
+                Some("src/main.rs".into()),
+                Some(9),
+                Some("nit: rename it".into())
+            )
+        );
+    }
+
+    #[test]
+    fn preserving_file_writes_keep_patch_and_rename_source() {
+        let (warehouse, _, _) = comment_warehouse();
+        let conn = warehouse.connection();
+        let pr = "octocat/hello#1";
+        upsert_file_diff_preserving(
+            conn,
+            pr,
+            "octocat/hello",
+            "b.rs",
+            Some("a.rs"),
+            "RENAMED",
+            1,
+            0,
+        )
+        .unwrap();
+        set_file_diff_patch_preserving(conn, pr, "b.rs", None, Some("@@ patch @@")).unwrap();
+        upsert_file_diff_preserving(conn, pr, "octocat/hello", "b.rs", None, "MODIFIED", 4, 2)
+            .unwrap();
+        set_file_diff_patch_preserving(conn, pr, "b.rs", None, None).unwrap();
+        let row: (Option<String>, String, Option<String>, i64, i64) = conn
+            .query_row(
+                "SELECT previous_path, change_type, patch, additions, deletions
+                 FROM fact_file_diffs WHERE file_diff_key = 'octocat/hello#1:b.rs'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("a.rs".into()),
+                "MODIFIED".into(),
+                Some("@@ patch @@".into()),
+                4,
+                2
+            )
+        );
+    }
+
+    #[test]
+    fn preserving_writes_surface_database_errors() {
+        let (warehouse, date, time) = comment_warehouse();
+        let conn = warehouse.connection();
+        conn.execute_batch("PRAGMA query_only = ON").unwrap();
+        let row = PullRequestRow {
+            pr_key: "octocat/hello#1",
+            number: 1,
+            repo_key: "octocat/hello",
+            author_key: "user:octocat",
+            state: "OPEN",
+            is_draft: false,
+            title: Some("t"),
+            body: None,
+            base_ref: None,
+            head_ref: None,
+            created_at: "2026-01-05T18:00:00Z",
+            updated_at: None,
+            merged_at: None,
+            closed_at: None,
+            merged_by_key: None,
+            created_date_key: &date,
+            created_time_key: &time,
+            updated_date_key: None,
+            updated_time_key: None,
+            merged_date_key: None,
+            comment_count: 0,
+            review_count: 0,
+            changed_files: 0,
+            additions: 0,
+            deletions: 0,
+        };
+        let pr = "octocat/hello#1";
+        let at = "2026-01-05T18:00:00Z";
+        let results = [
+            upsert_pull_request_preserving(conn, &row, CounterSource::Light),
+            upsert_review_preserving(
+                conn,
+                "r",
+                pr,
+                "user:octocat",
+                "APPROVED",
+                None,
+                at,
+                &date,
+                &time,
+            ),
+            upsert_review_comment_preserving(
+                conn,
+                "c",
+                pr,
+                "user:octocat",
+                None,
+                None,
+                None,
+                Some("x"),
+                at,
+                &date,
+                &time,
+            ),
+            upsert_issue_comment_preserving(
+                conn,
+                "i",
+                "pull_request",
+                pr,
+                "user:octocat",
+                None,
+                Some("x"),
+                at,
+                &date,
+                &time,
+            ),
+            upsert_file_diff_preserving(conn, pr, "octocat/hello", "a.rs", None, "ADDED", 1, 0),
+            set_file_diff_patch_preserving(conn, pr, "a.rs", None, Some("p")),
+        ];
+        for (index, result) in results.into_iter().enumerate() {
+            assert!(
+                matches!(result, Err(crate::Error::Database(_))),
+                "writer {index}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
     fn entity_resolution_detects_bots() {
         let warehouse = GithubDW::open_in_memory().unwrap();
         let conn = warehouse.connection();

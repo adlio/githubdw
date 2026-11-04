@@ -318,4 +318,78 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
         assert!(gate.retain_diffs_now(), "file removed: standalone again");
     }
+
+    #[test]
+    fn retention_names_round_trip_and_unknown_names_are_rejected() {
+        for retention in [
+            DiffRetention::Never,
+            DiffRetention::Transient,
+            DiffRetention::Retain,
+        ] {
+            assert_eq!(DiffRetention::parse(retention.as_str()), Some(retention));
+        }
+        assert_eq!(DiffRetention::Never.as_str(), "none");
+        assert_eq!(DiffRetention::parse(" Never "), Some(DiffRetention::Never));
+        assert_eq!(DiffRetention::parse("RETAIN"), Some(DiffRetention::Retain));
+        assert_eq!(DiffRetention::parse("forever"), None);
+        assert_eq!(DiffRetention::parse(""), None);
+    }
+
+    #[test]
+    fn an_unreadable_path_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        // A directory where the file should be cannot be read as a file.
+        let state = read_policy(dir.path());
+        match &state {
+            PolicyState::Invalid(reason) => {
+                assert!(reason.starts_with("unreadable policy file"), "{reason}")
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+        let gate = RetentionGate::new(
+            DiffRetention::Retain,
+            PolicySource::File(dir.path().to_path_buf()),
+        );
+        let decision = gate.decide();
+        assert_eq!(decision.allowed, DiffRetention::Never);
+        assert!(decision.app_mode);
+        assert!(decision.invalid.unwrap().starts_with("unreadable"));
+    }
+
+    #[test]
+    fn writing_to_a_path_without_a_parent_fails() {
+        assert!(
+            write_policy(
+                Path::new(""),
+                &file(CollectionMode::Full, DiffRetention::Retain)
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn sources_describe_themselves_and_standalone_is_missing() {
+        assert_eq!(format!("{:?}", PolicySource::DefaultFile), "DefaultFile");
+        assert_eq!(
+            format!("{:?}", PolicySource::File(PathBuf::from("/tmp/p.json"))),
+            "File(/tmp/p.json)"
+        );
+        assert_eq!(format!("{:?}", PolicySource::Standalone), "Standalone");
+        let custom = PolicySource::Custom(Arc::new(|| PolicyState::Missing));
+        assert_eq!(format!("{custom:?}"), "Custom(..)");
+        assert_eq!(PolicySource::Standalone.current(), PolicyState::Missing);
+        assert_eq!(custom.current(), PolicyState::Missing);
+    }
+
+    #[test]
+    fn the_default_source_reads_the_default_path() {
+        // Read-only: whatever the shared file says, the source reports it.
+        let expected = default_policy_path()
+            .map(|path| read_policy(&path))
+            .unwrap_or(PolicyState::Missing);
+        assert_eq!(PolicySource::DefaultFile.current(), expected);
+        if let Some(path) = default_policy_path() {
+            assert!(path.ends_with("adlio-collection/policy.json"));
+        }
+    }
 }
