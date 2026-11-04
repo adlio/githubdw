@@ -1373,8 +1373,8 @@ fn heavy_world_counts_match_and_cost_is_measured() {
 }
 
 /// The collection tables are not a numbered migration, so a warehouse used
-/// by this version still opens under the 0.3.3 migration set (user_version
-/// stays 7), and a read-only reader of a warehouse that never saw this
+/// by this version still opens under the 0.3.4 migration set (user_version
+/// stays 8), and a read-only reader of a warehouse that never saw this
 /// version gets "unknown" counts rather than an error.
 #[test]
 fn schema_stays_openable_by_the_previous_release() {
@@ -1396,8 +1396,8 @@ fn schema_stays_openable_by_the_previous_release() {
         .unwrap();
     }
     let mut conn = Connection::open(&path).unwrap();
-    assert_eq!(scalar(&conn, "PRAGMA user_version"), 7);
-    // The 0.3.3 migration list is exactly the first seven steps.
+    assert_eq!(scalar(&conn, "PRAGMA user_version"), 8);
+    // The 0.3.4 migration list is exactly the first eight steps.
     crate::storage::schema::migrations()
         .to_latest(&mut conn)
         .expect("0.3.3 migrations accept the file");
