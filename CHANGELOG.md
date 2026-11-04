@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-11-04
+
 ### Fixed
 
 - Sync no longer slows down as the warehouse grows. The full-text triggers
@@ -17,6 +19,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keyed by the source rowid, makes the triggers delete by rowid, and skips the
   update trigger when no indexed column changed. On an 8.5 GB warehouse a
   comment upsert now takes about 8 ms, and the one-time rebuild took 6m49s.
+  The rebuild runs when the first command opens the warehouse after the
+  upgrade, so expect that first `sync` or `search` to take minutes on a large
+  warehouse.
 
 ## [0.3.3] - 2026-11-02
 
