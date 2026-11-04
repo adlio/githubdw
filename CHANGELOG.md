@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Sync no longer slows down as the warehouse grows. The full-text triggers
+  located a row's index entry with `DELETE ... WHERE <key> = ...` on an
+  UNINDEXED FTS5 column, which scans the whole FTS table, so every upsert of a
+  PR, issue or comment cost a full scan. At 259k issue comments one `sync all`
+  ran past launchd's two-hour limit. Migration 8 rebuilds the four FTS tables
+  keyed by the source rowid, makes the triggers delete by rowid, and skips the
+  update trigger when no indexed column changed. On an 8.5 GB warehouse a
+  comment upsert now takes about 8 ms, and the one-time rebuild took 6m49s.
+
 ## [0.3.3] - 2026-11-02
 
 ### Performance
