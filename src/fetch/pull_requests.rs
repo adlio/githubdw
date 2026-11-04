@@ -41,7 +41,7 @@ pub const REPOSITORY_HEADER_SELECTION: &str = r#"nameWithOwner
 /// selections below in step with it.
 pub const PULL_REQUEST_NODE_SELECTION: &str = r#"id number title body state isDraft
         createdAt updatedAt mergedAt closedAt
-        baseRefName headRefName
+        baseRefName headRefName baseRefOid headRefOid
         additions deletions changedFiles
         author { login __typename }
         mergedBy { login __typename }
@@ -181,6 +181,9 @@ pub struct PullRequestData {
     pub conversation_comments: Vec<ConversationCommentData>,
     pub files: Vec<FileDiffData>,
     pub head_sha: Option<String>,
+    /// `baseRefOid` / `headRefOid`: the exact revision pair the diff spans.
+    pub base_oid: Option<String>,
+    pub head_oid: Option<String>,
     pub check_runs: Vec<CheckRunData>,
     /// GraphQL node id, used to continue nested connections.
     pub node_id: Option<String>,
@@ -481,6 +484,8 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
         conversation_comments,
         files,
         head_sha,
+        base_oid: string_field(node, "baseRefOid"),
+        head_oid: string_field(node, "headRefOid"),
         check_runs,
         node_id,
         pending,

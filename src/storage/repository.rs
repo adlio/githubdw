@@ -509,6 +509,287 @@ pub fn delete_file_diffs(conn: &Connection, pr_key: &str, paths: &[String]) -> R
     Ok(deleted)
 }
 
+// ---- Preserving writes (app mode) ------------------------------------
+//
+// Used whenever a collection policy file is present, and by every
+// counts-only (light) write. They differ from the legacy upserts in one
+// respect: a NULL or empty incoming value never replaces a stored non-empty
+// title, body, comment, or patch, and nothing is ever deleted. Provider
+// facts that are not payload (state, timestamps, sizes) still update.
+
+/// How a preserving pull-request upsert treats the detail-derived counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CounterSource {
+    /// A full hydrated fetch: `comment_count`/`review_count` are recomputed
+    /// from the complete nested collections and replace the stored values.
+    Detail,
+    /// A light node: the stored counters are kept; they are written only when
+    /// the row is new.
+    Light,
+}
+
+/// Upsert a pull request without blanking stored payload.
+pub fn upsert_pull_request_preserving(
+    conn: &Connection,
+    row: &PullRequestRow<'_>,
+    counters: CounterSource,
+) -> Result<()> {
+    let counter_update = match counters {
+        CounterSource::Detail => {
+            "comment_count = excluded.comment_count, review_count = excluded.review_count,"
+        }
+        CounterSource::Light => "",
+    };
+    let sql = format!(
+        "INSERT INTO fact_pull_requests (
+            pr_key, number, repo_key, author_key, state, is_draft, title, body,
+            base_ref, head_ref, created_at, updated_at, merged_at, closed_at,
+            merged_by_key, created_date_key, created_time_key, updated_date_key,
+            updated_time_key, merged_date_key, comment_count, review_count,
+            changed_files, additions, deletions
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                  ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
+        ON CONFLICT (pr_key) DO UPDATE SET
+            state = excluded.state,
+            is_draft = excluded.is_draft,
+            title = COALESCE(NULLIF(excluded.title, ''), fact_pull_requests.title),
+            body = COALESCE(NULLIF(excluded.body, ''), fact_pull_requests.body),
+            base_ref = COALESCE(excluded.base_ref, fact_pull_requests.base_ref),
+            head_ref = COALESCE(excluded.head_ref, fact_pull_requests.head_ref),
+            updated_at = COALESCE(excluded.updated_at, fact_pull_requests.updated_at),
+            merged_at = COALESCE(excluded.merged_at, fact_pull_requests.merged_at),
+            closed_at = excluded.closed_at,
+            merged_by_key = COALESCE(excluded.merged_by_key, fact_pull_requests.merged_by_key),
+            updated_date_key = COALESCE(excluded.updated_date_key, fact_pull_requests.updated_date_key),
+            updated_time_key = COALESCE(excluded.updated_time_key, fact_pull_requests.updated_time_key),
+            merged_date_key = COALESCE(excluded.merged_date_key, fact_pull_requests.merged_date_key),
+            {counter_update}
+            changed_files = excluded.changed_files,
+            additions = excluded.additions,
+            deletions = excluded.deletions"
+    );
+    conn.execute(
+        &sql,
+        params![
+            row.pr_key,
+            row.number,
+            row.repo_key,
+            row.author_key,
+            row.state,
+            row.is_draft as i64,
+            row.title,
+            row.body,
+            row.base_ref,
+            row.head_ref,
+            row.created_at,
+            row.updated_at,
+            row.merged_at,
+            row.closed_at,
+            row.merged_by_key,
+            row.created_date_key,
+            row.created_time_key,
+            row.updated_date_key,
+            row.updated_time_key,
+            row.merged_date_key,
+            row.comment_count,
+            row.review_count,
+            row.changed_files,
+            row.additions,
+            row.deletions,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Upsert a review without blanking a stored body. `body = None` is how a
+/// light fetch (which never asks for bodies) says "unknown".
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_review_preserving(
+    conn: &Connection,
+    review_key: &str,
+    pr_key: &str,
+    reviewer_key: &str,
+    state: &str,
+    body: Option<&str>,
+    submitted_at: &str,
+    submitted_date_key: &str,
+    submitted_time_key: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO fact_reviews (
+            review_key, pr_key, reviewer_key, state, body, submitted_at,
+            submitted_date_key, submitted_time_key
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        ON CONFLICT (review_key) DO UPDATE SET
+            state = excluded.state,
+            body = COALESCE(NULLIF(excluded.body, ''), fact_reviews.body),
+            submitted_at = excluded.submitted_at,
+            submitted_date_key = excluded.submitted_date_key,
+            submitted_time_key = excluded.submitted_time_key
+        WHERE fact_reviews.state IS NOT excluded.state
+           OR fact_reviews.submitted_at IS NOT excluded.submitted_at
+           OR (NULLIF(excluded.body, '') IS NOT NULL
+               AND fact_reviews.body IS NOT excluded.body)",
+        params![
+            review_key,
+            pr_key,
+            reviewer_key,
+            state,
+            body,
+            submitted_at,
+            submitted_date_key,
+            submitted_time_key,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Upsert a review-thread comment without blanking stored values.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_review_comment_preserving(
+    conn: &Connection,
+    comment_key: &str,
+    pr_key: &str,
+    author_key: &str,
+    in_reply_to: Option<&str>,
+    path: Option<&str>,
+    line: Option<i64>,
+    body: Option<&str>,
+    created_at: &str,
+    created_date_key: &str,
+    created_time_key: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO fact_review_comments (
+            comment_key, pr_key, review_key, author_key, in_reply_to, path, line,
+            body, created_at, created_date_key, created_time_key
+        ) VALUES (?1, ?2, NULL, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+        ON CONFLICT (comment_key) DO UPDATE SET
+            in_reply_to = COALESCE(excluded.in_reply_to, fact_review_comments.in_reply_to),
+            path = COALESCE(excluded.path, fact_review_comments.path),
+            line = COALESCE(excluded.line, fact_review_comments.line),
+            body = COALESCE(NULLIF(excluded.body, ''), fact_review_comments.body)
+        WHERE (excluded.in_reply_to IS NOT NULL
+               AND fact_review_comments.in_reply_to IS NOT excluded.in_reply_to)
+           OR (excluded.path IS NOT NULL AND fact_review_comments.path IS NOT excluded.path)
+           OR (excluded.line IS NOT NULL AND fact_review_comments.line IS NOT excluded.line)
+           OR (NULLIF(excluded.body, '') IS NOT NULL
+               AND fact_review_comments.body IS NOT excluded.body)",
+        params![
+            comment_key,
+            pr_key,
+            author_key,
+            in_reply_to,
+            path,
+            line,
+            body,
+            created_at,
+            created_date_key,
+            created_time_key,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Upsert a conversation comment without blanking stored values.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_issue_comment_preserving(
+    conn: &Connection,
+    comment_key: &str,
+    parent_type: &str,
+    parent_key: &str,
+    author_key: &str,
+    in_reply_to: Option<&str>,
+    body: Option<&str>,
+    created_at: &str,
+    created_date_key: &str,
+    created_time_key: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO fact_issue_comments (
+            comment_key, parent_type, parent_key, author_key, in_reply_to, body,
+            created_at, created_date_key, created_time_key
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        ON CONFLICT (comment_key) DO UPDATE SET
+            body = COALESCE(NULLIF(excluded.body, ''), fact_issue_comments.body),
+            in_reply_to = COALESCE(excluded.in_reply_to, fact_issue_comments.in_reply_to)
+        WHERE (NULLIF(excluded.body, '') IS NOT NULL
+               AND fact_issue_comments.body IS NOT excluded.body)
+           OR (excluded.in_reply_to IS NOT NULL
+               AND fact_issue_comments.in_reply_to IS NOT excluded.in_reply_to)",
+        params![
+            comment_key,
+            parent_type,
+            parent_key,
+            author_key,
+            in_reply_to,
+            body,
+            created_at,
+            created_date_key,
+            created_time_key,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Upsert a file row's metadata without touching stored patch text and
+/// without clearing a stored rename source.
+#[allow(clippy::too_many_arguments)]
+pub fn upsert_file_diff_preserving(
+    conn: &Connection,
+    pr_key: &str,
+    repo_key: &str,
+    file_path: &str,
+    previous_path: Option<&str>,
+    change_type: &str,
+    additions: i64,
+    deletions: i64,
+) -> Result<()> {
+    let file_diff_key = format!("{pr_key}:{file_path}");
+    conn.execute(
+        "INSERT INTO fact_file_diffs (
+            file_diff_key, pr_key, repo_key, file_path, previous_path, change_type,
+            patch, additions, deletions
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)
+        ON CONFLICT (file_diff_key) DO UPDATE SET
+            previous_path = COALESCE(excluded.previous_path, fact_file_diffs.previous_path),
+            change_type = excluded.change_type,
+            additions = excluded.additions,
+            deletions = excluded.deletions",
+        params![
+            file_diff_key,
+            pr_key,
+            repo_key,
+            file_path,
+            previous_path,
+            change_type,
+            additions,
+            deletions,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Set patch text only when new text is supplied; a NULL never clears a
+/// stored patch. `previous_path` likewise only fills in.
+pub fn set_file_diff_patch_preserving(
+    conn: &Connection,
+    pr_key: &str,
+    file_path: &str,
+    previous_path: Option<&str>,
+    patch: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE fact_file_diffs
+         SET patch = COALESCE(?1, patch), previous_path = COALESCE(?2, previous_path)
+         WHERE file_diff_key = ?3
+           AND (( ?1 IS NOT NULL AND patch IS NOT ?1)
+             OR ( ?2 IS NOT NULL AND previous_path IS NOT ?2))",
+        params![patch, previous_path, format!("{pr_key}:{file_path}")],
+    )?;
+    Ok(())
+}
+
 /// The configured bot login suffix (default `[bot]`).
 pub fn bot_login_suffix(conn: &Connection) -> String {
     conn.query_row(
@@ -679,6 +960,239 @@ mod tests {
             hits, 0,
             "clearing the body must remove stale search results"
         );
+    }
+
+    #[test]
+    fn preserving_review_writes_keep_stored_bodies_and_skip_no_op_updates() {
+        let (warehouse, date, time) = comment_warehouse();
+        let conn = warehouse.connection();
+        let review = |state: &str, body: Option<&str>| {
+            upsert_review_preserving(
+                conn,
+                "review1",
+                "octocat/hello#1",
+                "user:octocat",
+                state,
+                body,
+                "2026-01-05T18:00:00Z",
+                &date,
+                &time,
+            )
+            .unwrap();
+        };
+        let stored = || -> (String, Option<String>) {
+            conn.query_row(
+                "SELECT state, body FROM fact_reviews WHERE review_key = 'review1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        review("COMMENTED", Some("looks good"));
+        // A light read carries no body: the stored one stays.
+        review("APPROVED", None);
+        assert_eq!(stored(), ("APPROVED".into(), Some("looks good".into())));
+        review("APPROVED", Some(""));
+        assert_eq!(stored().1.as_deref(), Some("looks good"));
+        let before = conn.total_changes();
+        review("APPROVED", None);
+        assert_eq!(conn.total_changes(), before, "unchanged review is a no-op");
+        review("APPROVED", Some("ship it"));
+        assert_eq!(stored().1.as_deref(), Some("ship it"));
+    }
+
+    #[test]
+    fn preserving_review_comment_writes_fill_in_and_never_blank() {
+        let (warehouse, date, time) = comment_warehouse();
+        let conn = warehouse.connection();
+        let put =
+            |reply: Option<&str>, path: Option<&str>, line: Option<i64>, body: Option<&str>| {
+                upsert_review_comment_preserving(
+                    conn,
+                    "rc1",
+                    "octocat/hello#1",
+                    "user:octocat",
+                    reply,
+                    path,
+                    line,
+                    body,
+                    "2026-01-05T18:00:00Z",
+                    &date,
+                    &time,
+                )
+                .unwrap();
+            };
+        type Stored = (Option<String>, Option<String>, Option<i64>, Option<String>);
+        let stored = || -> Stored {
+            conn.query_row(
+                "SELECT in_reply_to, path, line, body FROM fact_review_comments
+                 WHERE comment_key = 'rc1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap()
+        };
+        put(
+            Some("rc0"),
+            Some("src/lib.rs"),
+            Some(7),
+            Some("nit: rename"),
+        );
+        put(None, None, None, None);
+        assert_eq!(
+            stored(),
+            (
+                Some("rc0".into()),
+                Some("src/lib.rs".into()),
+                Some(7),
+                Some("nit: rename".into())
+            ),
+            "absent values never blank stored ones"
+        );
+        let before = conn.total_changes();
+        put(Some("rc0"), Some("src/lib.rs"), Some(7), Some(""));
+        assert_eq!(conn.total_changes(), before, "unchanged comment is a no-op");
+        put(None, Some("src/main.rs"), Some(9), Some("nit: rename it"));
+        assert_eq!(
+            stored(),
+            (
+                Some("rc0".into()),
+                Some("src/main.rs".into()),
+                Some(9),
+                Some("nit: rename it".into())
+            )
+        );
+    }
+
+    #[test]
+    fn preserving_file_writes_keep_patch_and_rename_source() {
+        let (warehouse, _, _) = comment_warehouse();
+        let conn = warehouse.connection();
+        let pr = "octocat/hello#1";
+        upsert_file_diff_preserving(
+            conn,
+            pr,
+            "octocat/hello",
+            "b.rs",
+            Some("a.rs"),
+            "RENAMED",
+            1,
+            0,
+        )
+        .unwrap();
+        set_file_diff_patch_preserving(conn, pr, "b.rs", None, Some("@@ patch @@")).unwrap();
+        upsert_file_diff_preserving(conn, pr, "octocat/hello", "b.rs", None, "MODIFIED", 4, 2)
+            .unwrap();
+        set_file_diff_patch_preserving(conn, pr, "b.rs", None, None).unwrap();
+        let row: (Option<String>, String, Option<String>, i64, i64) = conn
+            .query_row(
+                "SELECT previous_path, change_type, patch, additions, deletions
+                 FROM fact_file_diffs WHERE file_diff_key = 'octocat/hello#1:b.rs'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            row,
+            (
+                Some("a.rs".into()),
+                "MODIFIED".into(),
+                Some("@@ patch @@".into()),
+                4,
+                2
+            )
+        );
+    }
+
+    #[test]
+    fn preserving_writes_surface_database_errors() {
+        let (warehouse, date, time) = comment_warehouse();
+        let conn = warehouse.connection();
+        conn.execute_batch("PRAGMA query_only = ON").unwrap();
+        let row = PullRequestRow {
+            pr_key: "octocat/hello#1",
+            number: 1,
+            repo_key: "octocat/hello",
+            author_key: "user:octocat",
+            state: "OPEN",
+            is_draft: false,
+            title: Some("t"),
+            body: None,
+            base_ref: None,
+            head_ref: None,
+            created_at: "2026-01-05T18:00:00Z",
+            updated_at: None,
+            merged_at: None,
+            closed_at: None,
+            merged_by_key: None,
+            created_date_key: &date,
+            created_time_key: &time,
+            updated_date_key: None,
+            updated_time_key: None,
+            merged_date_key: None,
+            comment_count: 0,
+            review_count: 0,
+            changed_files: 0,
+            additions: 0,
+            deletions: 0,
+        };
+        let pr = "octocat/hello#1";
+        let at = "2026-01-05T18:00:00Z";
+        let results = [
+            upsert_pull_request_preserving(conn, &row, CounterSource::Light),
+            upsert_review_preserving(
+                conn,
+                "r",
+                pr,
+                "user:octocat",
+                "APPROVED",
+                None,
+                at,
+                &date,
+                &time,
+            ),
+            upsert_review_comment_preserving(
+                conn,
+                "c",
+                pr,
+                "user:octocat",
+                None,
+                None,
+                None,
+                Some("x"),
+                at,
+                &date,
+                &time,
+            ),
+            upsert_issue_comment_preserving(
+                conn,
+                "i",
+                "pull_request",
+                pr,
+                "user:octocat",
+                None,
+                Some("x"),
+                at,
+                &date,
+                &time,
+            ),
+            upsert_file_diff_preserving(conn, pr, "octocat/hello", "a.rs", None, "ADDED", 1, 0),
+            set_file_diff_patch_preserving(conn, pr, "a.rs", None, Some("p")),
+        ];
+        for (index, result) in results.into_iter().enumerate() {
+            assert!(
+                matches!(result, Err(crate::Error::Database(_))),
+                "writer {index}: {result:?}"
+            );
+        }
     }
 
     #[test]

@@ -66,6 +66,12 @@ pub(super) fn without_superseded_notes(note: Option<String>, recovered: &Recover
     .unwrap_or_default()
 }
 
+/// Git recovery writes repository objects to disk, so it runs only when the
+/// run may retain diffs or no policy file governs the warehouse.
+pub(super) fn recovery_allowed(decision: &crate::retention::GateDecision) -> bool {
+    !decision.app_mode || decision.allowed == crate::retention::DiffRetention::Retain
+}
+
 impl Syncer<'_> {
     /// Walk a repository's pull requests newest-first, resumably.
     ///
@@ -312,15 +318,21 @@ impl Syncer<'_> {
         // Fetch patch text BEFORE any write, then land every write for this
         // item in one savepoint: a failure part-way (including a patch write)
         // leaves the previously stored rows exactly as they were.
-        let patches = (!options.skip_diffs && !pull_request.files.is_empty())
+        let decision = self.decide(options.skip_diffs);
+        let want_patches = decision.allowed == crate::retention::DiffRetention::Retain;
+        let patches = (want_patches && !pull_request.files.is_empty())
             .then(|| pull_requests::fetch_file_patches(self.client, repo_key, pull_request.number));
         let recovered = recover_files(
             self.client,
-            self.git_recovery.as_ref(),
+            if recovery_allowed(&decision) {
+                self.git_recovery.as_ref()
+            } else {
+                None
+            },
             repo_key,
             &pull_request,
             patches.as_ref(),
-            !options.skip_diffs,
+            want_patches,
         );
         let connection = self.connection;
         let mut caveats = without_superseded_notes(note, &recovered);
@@ -360,6 +372,16 @@ impl Syncer<'_> {
         recovered: Recovery,
     ) -> Result<Vec<String>> {
         let conn = self.connection;
+        // Write-time recheck: the policy may have changed since the fetch.
+        // Patch text fetched under Retain is dropped, unwritten, if the
+        // ceiling no longer allows it; app mode turns on payload preservation.
+        let now = self.decide(false);
+        let preserve = now.app_mode;
+        let patches = if now.allowed == crate::retention::DiffRetention::Retain {
+            patches
+        } else {
+            None
+        };
         let (changed_files, additions, deletions) = match &recovered {
             Some(Ok(set)) => (set.changed_files, set.additions, set.deletions),
             Some(Err(reason)) => return Err(crate::Error::GitRecovery(reason.clone())),
@@ -396,36 +418,43 @@ impl Syncer<'_> {
         let comment_count =
             (pull_request.conversation_comments.len() + pull_request.review_comments.len()) as i64;
 
-        repository::upsert_pull_request(
-            conn,
-            &PullRequestRow {
-                pr_key,
-                number: pull_request.number,
-                repo_key,
-                author_key: &author_key,
-                state: &pull_request.state,
-                is_draft: pull_request.is_draft,
-                title: pull_request.title.as_deref(),
-                body: pull_request.body.as_deref(),
-                base_ref: pull_request.base_ref.as_deref(),
-                head_ref: pull_request.head_ref.as_deref(),
-                created_at: &pull_request.created_at,
-                updated_at: pull_request.updated_at.as_deref(),
-                merged_at: pull_request.merged_at.as_deref(),
-                closed_at: pull_request.closed_at.as_deref(),
-                merged_by_key: merged_by_key.as_deref(),
-                created_date_key: &created.date_key,
-                created_time_key: &created.time_key,
-                updated_date_key: updated.as_ref().map(|keys| keys.date_key.as_str()),
-                updated_time_key: updated.as_ref().map(|keys| keys.time_key.as_str()),
-                merged_date_key: merged.as_ref().map(|keys| keys.date_key.as_str()),
-                comment_count,
-                review_count: pull_request.reviews.len() as i64,
-                changed_files,
-                additions,
-                deletions,
-            },
-        )?;
+        let row = PullRequestRow {
+            pr_key,
+            number: pull_request.number,
+            repo_key,
+            author_key: &author_key,
+            state: &pull_request.state,
+            is_draft: pull_request.is_draft,
+            title: pull_request.title.as_deref(),
+            body: pull_request.body.as_deref(),
+            base_ref: pull_request.base_ref.as_deref(),
+            head_ref: pull_request.head_ref.as_deref(),
+            created_at: &pull_request.created_at,
+            updated_at: pull_request.updated_at.as_deref(),
+            merged_at: pull_request.merged_at.as_deref(),
+            closed_at: pull_request.closed_at.as_deref(),
+            merged_by_key: merged_by_key.as_deref(),
+            created_date_key: &created.date_key,
+            created_time_key: &created.time_key,
+            updated_date_key: updated.as_ref().map(|keys| keys.date_key.as_str()),
+            updated_time_key: updated.as_ref().map(|keys| keys.time_key.as_str()),
+            merged_date_key: merged.as_ref().map(|keys| keys.date_key.as_str()),
+            comment_count,
+            review_count: pull_request.reviews.len() as i64,
+            changed_files,
+            additions,
+            deletions,
+        };
+        if preserve {
+            repository::upsert_pull_request_preserving(
+                conn,
+                &row,
+                repository::CounterSource::Detail,
+            )?;
+        } else {
+            repository::upsert_pull_request(conn, &row)?;
+        }
+        crate::collection::mark_detail_fetched(conn, pr_key, pull_request, patches.is_some())?;
 
         for review in &pull_request.reviews {
             let Some(submitted_at) = review.submitted_at.as_deref() else {
@@ -438,7 +467,12 @@ impl Syncer<'_> {
                 timezone,
                 core_hours,
             )?;
-            repository::upsert_review(
+            let write_review = if preserve {
+                repository::upsert_review_preserving
+            } else {
+                repository::upsert_review
+            };
+            write_review(
                 conn,
                 &review.id,
                 pr_key,
@@ -459,7 +493,12 @@ impl Syncer<'_> {
                 timezone,
                 core_hours,
             )?;
-            repository::upsert_review_comment(
+            let write_comment = if preserve {
+                repository::upsert_review_comment_preserving
+            } else {
+                repository::upsert_review_comment
+            };
+            write_comment(
                 conn,
                 &comment.id,
                 pr_key,
@@ -482,7 +521,12 @@ impl Syncer<'_> {
                 timezone,
                 core_hours,
             )?;
-            repository::upsert_issue_comment(
+            let write_comment = if preserve {
+                repository::upsert_issue_comment_preserving
+            } else {
+                repository::upsert_issue_comment
+            };
+            write_comment(
                 conn,
                 &comment.id,
                 "pull_request",
@@ -521,6 +565,7 @@ impl Syncer<'_> {
                     pull_request.number,
                     &set,
                     patches.is_some(),
+                    preserve,
                 );
             }
             Some(Err(reason)) => return Err(crate::Error::GitRecovery(reason)),
@@ -528,21 +573,37 @@ impl Syncer<'_> {
         }
 
         for file in &pull_request.files {
-            repository::upsert_file_diff(
-                conn,
-                pr_key,
-                repo_key,
-                &file.path,
-                None,
-                &file.change_type,
-                None,
-                file.additions,
-                file.deletions,
-            )?;
+            if preserve {
+                repository::upsert_file_diff_preserving(
+                    conn,
+                    pr_key,
+                    repo_key,
+                    &file.path,
+                    None,
+                    &file.change_type,
+                    file.additions,
+                    file.deletions,
+                )?;
+            } else {
+                repository::upsert_file_diff(
+                    conn,
+                    pr_key,
+                    repo_key,
+                    &file.path,
+                    None,
+                    &file.change_type,
+                    None,
+                    file.additions,
+                    file.deletions,
+                )?;
+            }
         }
 
         let mut caveats = Vec::new();
         match pull_requests::authoritative_file_paths(pull_request) {
+            // App mode never deletes a stored row, even one the provider no
+            // longer lists (for example after a force push).
+            Ok(_) if preserve => {}
             Ok(current) => {
                 let stale = repository::file_diffs_absent_from(conn, pr_key, &current)?;
                 repository::delete_file_diffs(conn, pr_key, &stale)?;
@@ -576,6 +637,7 @@ impl Syncer<'_> {
                 pr_key,
                 pull_request,
                 listing,
+                preserve,
             )?);
         }
         Ok(caveats)
@@ -591,32 +653,58 @@ impl Syncer<'_> {
         number: i64,
         set: &RecoveredFileSet,
         write_patches: bool,
+        preserve: bool,
     ) -> Result<Vec<String>> {
         for file in &set.files {
-            repository::upsert_file_diff(
-                conn,
-                pr_key,
-                repo_key,
-                &file.path,
-                file.previous_path.as_deref(),
-                &file.change_type,
-                None,
-                file.additions,
-                file.deletions,
-            )?;
-            if write_patches {
-                repository::set_file_diff_patch(
+            if preserve {
+                repository::upsert_file_diff_preserving(
                     conn,
                     pr_key,
+                    repo_key,
                     &file.path,
                     file.previous_path.as_deref(),
-                    file.patch.as_deref(),
+                    &file.change_type,
+                    file.additions,
+                    file.deletions,
                 )?;
+            } else {
+                repository::upsert_file_diff(
+                    conn,
+                    pr_key,
+                    repo_key,
+                    &file.path,
+                    file.previous_path.as_deref(),
+                    &file.change_type,
+                    None,
+                    file.additions,
+                    file.deletions,
+                )?;
+            }
+            if write_patches {
+                if preserve {
+                    repository::set_file_diff_patch_preserving(
+                        conn,
+                        pr_key,
+                        &file.path,
+                        file.previous_path.as_deref(),
+                        file.patch.as_deref(),
+                    )?;
+                } else {
+                    repository::set_file_diff_patch(
+                        conn,
+                        pr_key,
+                        &file.path,
+                        file.previous_path.as_deref(),
+                        file.patch.as_deref(),
+                    )?;
+                }
             }
         }
         let keep: std::collections::HashSet<&str> = set.keep.iter().map(String::as_str).collect();
-        let stale = repository::file_diffs_absent_from(conn, pr_key, &keep)?;
-        repository::delete_file_diffs(conn, pr_key, &stale)?;
+        if !preserve {
+            let stale = repository::file_diffs_absent_from(conn, pr_key, &keep)?;
+            repository::delete_file_diffs(conn, pr_key, &stale)?;
+        }
         let records: std::collections::HashSet<&str> =
             set.files.iter().map(|file| file.path.as_str()).collect();
         let empty = std::collections::HashSet::new();
@@ -625,8 +713,10 @@ impl Syncer<'_> {
             .iter()
             .filter(|path| records.contains(path.as_str()))
             .count();
+        // In app mode older rows outside the set are kept, so only the
+        // records themselves must have landed.
         if landed != set.files.len()
-            || stored.len() != set.files.len()
+            || (!preserve && stored.len() != set.files.len())
             || set.files.len() as i64 != set.changed_files
         {
             return Err(crate::Error::GitRecovery(format!(
@@ -655,12 +745,18 @@ impl Syncer<'_> {
         pr_key: &str,
         pull_request: &PullRequestData,
         listing: Result<pull_requests::PatchListing>,
+        preserve: bool,
     ) -> Result<Vec<String>> {
         let mut caveats = Vec::new();
         match listing {
             Ok(listing) => {
                 for (file_path, previous_path, patch) in &listing.files {
-                    repository::set_file_diff_patch(
+                    let write_patch = if preserve {
+                        repository::set_file_diff_patch_preserving
+                    } else {
+                        repository::set_file_diff_patch
+                    };
+                    write_patch(
                         conn,
                         pr_key,
                         file_path,

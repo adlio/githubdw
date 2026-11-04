@@ -47,6 +47,19 @@ pub fn init(conn: &mut Connection) -> Result<()> {
     if schema_version(conn)? != version_before {
         assert_referential_integrity(conn)?;
     }
+    ensure_collection_tables(conn)?;
+    Ok(())
+}
+
+/// Create the counts-first collection tables when missing.
+///
+/// Deliberately NOT a numbered migration: `PRAGMA user_version` stays at 8, so
+/// a githubdw 0.3.4 binary (for example a scheduled `githubdw sync` that has
+/// not been upgraded yet, or a rollback) still opens the warehouse. Older
+/// binaries ignore these tables. The statements only add tables; nothing
+/// existing is altered.
+pub fn ensure_collection_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(include_str!("collection_tables.sql"))?;
     Ok(())
 }
 

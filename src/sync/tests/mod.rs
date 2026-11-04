@@ -7,6 +7,7 @@ use serde_json::json;
 mod support;
 use support::*;
 
+mod app_mode;
 mod continuation;
 mod files;
 mod git_recovery;
