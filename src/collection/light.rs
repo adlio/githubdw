@@ -73,7 +73,7 @@ pub struct LightPullRequest {
     pub review_total: i64,
     pub login_reviews: Vec<ReviewData>,
     /// The login's review list has pages not yet read. Cleared once
-    /// [`complete_login_reviews`] reads them all.
+    /// `complete_login_reviews` reads them all.
     pub login_reviews_truncated: bool,
     /// GraphQL node id, used to continue the review list.
     pub node_id: Option<String>,
