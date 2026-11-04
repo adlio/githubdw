@@ -493,3 +493,25 @@ fn runaway_output_and_time_are_bounded() {
         "the child was not killed"
     );
 }
+
+/// Output that arrives after git itself has exited is still collected. The
+/// alias backgrounds a writer and returns at once, so the exit is always
+/// observed before the reader finishes; without this the late-output path ran
+/// only when a fast `git` happened to lose that race.
+#[test]
+fn output_written_after_git_exits_is_still_collected() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = GitRecoveryConfig::github(dir.path().to_path_buf());
+    let output = run_git(
+        &config,
+        None,
+        &[
+            "-c",
+            "alias.late=!(sleep 0.3; printf late) & exit 0",
+            "late",
+        ],
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    assert_eq!(output, b"late");
+}
