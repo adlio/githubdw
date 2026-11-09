@@ -528,46 +528,121 @@ async fn call_sync(server: &GithubDwServer) -> Result<CallToolResult, McpError> 
     server.prepare_sync(Some(&map))?.run().await
 }
 
-/// While a sync waits on a slow `gh`, other tools answer at once, and the
-/// sync still finishes and stores its data.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn other_tools_answer_while_a_sync_is_blocked_on_gh() {
+/// Send one JSON-RPC message as a line.
+async fn send(writer: &mut (impl tokio::io::AsyncWrite + Unpin), message: serde_json::Value) {
+    use tokio::io::AsyncWriteExt;
+    writer
+        .write_all(format!("{message}\n").as_bytes())
+        .await
+        .unwrap();
+}
+
+/// Read the next JSON-RPC message, failing after five seconds.
+async fn receive(
+    lines: &mut tokio::io::Lines<impl tokio::io::AsyncBufRead + Unpin>,
+) -> serde_json::Value {
+    let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .expect("a reply within 5s")
+        .unwrap()
+        .expect("an open stream");
+    serde_json::from_str(&line).unwrap()
+}
+
+/// Over the MCP wire: while a sync waits on a slow `gh`, a query sent after
+/// it is answered first, and the sync then finishes and stores its data.
+/// One worker thread: a sync that blocked a worker would starve the query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_query_is_answered_while_a_sync_is_blocked_on_gh() {
+    use rmcp::ServiceExt;
+    use tokio::io::AsyncBufReadExt;
+
     let dir = tempfile::tempdir().unwrap();
     let (server, started, release) = gated_server(&dir, vec![pr_page(false, None, &[1], 4999)]);
-    let syncing = {
-        let server = server.clone();
-        tokio::spawn(async move { call_sync(&server).await })
-    };
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        let running = server.serve(server_io).await.unwrap();
+        let _ = running.waiting().await;
+    });
+    let (reader, mut writer) = tokio::io::split(client_io);
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}
+        }}),
+    )
+    .await;
+    assert_eq!(receive(&mut lines).await["id"], 1);
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "trigger_sync",
+            "arguments": {"entity_type": "repo", "name": "octocat/hello", "days": 30}
+        }}),
+    )
+    .await;
     // Wait until the sync is parked inside the fake transport.
     tokio::task::spawn_blocking(move || {
         started
             .recv_timeout(Duration::from_secs(10))
             .expect("sync started");
-        started
     })
     .await
     .unwrap();
 
-    let query = {
-        let server = server.clone();
-        tokio::task::spawn_blocking(move || {
-            let map = args(json!({ "output": "count" }));
-            server.query_pull_requests(Some(&map))
-        })
-    };
-    let result = tokio::time::timeout(Duration::from_secs(5), query)
-        .await
-        .expect("query returned while the sync was blocked")
-        .unwrap()
-        .unwrap();
-    assert!(text_of(result).contains('0'), "nothing stored yet");
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "query_pull_requests", "arguments": {"output": "count"}
+        }}),
+    )
+    .await;
+    let query = receive(&mut lines).await;
+    assert_eq!(
+        query["id"], 3,
+        "the query is answered before the sync: {query}"
+    );
+    let count: serde_json::Value =
+        serde_json::from_str(query["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(count["count"], 0, "nothing stored yet: {count}");
 
     release.send(()).unwrap();
-    let synced = syncing.await.unwrap().unwrap();
-    let body: serde_json::Value = serde_json::from_str(&text_of(synced)).unwrap();
-    assert_eq!(body["status"], "Completed");
+    let sync = receive(&mut lines).await;
+    assert_eq!(sync["id"], 2);
+    let body: serde_json::Value =
+        serde_json::from_str(sync["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["status"], "Completed", "{body}");
     assert_eq!(body["partial"], false);
     assert_eq!(body["pull_requests_synced"], 1);
+}
+
+/// A name that is not owner/name is the caller's mistake, not ours.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_repository_name_is_an_invalid_params_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _started, _release) = gated_server(&dir, vec![]);
+    let map = args(json!({ "entity_type": "repo", "name": "no-slash" }));
+    let error = server
+        .prepare_sync(Some(&map))
+        .unwrap()
+        .run()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "{error:?}"
+    );
+    assert!(error.message.contains("owner/name"), "{error:?}");
 }
 
 /// Two pull requests against a budget of 2 with more pages behind them: the
