@@ -35,8 +35,8 @@ impl Syncer<'_> {
                 .filter(|target| target.repository == repository_name)
                 .collect();
             let entity_key = format!("repo:{repository_name}");
-            match sync_state::acquire_lock(self.connection, &entity_key) {
-                Ok(()) => {}
+            let lease = match sync_state::SyncLease::acquire(self.connection, &entity_key) {
+                Ok(lease) => lease,
                 Err(crate::Error::SyncInProgress(_)) => {
                     for target in group {
                         let counts = refresh::stored_counts(self.connection, target)?;
@@ -54,10 +54,11 @@ impl Syncer<'_> {
                     continue;
                 }
                 Err(error) => return Err(error),
-            }
+            };
             let outcome = self.refresh_group(&group, &entity_key, options, &mut report);
-            sync_state::release_lock(self.connection, &entity_key)?;
+            let released = lease.release();
             outcome?;
+            released?;
         }
         Ok(report)
     }

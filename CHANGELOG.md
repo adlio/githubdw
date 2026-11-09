@@ -49,9 +49,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   halves only for 502/504, timeout and resource-limit failures; any other
   error returns immediately.
 
+- `sync`: the per-entity sync lock is now an owned lease. Recording progress
+  renews it, so a walk that runs past 30 minutes (search pacing, rate-limit
+  sleeps) no longer lets a second process start the same sync. A run releases
+  only the lock it holds, so a stale holder finishing cannot delete its
+  successor's lock. A lock with an unparsable `started_at` is reclaimable
+  instead of blocking forever, and a failure while recording the job outcome
+  releases the lock and no longer replaces the sync's own error.
+- `sync watch`: the reported start time stays the job's real start instead of
+  following lock renewals.
+
 ### Removed
 
 - The unused `live-tests` Cargo feature.
+- `storage::sync_state_repository::acquire_lock` and `release_lock`; use
+  `SyncLease` (or `acquire_owned_lock`).
 
 ## [0.3.5] - 2026-11-04
 

@@ -21,28 +21,26 @@ impl Syncer<'_> {
         let login = crate::query::to_bare_login(login);
         let entity_key = format!("user:{login}");
 
-        sync_state::acquire_lock(self.connection, &entity_key)?;
-        sync_state::start_job(self.connection, &entity_key)?;
-
-        let outcome = self.sync_user_locked(&login, &entity_key, options);
-
-        match &outcome {
-            Ok(summary) => {
-                sync_state::complete_job_outcome(
-                    self.connection,
+        let conn = self.connection;
+        sync_state::with_lock(conn, &entity_key, || {
+            sync_state::start_job(conn, &entity_key)?;
+            let outcome = self.sync_user_locked(&login, &entity_key, options);
+            // Recording the job must not replace the walk's own error.
+            let recorded = match &outcome {
+                Ok(summary) => sync_state::complete_job_outcome(
+                    conn,
                     &entity_key,
                     summary.pull_requests_synced,
                     summary.skipped,
                     &summary.failed,
                     summary.partial,
-                )?;
-            }
-            Err(error) => {
-                sync_state::fail_job(self.connection, &entity_key, &error.to_string())?;
-            }
-        }
-        sync_state::release_lock(self.connection, &entity_key)?;
-        outcome
+                ),
+                Err(error) => sync_state::fail_job(conn, &entity_key, &error.to_string()),
+            };
+            let summary = outcome?;
+            recorded?;
+            Ok(summary)
+        })
     }
 
     pub(super) fn sync_user_locked(

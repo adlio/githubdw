@@ -9,32 +9,6 @@ use crate::storage::time_dimension;
 /// Locks staler than this are considered crashed and auto-released.
 const STALE_LOCK_MINUTES: i64 = 30;
 
-/// Acquire the sync lock for an entity. Fails fast if a live lock exists;
-/// auto-releases a stale one.
-pub fn acquire_lock(conn: &Connection, entity_key: &str) -> Result<()> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT started_at FROM sync_locks WHERE entity_key = ?1",
-            [entity_key],
-            |row| row.get(0),
-        )
-        .optional()?;
-    if let Some(started_at) = existing {
-        let started = started_at
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap_or_else(|_| Utc::now());
-        if Utc::now() - started < Duration::minutes(STALE_LOCK_MINUTES) {
-            return Err(Error::SyncInProgress(entity_key.to_string()));
-        }
-        conn.execute("DELETE FROM sync_locks WHERE entity_key = ?1", [entity_key])?;
-    }
-    conn.execute(
-        "INSERT INTO sync_locks (entity_key, started_at) VALUES (?1, ?2)",
-        params![entity_key, Utc::now().to_rfc3339()],
-    )?;
-    Ok(())
-}
-
 fn lease_token(previous: Option<&str>) -> String {
     loop {
         let token = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
@@ -45,10 +19,15 @@ fn lease_token(previous: Option<&str>) -> String {
 }
 
 /// Acquire the lock and return an owner token (the exact `started_at` this
-/// caller wrote). Same exclusion as [`acquire_lock`]: a live lock refuses, a
-/// lock older than the stale window is taken over. The takeover deletes only
-/// the stale row it observed, so a concurrent fresh acquire still wins.
+/// caller wrote). A live lock refuses; a lock older than the stale window, or
+/// whose `started_at` cannot be parsed, is taken over. The takeover deletes
+/// only the row it observed, so of two racers on one stale lock exactly one
+/// inserts and the other gets [`Error::SyncInProgress`].
 pub fn acquire_owned_lock(conn: &Connection, entity_key: &str) -> Result<String> {
+    take_lock(conn, entity_key, None)
+}
+
+fn take_lock(conn: &Connection, entity_key: &str, owner: Option<&str>) -> Result<String> {
     let existing: Option<String> = conn
         .query_row(
             "SELECT started_at FROM sync_locks WHERE entity_key = ?1",
@@ -57,9 +36,11 @@ pub fn acquire_owned_lock(conn: &Connection, entity_key: &str) -> Result<String>
         )
         .optional()?;
     if let Some(started_at) = existing {
+        // A value nobody can date is a crashed or hand-edited lock; waiting
+        // for it to "age" would block the entity forever.
         let started = started_at
-            .parse::<chrono::DateTime<Utc>>()
-            .unwrap_or_else(|_| Utc::now());
+            .parse::<DateTime<Utc>>()
+            .unwrap_or(DateTime::UNIX_EPOCH);
         if Utc::now() - started < Duration::minutes(STALE_LOCK_MINUTES) {
             return Err(Error::SyncInProgress(entity_key.to_string()));
         }
@@ -70,8 +51,8 @@ pub fn acquire_owned_lock(conn: &Connection, entity_key: &str) -> Result<String>
     }
     let token = lease_token(None);
     match conn.execute(
-        "INSERT INTO sync_locks (entity_key, started_at) VALUES (?1, ?2)",
-        params![entity_key, token],
+        "INSERT INTO sync_locks (entity_key, started_at, chunk_start_date) VALUES (?1, ?2, ?3)",
+        params![entity_key, token, owner],
     ) {
         Ok(_) => Ok(token),
         Err(rusqlite::Error::SqliteFailure(failure, _))
@@ -108,13 +89,78 @@ pub fn release_owned_lock(conn: &Connection, entity_key: &str, token: &str) -> R
     Ok(deleted == 1)
 }
 
-/// Release the lock (idempotent).
-pub fn release_lock(conn: &Connection, entity_key: &str) -> Result<()> {
-    conn.execute("DELETE FROM sync_locks WHERE entity_key = ?1", [entity_key])?;
-    Ok(())
+/// A sync's hold on an entity lock. The owner id is fixed for the life of the
+/// lease and stored in `chunk_start_date`, a column nothing else uses, so
+/// [`update_lock_progress`] can keep renewing `started_at` without the walks
+/// having to carry a token. Releasing deletes only a row that still carries
+/// this owner id, so a lock taken over after going stale is never deleted by
+/// the run that lost it. Dropping the guard releases too, so a panic or an
+/// early return cannot leak the lock.
+pub struct SyncLease<'c> {
+    conn: &'c Connection,
+    entity_key: String,
+    owner: String,
+    released: bool,
 }
 
-/// Update live progress counters on the lock row.
+impl<'c> SyncLease<'c> {
+    /// Take the lock for `entity_key` or fail with [`Error::SyncInProgress`].
+    pub fn acquire(conn: &'c Connection, entity_key: &str) -> Result<Self> {
+        let owner = lease_token(None);
+        take_lock(conn, entity_key, Some(&owner))?;
+        Ok(Self {
+            conn,
+            entity_key: entity_key.to_string(),
+            owner,
+            released: false,
+        })
+    }
+
+    /// Release the lock. `Ok(false)` means it was no longer ours and was left alone.
+    pub fn release(mut self) -> Result<bool> {
+        self.released = true;
+        self.delete_owned()
+    }
+
+    fn delete_owned(&self) -> Result<bool> {
+        let deleted = self.conn.execute(
+            "DELETE FROM sync_locks WHERE entity_key = ?1 AND chunk_start_date = ?2",
+            params![self.entity_key, self.owner],
+        )?;
+        Ok(deleted == 1)
+    }
+}
+
+impl Drop for SyncLease<'_> {
+    fn drop(&mut self) {
+        if !self.released {
+            // Nowhere to report a failure from here; the lock then ages out.
+            let _ = self.delete_owned();
+        }
+    }
+}
+
+/// Run `body` holding the lock on `entity_key`, then release it. The body's
+/// result is the primary one: a failed release only surfaces when the body
+/// succeeded, and never replaces the body's error.
+pub fn with_lock<T>(
+    conn: &Connection,
+    entity_key: &str,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let lease = SyncLease::acquire(conn, entity_key)?;
+    let result = body();
+    let released = lease.release();
+    match (result, released) {
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(value), Ok(_)) => Ok(value),
+    }
+}
+
+/// Update live progress counters on the lock row. Also renews the lock:
+/// `started_at` is how staleness is judged, so a long walk that keeps
+/// recording progress is never mistaken for a crashed one.
 pub fn update_lock_progress(
     conn: &Connection,
     entity_key: &str,
@@ -126,7 +172,7 @@ pub fn update_lock_progress(
 ) -> Result<()> {
     conn.execute(
         "UPDATE sync_locks SET current_item = ?2, current_item_id = ?3,
-             synced = ?4, skipped = ?5, failed = ?6
+             synced = ?4, skipped = ?5, failed = ?6, started_at = ?7
          WHERE entity_key = ?1",
         params![
             entity_key,
@@ -134,7 +180,8 @@ pub fn update_lock_progress(
             current_item_id,
             synced,
             skipped,
-            failed
+            failed,
+            Utc::now().to_rfc3339()
         ],
     )?;
     Ok(())
@@ -510,8 +557,12 @@ pub struct SyncJob {
 /// Syncs in progress right now, oldest first.
 pub fn active_syncs(conn: &Connection) -> Result<Vec<ActiveSync>> {
     let mut statement = conn.prepare(
-        "SELECT entity_key, started_at, current_item, current_item_id, synced, skipped, failed
-         FROM sync_locks ORDER BY started_at",
+        // The lock's own started_at is renewed as the sync progresses; the job
+        // row keeps the real start.
+        "SELECT l.entity_key, COALESCE(j.started_at, l.started_at), l.current_item,
+                l.current_item_id, l.synced, l.skipped, l.failed
+         FROM sync_locks l LEFT JOIN sync_jobs j ON j.entity_key = l.entity_key
+         ORDER BY 2",
     )?;
     let rows = statement.query_map([], |row| {
         Ok(ActiveSync {
@@ -602,17 +653,126 @@ mod tests {
         .unwrap()
     }
 
+    const KEY: &str = "repo:octocat/hello";
+
+    fn age_lock(conn: &Connection, minutes: i64) {
+        let aged = (Utc::now() - Duration::minutes(minutes)).to_rfc3339();
+        conn.execute("UPDATE sync_locks SET started_at = ?1", [aged])
+            .unwrap();
+    }
+
+    fn lock_rows(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM sync_locks", [], |r| r.get(0))
+            .unwrap()
+    }
+
     #[test]
     fn lock_lifecycle_rejects_double_acquire() {
         let warehouse = GithubDW::open_in_memory().unwrap();
         let conn = warehouse.connection();
-        acquire_lock(conn, "repo:octocat/hello").unwrap();
+        let lease = SyncLease::acquire(conn, KEY).unwrap();
         assert!(matches!(
-            acquire_lock(conn, "repo:octocat/hello"),
+            SyncLease::acquire(conn, KEY),
             Err(Error::SyncInProgress(_))
         ));
-        release_lock(conn, "repo:octocat/hello").unwrap();
-        acquire_lock(conn, "repo:octocat/hello").unwrap();
+        assert!(lease.release().unwrap());
+        assert_eq!(lock_rows(conn), 0);
+        SyncLease::acquire(conn, KEY).unwrap().release().unwrap();
+    }
+
+    /// Ages are minutes since the last renewal: 29 is live, 31 is stale.
+    #[test]
+    fn staleness_boundary_is_thirty_minutes() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        let _held = SyncLease::acquire(conn, KEY).unwrap();
+        age_lock(conn, 29);
+        assert!(matches!(
+            SyncLease::acquire(conn, KEY),
+            Err(Error::SyncInProgress(_))
+        ));
+        age_lock(conn, 31);
+        assert!(SyncLease::acquire(conn, KEY).is_ok());
+    }
+
+    /// A walk older than 30 minutes that keeps recording progress keeps its lock.
+    #[test]
+    fn recording_progress_renews_the_lock() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        let _held = SyncLease::acquire(conn, KEY).unwrap();
+        age_lock(conn, 31);
+        update_lock_progress(conn, KEY, 1, "octocat/hello#1", 1, 0, 0).unwrap();
+        assert!(matches!(
+            SyncLease::acquire(conn, KEY),
+            Err(Error::SyncInProgress(_))
+        ));
+        // Without the renewal the same age is stale (previous test), so the
+        // lock above survived because of the heartbeat.
+    }
+
+    /// A takes the lock, goes stale, B takes over; A finishing must not free B's lock.
+    #[test]
+    fn a_stale_holder_does_not_release_its_successors_lock() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        let a = SyncLease::acquire(conn, KEY).unwrap();
+        age_lock(conn, 31);
+        let b = SyncLease::acquire(conn, KEY).unwrap();
+        assert!(!a.release().unwrap(), "A no longer owns the lock");
+        assert_eq!(lock_rows(conn), 1, "B's lock is intact");
+        assert!(matches!(
+            SyncLease::acquire(conn, KEY),
+            Err(Error::SyncInProgress(_))
+        ));
+        assert!(b.release().unwrap());
+        assert_eq!(lock_rows(conn), 0);
+    }
+
+    /// Dropping an unreleased lease frees it, but not after it was taken over.
+    #[test]
+    fn dropping_a_lease_releases_only_its_own_lock() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        drop(SyncLease::acquire(conn, KEY).unwrap());
+        assert_eq!(lock_rows(conn), 0);
+        let a = SyncLease::acquire(conn, KEY).unwrap();
+        age_lock(conn, 31);
+        let _b = SyncLease::acquire(conn, KEY).unwrap();
+        drop(a);
+        assert_eq!(lock_rows(conn), 1);
+    }
+
+    /// Unparsable, empty and non-RFC3339 `started_at` values are all reclaimable.
+    #[test]
+    fn a_corrupt_started_at_is_reclaimable() {
+        for bad in ["garbage", "", "2026-13-45", "0"] {
+            let warehouse = GithubDW::open_in_memory().unwrap();
+            let conn = warehouse.connection();
+            conn.execute(
+                "INSERT INTO sync_locks (entity_key, started_at) VALUES (?1, ?2)",
+                params![KEY, bad],
+            )
+            .unwrap();
+            acquire_owned_lock(conn, KEY).unwrap_or_else(|e| panic!("{bad:?}: {e}"));
+        }
+    }
+
+    /// The body's error wins over a release problem, and the lock is freed either way.
+    #[test]
+    fn with_lock_keeps_the_body_error_and_releases() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        let conn = warehouse.connection();
+        let result: Result<()> =
+            with_lock(conn, KEY, || Err(Error::InvalidArgument("body".into())));
+        assert!(matches!(result, Err(Error::InvalidArgument(m)) if m == "body"));
+        assert_eq!(lock_rows(conn), 0);
+        // The lock is gone mid-body (taken over): the body's Ok stays Ok.
+        let result = with_lock(conn, KEY, || {
+            conn.execute("DELETE FROM sync_locks", []).unwrap();
+            Ok(7)
+        });
+        assert_eq!(result.unwrap(), 7);
     }
 
     /// A range may not claim the day that is still in progress, and "in
@@ -785,13 +945,17 @@ mod tests {
     fn watch_lists_live_syncs_then_finished_jobs() {
         let warehouse = crate::GithubDW::open_in_memory().unwrap();
         let conn = warehouse.connection();
-        acquire_lock(conn, "repo:o/r").unwrap();
+        let lease = SyncLease::acquire(conn, "repo:o/r").unwrap();
         start_job(conn, "repo:o/r").unwrap();
         let live = active_syncs(conn).unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].entity_key, "repo:o/r");
+        // Progress renews the lock but must not move the reported start.
+        let started = live[0].started_at.clone();
+        update_lock_progress(conn, "repo:o/r", 1, "o/r#1", 1, 0, 0).unwrap();
+        assert_eq!(active_syncs(conn).unwrap()[0].started_at, started);
         complete_job(conn, "repo:o/r", 3, 0, &[]).unwrap();
-        release_lock(conn, "repo:o/r").unwrap();
+        lease.release().unwrap();
         assert!(active_syncs(conn).unwrap().is_empty());
         let jobs = recent_jobs(conn, 5).unwrap();
         assert_eq!(jobs.len(), 1);
