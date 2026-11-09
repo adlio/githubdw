@@ -11,6 +11,7 @@ pub mod params;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
 use rmcp::handler::server::tool::ToolCallContext;
@@ -32,12 +33,24 @@ use crate::storage::monitor_repository;
 use crate::storage::time_dimension;
 use params::*;
 
-/// The MCP server. The warehouse sits behind a Mutex: stdio MCP dispatches
-/// one call at a time, so there is never contention — the lock simply
-/// satisfies Send/Sync bounds without unsafe code.
+/// Pull requests one `trigger_sync` call may process before it yields, as in
+/// the CLI's `sync all`. The position is checkpointed; calling again resumes.
+const SYNC_ITEM_BUDGET: i64 = 500;
+
+/// A rate-limit wait longer than this is reported to the caller instead of
+/// slept through, so a tool call never parks for minutes.
+const SYNC_MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(30);
+
+/// The MCP server. Quick tools take the warehouse Mutex; `trigger_sync` never
+/// does: it runs on a blocking thread with its own connection to the same
+/// database file, so other calls, pings and cancellation stay responsive.
 #[derive(Clone)]
 pub struct GithubDwServer {
     warehouse: Arc<Mutex<GithubDW>>,
+    database_path: std::path::PathBuf,
+    /// Builds the GitHub client for each sync. Replaceable in tests.
+    client_factory: Arc<dyn Fn() -> crate::fetch::GhClient + Send + Sync>,
+    sync_item_budget: i64,
     tool_router: ToolRouter<Self>,
 }
 
@@ -91,9 +104,10 @@ fn parse_params<T: serde::de::DeserializeOwned>(
     serde_json::from_value(value).map_err(|e| invalid_params(format!("invalid params: {e}")))
 }
 
-/// Shorthand for the boxed, `Send` future the tool router expects. Every tool
-/// body here is synchronous warehouse work, so the result is computed eagerly
+/// Shorthand for the boxed, `Send` future the tool router expects. The quick
+/// tools are synchronous warehouse work, so their result is computed eagerly
 /// and wrapped — no lock guard is ever held across an await point.
+/// `trigger_sync` is the exception: it awaits a blocking thread.
 type ToolFuture<'a> = Pin<Box<dyn Future<Output = Result<CallToolResult, McpError>> + Send + 'a>>;
 
 fn ready(result: Result<CallToolResult, McpError>) -> ToolFuture<'static> {
@@ -103,7 +117,10 @@ fn ready(result: Result<CallToolResult, McpError>) -> ToolFuture<'static> {
 impl GithubDwServer {
     pub fn new(warehouse: GithubDW) -> Self {
         Self {
+            database_path: warehouse.database_path().to_path_buf(),
             warehouse: Arc::new(Mutex::new(warehouse)),
+            client_factory: Arc::new(crate::fetch::GhClient::new),
+            sync_item_budget: SYNC_ITEM_BUDGET,
             tool_router: Self::build_tool_router(),
         }
     }
@@ -157,7 +174,8 @@ impl GithubDwServer {
                  Requires an authenticated gh CLI.",
             ),
             |ctx: ToolCallContext<'_, Self>| {
-                ready(ctx.service.trigger_sync(ctx.arguments.as_ref()))
+                let sync = ctx.service.prepare_sync(ctx.arguments.as_ref());
+                Box::pin(async move { sync?.run().await })
             },
         ));
         router
@@ -375,10 +393,12 @@ impl GithubDwServer {
         }
     }
 
-    fn trigger_sync(
+    /// Validate a `trigger_sync` call and capture what the blocking thread
+    /// needs, so the returned job borrows nothing from the request.
+    fn prepare_sync(
         &self,
         args: Option<&Map<String, serde_json::Value>>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<SyncJob, McpError> {
         let params: SyncParams = parse_params(args)?;
         if params.entity_type != "repo" {
             return Err(invalid_params(format!(
@@ -386,19 +406,59 @@ impl GithubDwServer {
                 params.entity_type
             )));
         }
-        let warehouse = self.warehouse.lock().map_err(internal_error)?;
-        let mut client = crate::fetch::GhClient::new();
+        Ok(SyncJob {
+            params,
+            database_path: self.database_path.clone(),
+            client_factory: Arc::clone(&self.client_factory),
+            item_budget: self.sync_item_budget,
+        })
+    }
+}
+
+/// One validated `trigger_sync` call.
+struct SyncJob {
+    params: SyncParams,
+    database_path: std::path::PathBuf,
+    client_factory: Arc<dyn Fn() -> crate::fetch::GhClient + Send + Sync>,
+    item_budget: i64,
+}
+
+impl SyncJob {
+    async fn run(self) -> Result<CallToolResult, McpError> {
+        tokio::task::spawn_blocking(move || self.run_blocking())
+            .await
+            .map_err(internal_error)?
+    }
+
+    fn run_blocking(self) -> Result<CallToolResult, McpError> {
+        // shortcut: an in-memory warehouse has no file to share, so a sync
+        // there would write to a private empty database; the server only runs
+        // on a file, and tests that sync use one.
+        let warehouse = GithubDW::open(&self.database_path).map_err(internal_error)?;
+        let mut client = (self.client_factory)();
         client.preflight().map_err(internal_error)?;
+        client.set_defer_waits_over(Some(SYNC_MAX_RATE_LIMIT_WAIT));
         let options = crate::sync::SyncOptions {
-            days: Some(params.days.unwrap_or(30)),
+            days: Some(self.params.days.unwrap_or(30)),
             ..Default::default()
         };
-        let mut syncer = crate::sync::Syncer::new(warehouse.connection(), &mut client);
-        let summary = syncer
-            .sync_repository(&params.name, &options)
-            .map_err(internal_error)?;
+        let mut syncer = crate::sync::Syncer::new(warehouse.connection(), &mut client)
+            .with_item_budget(self.item_budget);
+        let summary = match syncer.sync_repository(&self.params.name, &options) {
+            Ok(summary) => summary,
+            Err(crate::Error::RateLimited { wake_at, .. }) => {
+                let until = wake_at.to_rfc3339();
+                return json_result(json!({
+                    "status": "RateLimited",
+                    "rate_limited_until": until,
+                    "message": format!("rate limited until {until}, call again"),
+                }));
+            }
+            Err(error) => return Err(caller_error(error)),
+        };
         json_result(json!({
-            "status": "Completed",
+            "status": if summary.partial { "Partial" } else { "Completed" },
+            "partial": summary.partial,
             "pull_requests_synced": summary.pull_requests_synced,
             "issues_synced": summary.issues_synced,
             "skipped": summary.skipped,
@@ -407,6 +467,7 @@ impl GithubDwServer {
                 .iter()
                 .map(|(item, error)| json!({ "item": item, "error": error }))
                 .collect::<Vec<_>>(),
+            "notes": summary.notes,
             "up_to_date": summary.up_to_date,
         }))
     }
