@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `prs_merged` (user, repo and group metrics, and the `top_mergers`
+  leaderboard) now counts pull requests merged in the window, by
+  `merged_date_key`. It used to count pull requests opened in the window that
+  are merged now, so period-over-period deltas ran low. Expect different
+  numbers after upgrading.
+- `query::validate_select_only` is removed; `raw_query` now asks SQLite whether
+  the prepared statement is read-only.
+
+### Fixed
+
+- `query --group <name>` for a group with no members returned every pull
+  request; it now returns none, matching `metrics`. `QueryBuilder::authors`
+  and `repos` do the same for an empty list.
+- `raw_query` refused nothing but a non-`SELECT`/`WITH` first word, so
+  `WITH x AS (SELECT 1) DELETE FROM ...` ran. It also rejected a `;` inside a
+  string literal.
+
+### Removed
+
+- The unused `live-tests` Cargo feature.
+
 ## [0.3.5] - 2026-11-04
 
 ### Added
