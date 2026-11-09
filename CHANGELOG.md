@@ -42,6 +42,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read as a file. Only variables the query declares `Int` or `Boolean` use
   `-F`.
 
+- `sync`: run-level errors (cancellation, a spent rate limit or quota reserve,
+  an unusable `gh`, a failing database) now stop the repository and user walks
+  at once instead of being recorded as a failure for every remaining item.
+  Constraint errors on one item's rows are still recorded per item. Page size
+  halves only for 502/504, timeout and resource-limit failures; any other
+  error returns immediately.
+
 ### Removed
 
 - The unused `live-tests` Cargo feature.
