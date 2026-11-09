@@ -29,7 +29,7 @@ pub trait GhTransport: Send + Sync {
 
 /// Default wall-clock limit for one `gh` invocation.
 const GH_TIMEOUT: Duration = Duration::from_secs(120);
-/// Environment variable overriding [`GH_TIMEOUT`], in whole seconds.
+/// Environment variable overriding the 120-second `gh` deadline, in whole seconds.
 pub const GH_DEADLINE_ENV: &str = "GITHUBDW_GH_DEADLINE_SECS";
 
 /// Real transport: shells out to the `gh` binary on PATH.
