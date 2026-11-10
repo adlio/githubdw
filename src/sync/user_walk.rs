@@ -203,9 +203,8 @@ impl Syncer<'_> {
             }
             let data = match self.client.graphql_search(&query, &variables) {
                 Ok(data) => data,
-                Err(error) if page_size > 1 => {
+                Err(error) if page_size > 1 && error.is_page_size_symptom() => {
                     page_size = (page_size / 2).max(1);
-                    let _ = error;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -310,6 +309,7 @@ impl Syncer<'_> {
                         summary.pull_requests_synced += 1;
                         watermark.landed(item.pull_request.updated_at.as_deref());
                     }
+                    Err(error) if error.is_run_fatal() => return Err(error),
                     Err(error) => {
                         // Caps the committable watermark at this item, so a
                         // failure in the middle of the walk is retried rather
@@ -431,7 +431,9 @@ impl Syncer<'_> {
                     &[("q", expression.as_str())],
                 ) {
                     Ok(data) => break data,
-                    Err(_) if page_size > 1 => page_size = (page_size / 2).max(1),
+                    Err(error) if page_size > 1 && error.is_page_size_symptom() => {
+                        page_size = (page_size / 2).max(1)
+                    }
                     Err(error) => return Err(error),
                 }
             };
@@ -494,6 +496,7 @@ impl Syncer<'_> {
                             summary.notes.extend(note);
                             summary.pull_requests_synced += 1;
                         }
+                        Err(error) if error.is_run_fatal() => return Err(error),
                         Err(error) => summary.failed.push((pr_key.clone(), error.to_string())),
                     }
                     sync_state::update_lock_progress(

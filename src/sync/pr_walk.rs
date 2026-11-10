@@ -161,10 +161,9 @@ impl Syncer<'_> {
                     ));
                     continue;
                 }
-                Err(error) if page_size > 1 => {
+                Err(error) if page_size > 1 && error.is_page_size_symptom() => {
                     // Degrade and retry the same page with a smaller window.
                     page_size = (page_size / 2).max(1);
-                    let _ = error;
                     continue;
                 }
                 Err(error) => return Err(error),
@@ -222,6 +221,9 @@ impl Syncer<'_> {
                         summary.pull_requests_synced += 1;
                         watermark.landed(pull_request.updated_at.as_deref());
                     }
+                    // The run is over: leave the watermark and the last page
+                    // checkpoint as they are, so a resumed run re-reads this page.
+                    Err(error) if error.is_run_fatal() => return Err(error),
                     Err(error) => {
                         // A failed item caps the committable watermark at its
                         // own timestamp, wherever it sits in the walk, so the

@@ -61,6 +61,7 @@ impl Syncer<'_> {
                         summary.issues_synced += 1;
                         watermark.landed(Some(issue.updated_at.as_str()));
                     }
+                    Err(error) if error.is_run_fatal() => return Err(error),
                     Err(error) => {
                         watermark.failed(Some(issue.updated_at.as_str()));
                         summary.failed.push((item_id.clone(), error.to_string()));

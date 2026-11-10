@@ -74,3 +74,92 @@ pub enum Error {
     #[error("LLM error: {0}")]
     Llm(String),
 }
+
+impl Error {
+    /// True when the error ends the whole run rather than one item: the
+    /// caller cancelled, the quota or rate limit is spent, `gh` is unusable,
+    /// or the database itself is failing. Retrying the next item cannot
+    /// succeed, so walks propagate these instead of recording an item failure.
+    ///
+    /// A SQLite constraint violation (including a trigger `RAISE(ABORT)`) is
+    /// specific to one item's rows; its savepoint is already rolled back, so
+    /// it stays an item failure.
+    pub fn is_run_fatal(&self) -> bool {
+        match self {
+            Error::Cancelled
+            | Error::RateLimited { .. }
+            | Error::QuotaReserve(_)
+            | Error::GhUnavailable(_)
+            | Error::Migration(_)
+            | Error::SchemaIntegrity(_) => true,
+            Error::Database(rusqlite::Error::SqliteFailure(failure, _)) => {
+                failure.code != rusqlite::ErrorCode::ConstraintViolation
+            }
+            _ => false,
+        }
+    }
+
+    /// True when a smaller page could cure the failure: the provider timed out,
+    /// answered 502/504, or reported its resource limits. Any other error
+    /// would fail again at every size.
+    pub fn is_page_size_symptom(&self) -> bool {
+        let text = match self {
+            Error::GhCommand { stderr, .. } => stderr,
+            Error::GitHubApi(message) => message,
+            _ => return false,
+        }
+        .to_lowercase();
+        [
+            "http 502",
+            "http 504",
+            "timeout",
+            "resource_limits",
+            "something went wrong",
+        ]
+        .iter()
+        .any(|symptom| text.contains(symptom))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite(code: rusqlite::ErrorCode, extended: i32) -> Error {
+        Error::Database(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code: extended,
+            },
+            None,
+        ))
+    }
+
+    #[test]
+    fn run_fatal_errors_end_the_run_and_item_errors_do_not() {
+        assert!(Error::Cancelled.is_run_fatal());
+        assert!(Error::QuotaReserve("x".into()).is_run_fatal());
+        assert!(Error::GhUnavailable("x".into()).is_run_fatal());
+        assert!(sqlite(rusqlite::ErrorCode::DatabaseBusy, 5).is_run_fatal());
+        assert!(sqlite(rusqlite::ErrorCode::DiskFull, 13).is_run_fatal());
+        // A trigger abort or constraint is one item's rows.
+        assert!(!sqlite(rusqlite::ErrorCode::ConstraintViolation, 1811).is_run_fatal());
+        assert!(!Error::GitHubApi("Could not resolve".into()).is_run_fatal());
+        assert!(!Error::NotFound("x".into()).is_run_fatal());
+    }
+
+    #[test]
+    fn page_size_symptoms_are_only_size_and_timeout_failures() {
+        let gh = |stderr: &str| Error::GhCommand {
+            exit_code: Some(1),
+            stderr: stderr.into(),
+        };
+        assert!(gh("HTTP 502: Bad Gateway").is_page_size_symptom());
+        assert!(gh("HTTP 504").is_page_size_symptom());
+        assert!(gh("request timeout").is_page_size_symptom());
+        assert!(Error::GitHubApi("RESOURCE_LIMITS_EXCEEDED".into()).is_page_size_symptom());
+        assert!(!gh("HTTP 401: Bad credentials").is_page_size_symptom());
+        assert!(!gh("HTTP 403").is_page_size_symptom());
+        assert!(!Error::Cancelled.is_page_size_symptom());
+    }
+}
