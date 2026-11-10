@@ -556,3 +556,17 @@ fn output_written_after_git_exits_is_still_collected() {
     .unwrap();
     assert_eq!(output, b"late");
 }
+
+// The hand-written recipe must refuse a path it does not describe, so a
+// served file the recipe never wrote fails loudly instead of being counted.
+#[test]
+#[should_panic(expected = "the recipe never writes")]
+fn recipe_refuses_a_path_it_never_writes() {
+    test_repo::recipe("not/in/recipe.txt");
+}
+
+#[test]
+#[should_panic(expected = "not in the head tree")]
+fn all_added_recipe_refuses_a_path_outside_head() {
+    test_repo::recipe_all_added("not/in/head.txt");
+}
