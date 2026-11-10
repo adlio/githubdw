@@ -513,8 +513,11 @@ fn watch_shows_recent_jobs_and_live_progress() {
     {
         let warehouse = githubdw::GithubDW::open(cli.db()).unwrap();
         let connection = warehouse.connection();
-        githubdw::storage::sync_state_repository::acquire_lock(connection, "repo:octocat/hello")
-            .unwrap();
+        githubdw::storage::sync_state_repository::acquire_owned_lock(
+            connection,
+            "repo:octocat/hello",
+        )
+        .unwrap();
         githubdw::storage::sync_state_repository::update_lock_progress(
             connection,
             "repo:octocat/hello",

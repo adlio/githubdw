@@ -199,28 +199,26 @@ impl<'a> Syncer<'a> {
         let repository_name = repository_name.to_lowercase();
         let entity_key = format!("repo:{repository_name}");
 
-        sync_state::acquire_lock(self.connection, &entity_key)?;
-        sync_state::start_job(self.connection, &entity_key)?;
-
-        let outcome = self.sync_repository_locked(&repository_name, &entity_key, options);
-
-        match &outcome {
-            Ok(summary) => {
-                sync_state::complete_job_outcome(
-                    self.connection,
+        let conn = self.connection;
+        sync_state::with_lock(conn, &entity_key, || {
+            sync_state::start_job(conn, &entity_key)?;
+            let outcome = self.sync_repository_locked(&repository_name, &entity_key, options);
+            // Recording the job must not replace the walk's own error.
+            let recorded = match &outcome {
+                Ok(summary) => sync_state::complete_job_outcome(
+                    conn,
                     &entity_key,
                     summary.pull_requests_synced + summary.issues_synced,
                     summary.skipped,
                     &summary.failed,
                     summary.partial,
-                )?;
-            }
-            Err(error) => {
-                sync_state::fail_job(self.connection, &entity_key, &error.to_string())?;
-            }
-        }
-        sync_state::release_lock(self.connection, &entity_key)?;
-        outcome
+                ),
+                Err(error) => sync_state::fail_job(conn, &entity_key, &error.to_string()),
+            };
+            let summary = outcome?;
+            recorded?;
+            Ok(summary)
+        })
     }
 
     fn sync_repository_locked(

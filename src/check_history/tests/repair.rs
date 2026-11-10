@@ -270,7 +270,7 @@ fn observed_only_reads_stored_and_current_heads_and_is_not_complete() {
 #[test]
 fn a_running_sync_fails_the_target_and_keeps_its_lock() {
     let conn = warehouse();
-    sync_state::acquire_lock(&conn, "repo:o/r").unwrap();
+    sync_state::acquire_owned_lock(&conn, "repo:o/r").unwrap();
     let mut client = client(Vec::new());
     let report = repair_check_history(
         &conn,

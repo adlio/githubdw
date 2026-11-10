@@ -116,7 +116,7 @@ fn failed_refresh_preserves_stored_rows_and_state() {
 fn refresh_honours_a_running_sync_lock_and_leaves_it_in_place() {
     let warehouse = warehouse_with_shipped_pr();
     let conn = warehouse.connection();
-    sync_state::acquire_lock(conn, "repo:octocat/hello").unwrap();
+    sync_state::acquire_owned_lock(conn, "repo:octocat/hello").unwrap();
     let state_before = state_snapshot(conn);
     let (mut client, transport) =
         routing_client(vec![single_pr_response(heavy_pr_node(5))], vec![]);

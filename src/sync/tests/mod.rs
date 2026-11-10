@@ -13,6 +13,7 @@ mod fatal_errors;
 mod files;
 mod git_recovery;
 mod issues;
+mod lock;
 mod plan;
 mod repo_walk;
 mod targets;
