@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-09
+
+### Breaking
+
+- Library API: `query::validate_select_only`,
+  `storage::sync_state_repository::acquire_lock` and `release_lock` are
+  removed, and `fetch::GhCommandLine` is built with `GhCommandLine::new()`.
+  CLI flags and MCP tool inputs are unchanged.
+- `prs_merged` now counts by merge date, so metric values change.
+
 ### Changed
 
 - `prs_merged` (user, repo and group metrics, and the `top_mergers`
