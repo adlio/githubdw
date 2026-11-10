@@ -59,6 +59,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `sync watch`: the reported start time stays the job's real start instead of
   following lock renewals.
 
+- `mcp`: `trigger_sync` no longer blocks the server. It runs on a blocking
+  thread with its own database connection, so other tool calls, pings and
+  cancellation are answered while it works. A call processes at most 500
+  pull requests and returns `partial: true` (status `Partial`) when it stops
+  at that budget; calling again resumes. A rate-limit wait over 30 seconds
+  is not slept: the call returns status `RateLimited` with
+  `rate_limited_until`. The result also carries `notes`. Input is unchanged.
+
 ### Removed
 
 - The unused `live-tests` Cargo feature.

@@ -415,6 +415,271 @@ fn monitors_removing_an_untracked_name_errors() {
 fn sync_rejects_a_non_repo_entity_type() {
     // Guard runs before any network/gh access, so this stays hermetic.
     let map = args(json!({ "entity_type": "user", "name": "alice" }));
-    let error = server().trigger_sync(Some(&map)).expect_err("error");
+    let error = server().prepare_sync(Some(&map)).err().expect("error");
     assert!(error.message.contains("only 'repo'"), "{error:?}");
+}
+
+/// Fake `gh`: `auth status` succeeds at once; the first data call announces
+/// itself on `started`, then waits for `release`. Pull-request calls are
+/// served from `pages` in order; issue calls get an empty page.
+struct GatedTransport {
+    started: std::sync::mpsc::Sender<()>,
+    release: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+    pages: Mutex<Vec<String>>,
+}
+
+impl crate::fetch::GhTransport for GatedTransport {
+    fn run(&self, arguments: &[String]) -> crate::Result<String> {
+        if arguments.first().map(String::as_str) == Some("auth") {
+            return Ok(String::new());
+        }
+        if let Some(release) = self.release.lock().unwrap().take() {
+            let _ = self.started.send(());
+            let _ = release.recv();
+        }
+        if arguments.iter().any(|a| a.contains("issues(")) {
+            return Ok(empty_issue_page());
+        }
+        let mut pages = self.pages.lock().unwrap();
+        if pages.is_empty() {
+            return Err(crate::Error::GitHubApi("no more pages".into()));
+        }
+        Ok(pages.remove(0))
+    }
+}
+
+fn empty_issue_page() -> String {
+    json!({"data": {
+        "rateLimit": {"limit": 5000, "cost": 1, "remaining": 4999, "resetAt": "2099-01-01T00:00:00Z"},
+        "repository": {
+            "nameWithOwner": "octocat/hello",
+            "issues": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []}
+        }
+    }})
+    .to_string()
+}
+
+/// A pull-request page; `remaining` is the GraphQL quota GitHub reports.
+fn pr_page(has_next: bool, cursor: Option<&str>, numbers: &[i64], remaining: i64) -> String {
+    let nodes: Vec<_> = numbers
+        .iter()
+        .map(|n| {
+            json!({
+                "number": n, "title": format!("PR {n}"), "body": "", "state": "MERGED",
+                "isDraft": false, "createdAt": "2026-01-05T18:00:00Z",
+                "updatedAt": format!("2026-01-{:02}T09:00:00Z", 5 + n),
+                "mergedAt": "2026-01-06T09:00:00Z", "closedAt": "2026-01-06T09:00:00Z",
+                "baseRefName": "main", "headRefName": format!("f/{n}"),
+                "additions": 1, "deletions": 1, "changedFiles": 0,
+                "author": {"login": "octocat", "__typename": "User"},
+                "mergedBy": null,
+                "reviews": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []},
+                "reviewThreads": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []},
+                "comments": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []},
+                "files": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": []},
+                "commits": {"nodes": []}
+            })
+        })
+        .collect();
+    json!({"data": {
+        "rateLimit": {"limit": 5000, "cost": 1, "remaining": remaining, "resetAt": "2099-01-01T00:00:00Z"},
+        "repository": {
+            "nameWithOwner": "octocat/hello", "primaryLanguage": null, "isFork": false,
+            "isPrivate": false, "defaultBranchRef": {"name": "main"},
+            "createdAt": "2020-01-01T00:00:00Z",
+            "pullRequests": {"pageInfo": {"hasNextPage": has_next, "endCursor": cursor}, "nodes": nodes}
+        }
+    }})
+    .to_string()
+}
+
+/// A server over a file-backed warehouse whose syncs use a gated fake `gh`.
+fn gated_server(
+    dir: &tempfile::TempDir,
+    pages: Vec<String>,
+) -> (
+    GithubDwServer,
+    std::sync::mpsc::Receiver<()>,
+    std::sync::mpsc::Sender<()>,
+) {
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let transport = Arc::new(GatedTransport {
+        started: started_tx,
+        release: Mutex::new(Some(release_rx)),
+        pages: Mutex::new(pages),
+    });
+    struct Shared(Arc<GatedTransport>);
+    impl crate::fetch::GhTransport for Shared {
+        fn run(&self, arguments: &[String]) -> crate::Result<String> {
+            self.0.run(arguments)
+        }
+    }
+    let mut server = GithubDwServer::new(GithubDW::open(dir.path().join("w.db")).unwrap());
+    server.client_factory = Arc::new(move || {
+        crate::fetch::GhClient::with_transport(Box::new(Shared(Arc::clone(&transport))))
+            .without_sleeping()
+    });
+    (server, started_rx, release_tx)
+}
+
+async fn call_sync(server: &GithubDwServer) -> Result<CallToolResult, McpError> {
+    let map = args(json!({ "entity_type": "repo", "name": "octocat/hello", "days": 30 }));
+    server.prepare_sync(Some(&map))?.run().await
+}
+
+/// Send one JSON-RPC message as a line.
+async fn send(writer: &mut (impl tokio::io::AsyncWrite + Unpin), message: serde_json::Value) {
+    use tokio::io::AsyncWriteExt;
+    writer
+        .write_all(format!("{message}\n").as_bytes())
+        .await
+        .unwrap();
+}
+
+/// Read the next JSON-RPC message, failing after five seconds.
+async fn receive(
+    lines: &mut tokio::io::Lines<impl tokio::io::AsyncBufRead + Unpin>,
+) -> serde_json::Value {
+    let line = tokio::time::timeout(Duration::from_secs(5), lines.next_line())
+        .await
+        .expect("a reply within 5s")
+        .unwrap()
+        .expect("an open stream");
+    serde_json::from_str(&line).unwrap()
+}
+
+/// Over the MCP wire: while a sync waits on a slow `gh`, a query sent after
+/// it is answered first, and the sync then finishes and stores its data.
+/// One worker thread: a sync that blocked a worker would starve the query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn a_query_is_answered_while_a_sync_is_blocked_on_gh() {
+    use rmcp::ServiceExt;
+    use tokio::io::AsyncBufReadExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let (server, started, release) = gated_server(&dir, vec![pr_page(false, None, &[1], 4999)]);
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        let running = server.serve(server_io).await.unwrap();
+        let _ = running.waiting().await;
+    });
+    let (reader, mut writer) = tokio::io::split(client_io);
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}
+        }}),
+    )
+    .await;
+    assert_eq!(receive(&mut lines).await["id"], 1);
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "trigger_sync",
+            "arguments": {"entity_type": "repo", "name": "octocat/hello", "days": 30}
+        }}),
+    )
+    .await;
+    // Wait until the sync is parked inside the fake transport.
+    tokio::task::spawn_blocking(move || {
+        started
+            .recv_timeout(Duration::from_secs(10))
+            .expect("sync started");
+    })
+    .await
+    .unwrap();
+
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "id": 3, "method": "tools/call", "params": {
+            "name": "query_pull_requests", "arguments": {"output": "count"}
+        }}),
+    )
+    .await;
+    let query = receive(&mut lines).await;
+    assert_eq!(
+        query["id"], 3,
+        "the query is answered before the sync: {query}"
+    );
+    let count: serde_json::Value =
+        serde_json::from_str(query["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(count["count"], 0, "nothing stored yet: {count}");
+
+    release.send(()).unwrap();
+    let sync = receive(&mut lines).await;
+    assert_eq!(sync["id"], 2);
+    let body: serde_json::Value =
+        serde_json::from_str(sync["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(body["status"], "Completed", "{body}");
+    assert_eq!(body["partial"], false);
+    assert_eq!(body["pull_requests_synced"], 1);
+}
+
+/// A name that is not owner/name is the caller's mistake, not ours.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_malformed_repository_name_is_an_invalid_params_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _started, _release) = gated_server(&dir, vec![]);
+    let map = args(json!({ "entity_type": "repo", "name": "no-slash" }));
+    let error = server
+        .prepare_sync(Some(&map))
+        .unwrap()
+        .run()
+        .await
+        .unwrap_err();
+    assert_eq!(
+        error.code,
+        rmcp::model::ErrorCode::INVALID_PARAMS,
+        "{error:?}"
+    );
+    assert!(error.message.contains("owner/name"), "{error:?}");
+}
+
+/// Two pull requests against a budget of 2 with more pages behind them: the
+/// run stops, says so, and reports what it stored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_sync_over_budget_reports_partial() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut server, _started, release) =
+        gated_server(&dir, vec![pr_page(true, Some("C1"), &[10, 9], 4999)]);
+    server.sync_item_budget = 2;
+    release.send(()).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&text_of(call_sync(&server).await.unwrap())).unwrap();
+    assert_eq!(body["partial"], true);
+    assert_eq!(body["status"], "Partial");
+    assert_eq!(body["pull_requests_synced"], 2);
+}
+
+/// GitHub reports the quota spent with more pages to go: the next request
+/// would wait until 2099, so the call returns that time instead of sleeping.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_rate_limit_wait_is_reported_not_slept() {
+    let dir = tempfile::tempdir().unwrap();
+    let (server, _started, release) = gated_server(&dir, vec![pr_page(true, Some("C1"), &[1], 0)]);
+    release.send(()).unwrap();
+    let body: serde_json::Value =
+        serde_json::from_str(&text_of(call_sync(&server).await.unwrap())).unwrap();
+    assert_eq!(body["status"], "RateLimited", "{body}");
+    let until: chrono::DateTime<chrono::Utc> = body["rate_limited_until"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    let reset: chrono::DateTime<chrono::Utc> = "2099-01-01T00:00:00Z".parse().unwrap();
+    assert!((until - reset).num_seconds().abs() < 60, "{until}");
+    assert!(
+        body["message"].as_str().unwrap().ends_with(", call again"),
+        "{body}"
+    );
 }
