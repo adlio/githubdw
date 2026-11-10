@@ -168,7 +168,7 @@ fn variable<'a>(arguments: &'a [String], name: &str) -> Option<&'a str> {
     let prefix = format!("{name}=");
     arguments
         .windows(2)
-        .find(|pair| pair[0] == "-F" && pair[1].starts_with(&prefix))
+        .find(|pair| (pair[0] == "-f" || pair[0] == "-F") && pair[1].starts_with(&prefix))
         .map(|pair| &pair[1][prefix.len()..])
 }
 
@@ -465,9 +465,16 @@ impl GhTransport for FakeGitHub {
             let after = variable(arguments, "cursor")
                 .and_then(|c| c.parse().ok())
                 .unwrap_or(0);
-            return Ok(world
-                .search(&q, &login, light, page_size, after)
-                .to_string());
+            let response = world.search(&q, &login, light, page_size, after);
+            // Real `gh api graphql` exits 1 whenever `errors` is present, and
+            // still prints the body. Model that so the transport decides.
+            let has_errors = response.get("errors").is_some();
+            return crate::fetch::interpret_gh_output(
+                arguments,
+                Some(i32::from(has_errors)),
+                &response.to_string(),
+                "gh: Could not resolve to a node (partial GraphQL errors)",
+            );
         }
         if query.contains("node(id: $id)") && query.contains("loginReviews") {
             world.requests.review_pages += 1;

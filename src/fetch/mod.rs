@@ -8,9 +8,12 @@ pub mod pull_requests;
 pub mod rate_limit;
 pub mod user_search;
 
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -24,23 +27,151 @@ pub trait GhTransport: Send + Sync {
     fn run(&self, arguments: &[String]) -> Result<String>;
 }
 
+/// Default wall-clock limit for one `gh` invocation.
+const GH_TIMEOUT: Duration = Duration::from_secs(120);
+/// Environment variable overriding the 120-second `gh` deadline, in whole seconds.
+pub const GH_DEADLINE_ENV: &str = "GITHUBDW_GH_DEADLINE_SECS";
+
 /// Real transport: shells out to the `gh` binary on PATH.
-pub struct GhCommandLine;
+pub struct GhCommandLine {
+    program: std::ffi::OsString,
+    timeout: Duration,
+}
+
+impl GhCommandLine {
+    /// `gh` on PATH, killed after 120s (or `GITHUBDW_GH_DEADLINE_SECS`).
+    pub fn new() -> Self {
+        let timeout = std::env::var(GH_DEADLINE_ENV)
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .filter(|seconds| *seconds > 0)
+            .map_or(GH_TIMEOUT, Duration::from_secs);
+        Self {
+            program: "gh".into(),
+            timeout,
+        }
+    }
+}
+
+impl Default for GhCommandLine {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Turn a finished `gh` process into the transport result.
+///
+/// `gh api graphql` exits 1 when the response carries GraphQL `errors`, yet
+/// still prints the whole body. When that body is a GraphQL response (a
+/// `data` or `errors` key) it is returned so the caller decides: a search
+/// skips inaccessible nodes, while `GhClient::graphql` still rejects any
+/// `errors`. A rate-limited response stays an error so it is retried.
+pub(crate) fn interpret_gh_output(
+    arguments: &[String],
+    exit_code: Option<i32>,
+    stdout: &str,
+    stderr: &str,
+) -> Result<String> {
+    if exit_code == Some(0) {
+        return Ok(stdout.to_string());
+    }
+    if arguments.get(1).map(String::as_str) == Some("graphql")
+        || arguments.get(2).map(String::as_str) == Some("graphql")
+    {
+        // `--include` puts response headers before the JSON body.
+        let body = split_included(stdout).map_or(stdout, |(_, body)| body);
+        let response = serde_json::from_str::<Value>(body).ok();
+        let graphql_body = response
+            .as_ref()
+            .is_some_and(|r| r.get("data").is_some() || r.get("errors").is_some());
+        let throttled = response
+            .as_ref()
+            .and_then(|r| r.get("errors"))
+            .and_then(Value::as_array)
+            .is_some_and(|errors| {
+                errors
+                    .iter()
+                    .any(|e| e.get("type").and_then(Value::as_str) == Some("RATE_LIMITED"))
+            });
+        let error = Error::GhCommand {
+            exit_code,
+            stderr: stderr.to_string(),
+        };
+        // A throttle stays an error so the retry/backoff path handles it.
+        if graphql_body && !throttled && !is_rate_limit(&error) {
+            return Ok(stdout.to_string());
+        }
+        return Err(error);
+    }
+    Err(Error::GhCommand {
+        exit_code,
+        stderr: stderr.to_string(),
+    })
+}
 
 impl GhTransport for GhCommandLine {
     fn run(&self, arguments: &[String]) -> Result<String> {
-        let output = Command::new("gh")
+        let mut child = Command::new(&self.program)
             .args(arguments)
-            .output()
+            .env("GH_PROMPT_DISABLED", "1")
+            .env_remove("GH_DEBUG")
+            .env_remove("DEBUG")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .map_err(|error| Error::GhUnavailable(format!("failed to run gh: {error}")))?;
-        if output.status.success() {
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        } else {
-            Err(Error::GhCommand {
-                exit_code: output.status.code(),
-                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-            })
-        }
+        let mut stdout = child.stdout.take().expect("stdout is piped");
+        let mut stderr = child.stderr.take().expect("stderr is piped");
+        let (out_tx, out_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = stdout.read_to_end(&mut buffer);
+            let _ = out_tx.send(buffer);
+        });
+        let (err_tx, err_rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = stderr.read_to_end(&mut buffer);
+            let _ = err_tx.send(buffer);
+        });
+        let deadline = Instant::now() + self.timeout;
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {}
+                Err(error) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(Error::GhUnavailable(format!(
+                        "failed to wait for gh: {error}"
+                    )));
+                }
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                // Not worded as a "timeout": a hung gh is not retried.
+                return Err(Error::GhCommand {
+                    exit_code: None,
+                    stderr: format!(
+                        "gh {} killed after {}s without finishing (set {GH_DEADLINE_ENV} to change)",
+                        arguments.first().map(String::as_str).unwrap_or_default(),
+                        self.timeout.as_secs()
+                    ),
+                });
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        // A grandchild can keep a pipe open after gh exits; do not wait on it.
+        let drain = |rx: &mpsc::Receiver<Vec<u8>>| {
+            rx.recv_timeout(Duration::from_secs(5))
+                .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+                .unwrap_or_default()
+        };
+        let stdout = drain(&out_rx);
+        let stderr = drain(&err_rx);
+        interpret_gh_output(arguments, status.code(), &stdout, &stderr)
     }
 }
 
@@ -170,7 +301,7 @@ pub fn split_included(raw: &str) -> Result<(Option<RateLimitHeaders>, &str)> {
 impl GhClient {
     /// Create a client over the real `gh` binary.
     pub fn new() -> Self {
-        Self::with_transport(Box::new(GhCommandLine))
+        Self::with_transport(Box::new(GhCommandLine::new()))
     }
 
     /// Create a client over a custom transport (fixtures in tests).
@@ -330,7 +461,12 @@ impl GhClient {
             format!("query={query}"),
         ];
         for (name, value) in variables {
-            arguments.push("-F".into());
+            // `-F` coerces `123`, `true`, `null` to JSON and reads `@file`;
+            // only variables the query declares Int or Boolean may use it.
+            let typed = ["Int", "Boolean"]
+                .iter()
+                .any(|kind| query.contains(&format!("${name}: {kind}")));
+            arguments.push(if typed { "-F" } else { "-f" }.into());
             arguments.push(format!("{name}={value}"));
         }
         arguments
@@ -564,24 +700,29 @@ fn is_rate_limit(error: &Error) -> bool {
     match error {
         Error::GhCommand { stderr, .. } => {
             let lowered = stderr.to_lowercase();
-            lowered.contains("rate limit") || lowered.contains("http 429")
+            lowered.contains("rate limit")
+                || lowered.contains("abuse detection")
+                || lowered.contains("http 429")
         }
         _ => false,
     }
 }
 
 /// Classify whether an error is worth retrying (throttles, transient failures).
+/// A 403 is retried only when it is a rate limit; SAML, permission and
+/// blocked-repository 403s are permanent and fail on the first attempt.
 fn is_retryable(error: &Error) -> bool {
     match error {
         Error::GhCommand { stderr, .. } => {
             let lowered = stderr.to_lowercase();
-            lowered.contains("secondary rate limit")
-                || lowered.contains("rate limit")
-                || lowered.contains("http 403")
-                || lowered.contains("http 429")
+            is_rate_limit(error)
                 || lowered.contains("http 5")
                 || lowered.contains("timeout")
-                || lowered.contains("connection")
+                || lowered.contains("timed out")
+                || lowered.contains("connection reset")
+                || lowered.contains("connection refused")
+                || lowered.contains("connection closed")
+                || lowered.contains("unexpected eof")
         }
         _ => false,
     }
@@ -935,5 +1076,229 @@ mod tests {
         ]);
         let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
         assert!(client.graphql("query {}", &[]).is_err());
+    }
+
+    fn gh_failure(stderr: &str) -> Result<String> {
+        Err(Error::GhCommand {
+            exit_code: Some(1),
+            stderr: stderr.into(),
+        })
+    }
+
+    #[test]
+    fn a_permanent_403_costs_one_attempt() {
+        for stderr in [
+            "HTTP 403: Resource protected by organization SAML enforcement.",
+            "HTTP 403: Must have admin rights to Repository.",
+            "HTTP 403: Repository access blocked",
+        ] {
+            let transport = FixtureTransport::new(vec![gh_failure(stderr), Ok("{}".into())]);
+            let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
+            assert!(client.rest("a").is_err(), "{stderr}");
+            assert_eq!(client.requests_issued(), 1, "{stderr}");
+        }
+    }
+
+    #[test]
+    fn throttles_and_transient_network_errors_are_retried() {
+        for stderr in [
+            "HTTP 403: You have exceeded a secondary rate limit.",
+            "HTTP 403: API rate limit exceeded for user ID 1.",
+            "HTTP 403: You have triggered an abuse detection mechanism.",
+            "HTTP 429: Too Many Requests",
+            "HTTP 502: Bad Gateway",
+            "Post \"https://api.github.com/graphql\": read: connection reset by peer",
+            "dial tcp: connect: connection refused",
+            "net/http: TLS handshake timeout",
+        ] {
+            let transport = FixtureTransport::new(vec![gh_failure(stderr), Ok("{}".into())]);
+            let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
+            client.rest("a").unwrap_or_else(|e| panic!("{stderr}: {e}"));
+            assert_eq!(client.requests_issued(), 2, "{stderr}");
+        }
+        // "connection" alone is not a transient signal.
+        let transport = FixtureTransport::new(vec![
+            gh_failure("GraphQL: Field 'connection' doesn't exist on type 'Query'"),
+            Ok("{}".into()),
+        ]);
+        let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
+        assert!(client.rest("a").is_err());
+        assert_eq!(client.requests_issued(), 1);
+    }
+
+    #[test]
+    fn string_variables_are_sent_raw_and_declared_ints_typed() {
+        let query = "query($owner: String!, $name: String!, $number: Int!, $flag: Boolean) { x }";
+        let arguments = GhClient::graphql_arguments(
+            query,
+            &[
+                ("owner", "123"),
+                ("name", "true"),
+                ("number", "42"),
+                ("flag", "false"),
+                ("cursor", "@etc/passwd"),
+                ("q", "null"),
+            ],
+        );
+        let expected: Vec<String> = [
+            "api",
+            "graphql",
+            "-f",
+            &format!("query={query}"),
+            "-f",
+            "owner=123",
+            "-f",
+            "name=true",
+            "-F",
+            "number=42",
+            "-F",
+            "flag=false",
+            "-f",
+            "cursor=@etc/passwd",
+            "-f",
+            "q=null",
+        ]
+        .iter()
+        .map(|a| a.to_string())
+        .collect();
+        assert_eq!(arguments, expected);
+    }
+
+    #[test]
+    fn a_graphql_exit_1_with_a_body_returns_the_body() {
+        let graphql = ["api".to_string(), "graphql".to_string()];
+        let partial =
+            r#"{"data":{"a":{"name":"githubdw"},"b":null},"errors":[{"type":"NOT_FOUND"}]}"#;
+        assert_eq!(
+            interpret_gh_output(&graphql, Some(1), partial, "gh: Could not resolve").unwrap(),
+            partial
+        );
+        // A body with errors and null data is also the caller's to classify.
+        let no_data = r#"{"data":null,"errors":[{"message":"bad cursor"}]}"#;
+        assert_eq!(
+            interpret_gh_output(&graphql, Some(1), no_data, "gh: bad cursor").unwrap(),
+            no_data
+        );
+        // With `--include`, headers precede the body.
+        let included = [
+            "api".to_string(),
+            "--include".to_string(),
+            "graphql".to_string(),
+        ];
+        let with_headers = format!("HTTP/2.0 200 OK\r\nX-Foo: 1\r\n\r\n{partial}");
+        assert_eq!(
+            interpret_gh_output(&included, Some(1), &with_headers, "").unwrap(),
+            with_headers
+        );
+        // Not a GraphQL body, a throttle, or a REST call: still an error.
+        for (arguments, stdout, stderr) in [
+            (&graphql[..], "", "HTTP 401: Bad credentials"),
+            (&graphql[..], r#"{"message":"Bad credentials"}"#, "HTTP 401"),
+            (
+                &graphql[..],
+                r#"{"errors":[{"type":"RATE_LIMITED","message":"slow"}]}"#,
+                "gh: slow",
+            ),
+            (
+                &graphql[..],
+                r#"{"data":null,"errors":[{"message":"x"}]}"#,
+                "HTTP 403: secondary rate limit",
+            ),
+            (
+                &["api".to_string(), "repos/a/b".to_string()][..],
+                partial,
+                "HTTP 404",
+            ),
+        ] {
+            match interpret_gh_output(arguments, Some(1), stdout, stderr) {
+                Err(Error::GhCommand {
+                    exit_code,
+                    stderr: got,
+                }) => {
+                    assert_eq!((exit_code, got.as_str()), (Some(1), stderr));
+                }
+                other => panic!("{stdout} / {stderr}: {other:?}"),
+            }
+        }
+    }
+
+    /// A `gh` stand-in: a shell script at a temp path.
+    #[cfg(unix)]
+    fn fake_gh(body: &str, timeout: Duration) -> (tempfile::TempDir, GhCommandLine) {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("gh");
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let gh = GhCommandLine {
+            program: path.into_os_string(),
+            timeout,
+        };
+        (dir, gh)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_transport_keeps_partial_data_from_an_exit_1() {
+        let (_dir, gh) = fake_gh(
+            r#"printf '%s' '{"data":{"a":{"name":"githubdw"},"b":null},"errors":[{"type":"NOT_FOUND"}]}'
+echo 'gh: Could not resolve to a Repository' >&2
+exit 1"#,
+            Duration::from_secs(30),
+        );
+        let mut client = GhClient::with_transport(Box::new(gh)).without_sleeping();
+        let (data, errors) = client
+            .graphql_search_with_errors("query { a b }", &[])
+            .unwrap();
+        assert_eq!(data["a"]["name"], "githubdw");
+        assert_eq!(errors.len(), 1);
+        // The strict path still refuses any errors, without a retry.
+        assert!(matches!(
+            client.graphql("query { a b }", &[]),
+            Err(Error::GitHubApi(_))
+        ));
+        assert_eq!(client.requests_issued(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_gh_is_killed_at_the_deadline() {
+        let (_dir, gh) = fake_gh("exec sleep 30", Duration::from_millis(300));
+        let started = Instant::now();
+        let error = gh.run(&["api".into(), "graphql".into()]).unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        match &error {
+            Error::GhCommand { exit_code, stderr } => {
+                assert_eq!(*exit_code, None);
+                assert!(stderr.contains("killed after 0s"), "{stderr}");
+                assert!(stderr.contains(GH_DEADLINE_ENV), "{stderr}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(!is_retryable(&error), "a hung gh is not retried");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gh_runs_without_prompts_or_debug_output() {
+        let (_dir, gh) = fake_gh(
+            r#"printf '%s|%s|%s' "${GH_PROMPT_DISABLED-unset}" "${GH_DEBUG-unset}" "${DEBUG-unset}""#,
+            Duration::from_secs(30),
+        );
+        // SAFETY: no other test reads or writes GH_DEBUG or DEBUG.
+        unsafe {
+            std::env::set_var("GH_DEBUG", "api");
+            std::env::set_var("DEBUG", "1");
+        }
+        let stdout = gh.run(&["version".into()]);
+        unsafe {
+            std::env::remove_var("GH_DEBUG");
+            std::env::remove_var("DEBUG");
+        }
+        assert_eq!(stdout.unwrap(), "1|unset|unset");
     }
 }

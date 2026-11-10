@@ -26,6 +26,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `WITH x AS (SELECT 1) DELETE FROM ...` ran. It also rejected a `;` inside a
   string literal.
 
+- `gh api graphql` exits 1 when a response carries partial `errors` but
+  still prints the data. That data is now kept, so a search with one
+  SAML-protected or missing node stores the rest instead of failing.
+  Rate-limited responses still go through retry and backoff.
+- A hung `gh` is killed after 120 seconds with a clear error
+  (`GITHUBDW_GH_DEADLINE_SECS` changes the limit). `gh` now runs with
+  `GH_PROMPT_DISABLED=1` and without `GH_DEBUG`/`DEBUG`, so request headers
+  never reach stored error text.
+- A permanent HTTP 403 (SAML, permissions, blocked repository) fails on the
+  first attempt instead of seven. Only rate-limit 403s and specific
+  transient network errors are retried.
+- GraphQL string variables are passed with `-f`, so a login or repository
+  named `123`, `true` or `null` reaches GitHub as a string and `@x` is never
+  read as a file. Only variables the query declares `Int` or `Boolean` use
+  `-F`.
+
 ### Removed
 
 - The unused `live-tests` Cargo feature.
