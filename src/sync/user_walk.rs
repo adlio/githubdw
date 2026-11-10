@@ -199,15 +199,22 @@ impl Syncer<'_> {
             if let Some(cursor) = page_cursor.as_deref() {
                 variables.push(("cursor", cursor));
             }
-            let data = match self.client.graphql_search(&query, &variables) {
-                Ok(data) => data,
+            let (data, errors) = match self.client.graphql_search_with_errors(&query, &variables) {
+                Ok(answer) => answer,
                 Err(error) if page_size > 1 && error.is_page_size_symptom() => {
                     page_size = (page_size / 2).max(1);
                     continue;
                 }
                 Err(error) => return Err(error),
             };
-            let page = user_search::parse_user_search_page(&data)?;
+            let page = match user_search::parse_user_search_page(&data, &errors) {
+                Ok(page) => page,
+                Err(error) if page_size > 1 && error.is_page_size_symptom() => {
+                    page_size = (page_size / 2).max(1);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             summary.pages_fetched += 1;
 
             if first_page {
@@ -268,8 +275,9 @@ impl Syncer<'_> {
                 }
             }
             first_page = false;
+            note_inaccessible(login, role, &page, summary);
 
-            let page_is_empty = page.items.is_empty();
+            let page_is_empty = page.items.is_empty() && page.inaccessible.is_empty();
             for item in &page.items {
                 // Strict comparison, exactly as the repository walk does it: an
                 // item updated in the same second as the cursor may have missed
@@ -423,19 +431,21 @@ impl Syncer<'_> {
                 search_timestamp(start)?,
                 search_timestamp(end)?,
             );
-            let data = loop {
-                match self.client.graphql_search(
-                    &user_search::user_pull_requests_query(page_size),
-                    &[("q", expression.as_str())],
-                ) {
-                    Ok(data) => break data,
+            let page = loop {
+                let query = user_search::user_pull_requests_query(page_size);
+                let answer = self
+                    .client
+                    .graphql_search_with_errors(&query, &[("q", expression.as_str())]);
+                match answer
+                    .and_then(|(data, errors)| user_search::parse_user_search_page(&data, &errors))
+                {
+                    Ok(page) => break page,
                     Err(error) if page_size > 1 && error.is_page_size_symptom() => {
                         page_size = (page_size / 2).max(1)
                     }
                     Err(error) => return Err(error),
                 }
             };
-            let page = user_search::parse_user_search_page(&data)?;
             summary.pages_fetched += 1;
             if page.total_count > i64::from(page_size) || page.has_next_page {
                 if start == end {
@@ -454,7 +464,7 @@ impl Syncer<'_> {
                 // differ. Ingest every returned node from a complete page, even
                 // if newer than the query window; only the frozen search bound
                 // is committed, so later updates remain eligible next time.
-                if page.total_count != page.items.len() as i64
+                if page.total_count != (page.items.len() + page.inaccessible.len()) as i64
                     || page.items.iter().any(|item| {
                         item.pull_request
                             .updated_at
@@ -469,6 +479,7 @@ impl Syncer<'_> {
                     ));
                     return Ok(());
                 }
+                note_inaccessible(login, role, &page, summary);
                 let failures_before = summary.failed.len();
                 for item in &page.items {
                     let repo_key = repository::upsert_repository(
@@ -545,5 +556,22 @@ impl Syncer<'_> {
             ));
         }
         Ok(())
+    }
+}
+
+/// Count the nodes a page could not show and say why. They are not retryable,
+/// so they are neither stored nor failures and never hold the cursor back.
+fn note_inaccessible(
+    login: &str,
+    role: UserRole,
+    page: &user_search::UserSearchPage,
+    summary: &mut SyncSummary,
+) {
+    for message in &page.inaccessible {
+        summary.skipped += 1;
+        summary.notes.push(format!(
+            "{login} ({}): skipped a pull request GitHub would not show: {message}",
+            role.qualifier()
+        ));
     }
 }

@@ -17,5 +17,6 @@ mod lock;
 mod plan;
 mod repo_walk;
 mod targets;
+mod user_saml;
 mod user_walk;
 mod user_windows;

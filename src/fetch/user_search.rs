@@ -24,6 +24,7 @@
 use serde_json::Value;
 
 use super::pull_requests::{PullRequestData, RepositoryMetadata, parse_pull_request_node};
+use super::{is_inaccessible, node_index};
 use crate::error::{Error, Result};
 
 /// GitHub's hard ceiling on results per search query, regardless of match count.
@@ -124,6 +125,9 @@ pub struct UserSearchPage {
     /// [`SEARCH_RESULT_CAP`], which is exactly the case the caller must split.
     pub total_count: i64,
     pub items: Vec<SearchedPullRequest>,
+    /// Matches the provider would not show (SAML, forbidden, not found): the
+    /// error message of each. Expected skips, never stored, never failures.
+    pub inaccessible: Vec<String>,
     pub has_next_page: bool,
     pub end_cursor: Option<String>,
 }
@@ -136,8 +140,29 @@ impl UserSearchPage {
     }
 }
 
-/// Parse one page of the user search response (the `data` value).
-pub fn parse_user_search_page(data: &Value) -> Result<UserSearchPage> {
+/// Parse one page of the user search response: the `data` value and any
+/// GraphQL `errors` that came with it. An error that points at one search node
+/// and marks it inaccessible (the same rule the collection path uses) skips
+/// that node; any other error fails the page.
+pub fn parse_user_search_page(data: &Value, errors: &[Value]) -> Result<UserSearchPage> {
+    let mut skipped: std::collections::BTreeMap<usize, String> = Default::default();
+    let mut fatal = Vec::new();
+    for error in errors {
+        let message = error
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown GraphQL error")
+            .to_string();
+        match node_index(error) {
+            Some(index) if is_inaccessible(error) => {
+                skipped.insert(index, message);
+            }
+            _ => fatal.push(message),
+        }
+    }
+    if !fatal.is_empty() {
+        return Err(Error::GitHubApi(fatal.join("; ")));
+    }
     let search = data
         .get("search")
         .filter(|value| !value.is_null())
@@ -154,7 +179,10 @@ pub fn parse_user_search_page(data: &Value) -> Result<UserSearchPage> {
         .get("nodes")
         .and_then(Value::as_array)
         .ok_or_else(|| Error::GitHubApi("search has no nodes array".into()))?;
-    for node in nodes {
+    for (index, node) in nodes.iter().enumerate() {
+        if skipped.contains_key(&index) {
+            continue;
+        }
         // `type: ISSUE` also matches issues; `is:pr` filters them out, and an
         // issue that slips through answers the `... on PullRequest` fragment
         // with an EMPTY object, which is skipped. A null node or a node that
@@ -179,6 +207,7 @@ pub fn parse_user_search_page(data: &Value) -> Result<UserSearchPage> {
     Ok(UserSearchPage {
         total_count,
         items,
+        inaccessible: skipped.into_values().collect(),
         has_next_page,
         end_cursor,
     })
@@ -259,7 +288,7 @@ mod tests {
 
     #[test]
     fn parses_page_with_per_node_repository() {
-        let page = parse_user_search_page(&search_response(2, &[7, 8])).unwrap();
+        let page = parse_user_search_page(&search_response(2, &[7, 8]), &[]).unwrap();
         assert_eq!(page.total_count, 2);
         assert_eq!(page.items.len(), 2);
         assert_eq!(page.items[0].repository.name_with_owner, "acme/widgets");
@@ -272,7 +301,7 @@ mod tests {
     /// reach every result — the caller has to narrow the window.
     #[test]
     fn reports_when_matches_exceed_the_cap() {
-        let page = parse_user_search_page(&search_response(4200, &[1])).unwrap();
+        let page = parse_user_search_page(&search_response(4200, &[1]), &[]).unwrap();
         assert!(page.exceeds_result_cap());
     }
 
@@ -285,7 +314,7 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(json!({}));
-        let page = parse_user_search_page(&response).unwrap();
+        let page = parse_user_search_page(&response, &[]).unwrap();
         assert_eq!(page.items.len(), 1);
     }
 
@@ -296,11 +325,11 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(Value::Null);
-        assert!(parse_user_search_page(&response).is_err(), "null node");
+        assert!(parse_user_search_page(&response, &[]).is_err(), "null node");
         let mut response = search_response(1, &[7]);
         response["search"]["nodes"][0]["reviews"] = Value::Null;
         assert!(
-            parse_user_search_page(&response).is_err(),
+            parse_user_search_page(&response, &[]).is_err(),
             "null connection"
         );
         let mut response = search_response(1, &[7]);
@@ -308,6 +337,6 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("number");
-        assert!(parse_user_search_page(&response).is_err(), "no number");
+        assert!(parse_user_search_page(&response, &[]).is_err(), "no number");
     }
 }
