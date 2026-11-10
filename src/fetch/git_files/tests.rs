@@ -8,14 +8,27 @@ fn git_records(fixture: &FixtureRepo) -> Vec<GitFile> {
     fixture.records()
 }
 
-fn served_from(git: &[GitFile], count: usize) -> (Vec<FileDiffData>, PatchListing) {
+/// The fixture's totals, hard-coded from the recipe in `test_repo`.
+const FIXTURE_TOTALS: ProviderTotals = ProviderTotals {
+    changed_files: test_repo::TOTAL_FILES,
+    additions: test_repo::TOTAL_ADDITIONS,
+    deletions: test_repo::TOTAL_DELETIONS,
+};
+
+/// The first `count` fixture records as GitHub serves them. Change type
+/// and line counts come from the recipe, not from `git_lines`.
+fn served_from(
+    git: &[GitFile],
+    count: usize,
+    recipe: fn(&str) -> (&'static str, i64, i64),
+) -> (Vec<FileDiffData>, PatchListing) {
     let files = git[..count]
         .iter()
         .map(|file| {
-            let (additions, deletions) = git_lines(file);
+            let (change_type, additions, deletions) = recipe(&file.path);
             FileDiffData {
                 path: file.path.clone(),
-                change_type: change_type_for(file.status).into(),
+                change_type: change_type.into(),
                 additions,
                 deletions,
             }
@@ -38,17 +51,11 @@ fn served_from(git: &[GitFile], count: usize) -> (Vec<FileDiffData>, PatchListin
     (files, listing)
 }
 
-fn totals_of(git: &[GitFile]) -> ProviderTotals {
-    ProviderTotals {
-        changed_files: git.len() as i64,
-        additions: git.iter().map(|f| git_lines(f).0).sum(),
-        deletions: git.iter().map(|f| git_lines(f).1).sum(),
-    }
-}
-
-pub(crate) fn pull_request_for(git: &[GitFile], served: usize, head: &str) -> PullRequestData {
-    let totals = totals_of(git);
-    let (files, _) = served_from(git, served);
+pub(crate) fn pull_request_for(
+    files: Vec<FileDiffData>,
+    totals: ProviderTotals,
+    head: &str,
+) -> PullRequestData {
     PullRequestData {
         number: 7,
         title: None,
@@ -142,6 +149,24 @@ fn git_records_cover_every_path_with_renames_binary_and_hostile_names() {
 }
 
 #[test]
+fn git_records_match_the_recipe_and_hand_counted_totals() {
+    let git = git_records(&test_repo::build());
+    assert_eq!(git.len() as i64, test_repo::TOTAL_FILES);
+    let (mut additions, mut deletions) = (0, 0);
+    for file in &git {
+        let (change_type, adds, dels) = test_repo::recipe(&file.path);
+        assert_eq!(change_type_for(file.status), change_type, "{:?}", file.path);
+        assert_eq!(git_lines(file), (adds, dels), "{:?}", file.path);
+        additions += adds;
+        deletions += dels;
+    }
+    assert_eq!(
+        (additions, deletions),
+        (test_repo::TOTAL_ADDITIONS, test_repo::TOTAL_DELETIONS)
+    );
+}
+
+#[test]
 fn unrelated_history_requires_exact_error_and_all_added_totals() {
     let fixture = test_repo::build();
     let (git, _) = diff_files(
@@ -152,9 +177,13 @@ fn unrelated_history_requires_exact_error_and_all_added_totals() {
         false,
     )
     .unwrap();
-    let totals = totals_of(&git);
-    let pr = pull_request_for(&git, 3000, &fixture.head);
-    let (_, listing) = served_from(&git, 3000);
+    let totals = ProviderTotals {
+        changed_files: test_repo::ALL_ADDED_FILES,
+        additions: test_repo::ALL_ADDED_ADDITIONS,
+        deletions: 0,
+    };
+    let (files, listing) = served_from(&git, 3000, test_repo::recipe_all_added);
+    let pr = pull_request_for(files, totals, &fixture.head);
     let attempt = |message: String, input: &PullRequestData, total: ProviderTotals| {
         let mut replies = rest_fixtures(&fixture, total);
         replies[1] = Err(Error::GhCommand {
@@ -203,10 +232,10 @@ fn unrelated_history_requires_exact_error_and_all_added_totals() {
 fn capped_listing_is_completed_exactly_and_failures_close() {
     let fixture = test_repo::build();
     let git = git_records(&fixture);
-    let totals = totals_of(&git);
+    let totals = FIXTURE_TOTALS;
     let served = 3000;
-    let pull_request = pull_request_for(&git, served, &fixture.head);
-    let (_, listing) = served_from(&git, served);
+    let (files, listing) = served_from(&git, served, test_repo::recipe);
+    let pull_request = pull_request_for(files, totals, &fixture.head);
 
     let mut ok_client = client(rest_fixtures(&fixture, totals));
     let set = recover_pull_request_files(
@@ -401,8 +430,20 @@ fn served_zero_without_patch_takes_git_counts_only_under_the_totals_proof() {
 
 #[test]
 fn totals_reconcile_ignores_a_transient_zero_and_rejects_disagreement() {
-    let mut pr =
-        super::tests::pull_request_for(&[git_file("a", 'A', Some((2, 1)))], 1, &"a".repeat(40));
+    let mut pr = super::tests::pull_request_for(
+        vec![FileDiffData {
+            path: "a".into(),
+            change_type: "ADDED".into(),
+            additions: 2,
+            deletions: 1,
+        }],
+        ProviderTotals {
+            changed_files: 1,
+            additions: 2,
+            deletions: 1,
+        },
+        &"a".repeat(40),
+    );
     let rest = |files: i64, a: i64, d: i64| json!({"changed_files": files, "additions": a, "deletions": d});
     assert_eq!(
         reconcile_totals(&pr, &rest(0, 0, 0)).unwrap().changed_files,
@@ -514,4 +555,18 @@ fn output_written_after_git_exits_is_still_collected() {
     )
     .unwrap();
     assert_eq!(output, b"late");
+}
+
+// The hand-written recipe must refuse a path it does not describe, so a
+// served file the recipe never wrote fails loudly instead of being counted.
+#[test]
+#[should_panic(expected = "the recipe never writes")]
+fn recipe_refuses_a_path_it_never_writes() {
+    test_repo::recipe("not/in/recipe.txt");
+}
+
+#[test]
+#[should_panic(expected = "not in the head tree")]
+fn all_added_recipe_refuses_a_path_outside_head() {
+    test_repo::recipe_all_added("not/in/head.txt");
 }

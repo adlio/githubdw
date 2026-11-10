@@ -7,26 +7,21 @@ fn capped_pages(
     rest_additions_offset: i64,
     fixture: &test_repo::FixtureRepo,
 ) -> Vec<String> {
-    let lines = |file: &GitFile| file.lines.unwrap_or((0, 0));
-    let change = |file: &GitFile| match file.status {
-        'A' => "ADDED",
-        'D' => "DELETED",
-        'R' => "RENAMED",
-        _ => "MODIFIED",
-    };
-    let additions: i64 = git.iter().map(|f| lines(f).0).sum();
-    let deletions: i64 = git.iter().map(|f| lines(f).1).sum();
+    // Totals and per-file facts come from the fixture recipe, never from
+    // the git output the code under test also reads.
+    let (additions, deletions) = (test_repo::TOTAL_ADDITIONS, test_repo::TOTAL_DELETIONS);
     let mut node = pr_node(5, "2026-01-05T18:00:00Z", "2026-01-08T09:00:00Z");
     node["id"] = json!("PR_5");
     node["title"] = json!("refreshed title");
-    node["changedFiles"] = json!(git.len());
+    node["changedFiles"] = json!(test_repo::TOTAL_FILES);
     node["additions"] = json!(additions);
     node["deletions"] = json!(deletions);
     let served: Vec<_> = git[..3000]
         .iter()
         .map(|f| {
-            json!({"path": f.path, "changeType": change(f),
-                        "additions": lines(f).0, "deletions": lines(f).1})
+            let (change_type, adds, dels) = test_repo::recipe(&f.path);
+            json!({"path": f.path, "changeType": change_type,
+                        "additions": adds, "deletions": dels})
         })
         .collect();
     node["files"] = json!({"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": served});
@@ -47,7 +42,7 @@ fn capped_pages(
     }
     pages.push(
         json!({"base": {"sha": fixture.base}, "head": {"sha": fixture.head},
-               "changed_files": git.len(), "additions": additions + rest_additions_offset,
+               "changed_files": test_repo::TOTAL_FILES, "additions": additions + rest_additions_offset,
                "deletions": deletions})
         .to_string(),
     );
@@ -74,7 +69,7 @@ fn refresh_pr5_recovering(
 fn capped_listing_is_completed_from_git_and_stale_rows_pruned_atomically() {
     let fixture = test_repo::build();
     let git = fixture.records();
-    assert!(git.len() > 3000);
+    assert_eq!(git.len() as i64, test_repo::TOTAL_FILES);
     let warehouse = warehouse_with_abc_and_unrelated();
     let conn = warehouse.connection();
     // A prior revision stored the rename source as its own file. It must
@@ -113,7 +108,7 @@ fn capped_listing_is_completed_from_git_and_stale_rows_pruned_atomically() {
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )
         .unwrap();
-    assert_eq!(changed, git.len() as i64);
+    assert_eq!(changed, test_repo::TOTAL_FILES);
     assert_eq!(previous.as_deref(), Some("old name/basename.rs"));
     assert_eq!(tail_patch, git.last().unwrap().patch, "tail patch from git");
     assert_eq!(title_of(conn, "octocat/hello#5"), "refreshed title");
