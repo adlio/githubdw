@@ -297,3 +297,72 @@ fn raw_query_is_select_only() {
     assert!(raw_query(conn, "DELETE FROM fact_pull_requests").is_err());
     assert!(raw_query(conn, "SELECT 1; DROP TABLE issues").is_err());
 }
+
+fn pr_count(conn: &Connection) -> i64 {
+    conn.query_row("SELECT COUNT(*) FROM fact_pull_requests", [], |r| r.get(0))
+        .unwrap()
+}
+
+#[test]
+fn raw_query_refuses_writes_hidden_behind_with() {
+    let warehouse = GithubDW::open_in_memory().unwrap();
+    seed(&warehouse);
+    let conn = warehouse.connection();
+    for sql in [
+        "WITH x AS (SELECT 1) DELETE FROM fact_pull_requests",
+        "WITH x AS (SELECT 1) INSERT INTO config (key, value) SELECT 'k', 'v' FROM x",
+        "  \n\tDELETE FROM fact_pull_requests",
+        "select 1; delete from fact_pull_requests",
+        "PRAGMA user_version = 7",
+        "CREATE TABLE evil (a)",
+        "",
+    ] {
+        assert!(raw_query(conn, sql).is_err(), "should refuse: {sql:?}");
+    }
+    assert_eq!(pr_count(conn), 3, "no row was deleted");
+}
+
+#[test]
+fn raw_query_allows_read_only_forms() {
+    let warehouse = GithubDW::open_in_memory().unwrap();
+    seed(&warehouse);
+    let conn = warehouse.connection();
+    let rows = raw_query(conn, "SELECT ';' AS s").unwrap();
+    assert_eq!(rows[0]["s"], serde_json::Value::from(";"));
+    let rows = raw_query(conn, "SELECT 1 AS n;").unwrap();
+    assert_eq!(rows[0]["n"], serde_json::Value::from(1));
+    let rows = raw_query(
+        conn,
+        "WITH m AS (SELECT pr_key FROM fact_pull_requests WHERE state = 'MERGED') SELECT COUNT(*) AS n FROM m",
+    )
+    .unwrap();
+    assert_eq!(rows[0]["n"], serde_json::Value::from(2));
+}
+
+#[test]
+fn empty_groups_match_no_pull_requests() {
+    let warehouse = GithubDW::open_in_memory().unwrap();
+    seed(&warehouse);
+    let conn = warehouse.connection();
+    crate::groups::create_group(conn, crate::groups::GroupKind::User, "nobody", None).unwrap();
+    crate::groups::create_group(conn, crate::groups::GroupKind::Repo, "norepos", None).unwrap();
+    for name in ["nobody", "norepos"] {
+        let filters = PrFilters {
+            group: Some(name.into()),
+            ..Default::default()
+        };
+        assert_eq!(filters.builder(conn).unwrap().count().unwrap(), 0, "{name}");
+    }
+    // Direct builder use: an empty list is a filter that matches nothing.
+    assert_eq!(QueryBuilder::new(conn).authors(&[]).count().unwrap(), 0);
+    assert_eq!(QueryBuilder::new(conn).repos(&[]).count().unwrap(), 0);
+    // No filter at all stays unfiltered; a non-empty list still filters (alice has 2 of 3).
+    assert_eq!(QueryBuilder::new(conn).count().unwrap(), 3);
+    assert_eq!(
+        QueryBuilder::new(conn)
+            .authors(&["alice".into()])
+            .count()
+            .unwrap(),
+        2
+    );
+}

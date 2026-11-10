@@ -233,7 +233,7 @@ impl<'a> MetricsEngine<'a> {
         )?;
         let prs_merged = self.split_measure(
             "fact_pull_requests p",
-            "p.created_date_key",
+            "p.merged_date_key",
             &format!("AND p.author_key IN ({placeholders}) AND p.state = 'MERGED'"),
             "1",
             &user_parameter,
@@ -384,7 +384,7 @@ impl<'a> MetricsEngine<'a> {
         )?;
         let prs_merged = self.split_measure(
             "fact_pull_requests p",
-            "p.created_date_key",
+            "p.merged_date_key",
             "AND p.repo_key = ? AND p.state = 'MERGED'",
             "1",
             &repo_parameter,
@@ -468,7 +468,7 @@ impl<'a> MetricsEngine<'a> {
         let top_mergers = self.leaderboard(
             "p.author_key",
             "fact_pull_requests p",
-            "p.created_date_key",
+            "p.merged_date_key",
             "AND p.repo_key = ? AND p.state = 'MERGED'",
             &repo_parameter,
             &windows,
@@ -535,7 +535,7 @@ impl<'a> MetricsEngine<'a> {
         )?;
         let prs_merged = self.split_measure(
             "fact_pull_requests p",
-            "p.created_date_key",
+            "p.merged_date_key",
             &format!("AND p.author_key IN ({placeholders}) AND p.state = 'MERGED'"),
             "1",
             &member_parameters,
@@ -590,7 +590,7 @@ impl<'a> MetricsEngine<'a> {
         )?;
         let prs_merged = self.split_measure(
             "fact_pull_requests p",
-            "p.created_date_key",
+            "p.merged_date_key",
             &format!("AND p.repo_key IN ({placeholders}) AND p.state = 'MERGED'"),
             "1",
             &repo_parameters,

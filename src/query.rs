@@ -168,6 +168,9 @@ pub struct QueryBuilder<'a> {
     authors: Vec<String>,
     reviewers: Vec<String>,
     repos: Vec<String>,
+    /// Set when `authors`/`repos` is given an empty list: the filter was
+    /// supplied and nothing satisfies it, so the query must return no rows.
+    match_nothing: bool,
     orgs: Vec<String>,
     states: Vec<String>,
     labels: Vec<String>,
@@ -185,6 +188,7 @@ impl<'a> QueryBuilder<'a> {
             authors: Vec::new(),
             reviewers: Vec::new(),
             repos: Vec::new(),
+            match_nothing: false,
             orgs: Vec::new(),
             states: Vec::new(),
             labels: Vec::new(),
@@ -203,6 +207,7 @@ impl<'a> QueryBuilder<'a> {
     }
 
     pub fn authors(mut self, logins: &[String]) -> Self {
+        self.match_nothing |= logins.is_empty();
         for login in logins {
             let keys = resolve_entity_keys(self.connection, login);
             self.authors.extend(keys);
@@ -222,6 +227,7 @@ impl<'a> QueryBuilder<'a> {
     }
 
     pub fn repos(mut self, names: &[String]) -> Self {
+        self.match_nothing |= names.is_empty();
         self.repos.extend(names.iter().map(|n| n.to_lowercase()));
         self
     }
@@ -305,6 +311,9 @@ impl<'a> QueryBuilder<'a> {
             parameters.extend(values.iter().map(|v| SqlValue::Text(v.clone())));
         };
 
+        if self.match_nothing {
+            conditions.push("0 = 1".into());
+        }
         add_in_clause(
             "p.author_key",
             &self.authors,
@@ -632,13 +641,21 @@ impl PrFilters {
     }
 }
 
-/// Run an arbitrary read-only SELECT; returns rows as JSON objects.
+/// Run one read-only statement; returns rows as JSON objects.
+///
+/// SQLite decides what is read-only (`Statement::readonly`), not the first
+/// keyword: `WITH x AS (...) DELETE ...` is refused, and a `;` inside a string
+/// literal is fine. `prepare` itself refuses a second statement.
 pub fn raw_query(
     connection: &Connection,
     sql: &str,
 ) -> Result<Vec<serde_json::Map<String, serde_json::Value>>> {
-    validate_select_only(sql)?;
     let mut statement = connection.prepare(sql)?;
+    if !statement.readonly() {
+        return Err(Error::InvalidArgument(
+            "only read-only queries are allowed".into(),
+        ));
+    }
     let column_names: Vec<String> = statement
         .column_names()
         .iter()
@@ -663,28 +680,6 @@ pub fn raw_query(
         rows_out.push(object);
     }
     Ok(rows_out)
-}
-
-/// Reject anything that is not a single SELECT statement.
-pub fn validate_select_only(sql: &str) -> Result<()> {
-    let trimmed = sql.trim_start();
-    let first_token = trimmed
-        .split_whitespace()
-        .next()
-        .unwrap_or_default()
-        .to_uppercase();
-    if first_token != "SELECT" && first_token != "WITH" {
-        return Err(Error::InvalidArgument(
-            "only SELECT queries are allowed".into(),
-        ));
-    }
-    // Reject multiple statements.
-    if trimmed.trim_end().trim_end_matches(';').contains(';') {
-        return Err(Error::InvalidArgument(
-            "multiple statements are not allowed".into(),
-        ));
-    }
-    Ok(())
 }
 
 #[cfg(test)]
