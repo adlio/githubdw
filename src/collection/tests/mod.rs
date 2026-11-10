@@ -2,7 +2,7 @@
 //! files.
 
 mod edges;
-mod fake;
+pub(crate) mod fake;
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;

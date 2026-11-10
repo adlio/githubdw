@@ -33,7 +33,7 @@ use crate::storage::time_dimension;
 
 mod light;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use light::{LightPullRequest, light_search_query};
 

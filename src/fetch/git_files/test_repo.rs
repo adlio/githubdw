@@ -172,3 +172,56 @@ impl FixtureRepo {
         MODIFIED + 100 + 100 + HOSTILE.len() + 2 + 1
     }
 }
+
+/// Totals counted by hand from the recipe in [`build`], never from git
+/// output: 3,050 modified (+1 each), 100 deleted (-1 each), 100 added
+/// (+1), 7 hostile adds (+1), an exact rename (0), a rename with one
+/// added line (+1) and a binary edit (no text lines).
+pub const TOTAL_FILES: i64 = 3260;
+pub const TOTAL_ADDITIONS: i64 = 3158;
+pub const TOTAL_DELETIONS: i64 = 100;
+
+/// What the recipe says a path is: GraphQL change type, additions,
+/// deletions. Written from the recipe by hand; panics on a path the
+/// recipe never writes.
+pub fn recipe(path: &str) -> (&'static str, i64, i64) {
+    if let Some(index) = path
+        .strip_prefix("d/f")
+        .and_then(|rest| rest.strip_suffix(".txt"))
+    {
+        let index: usize = index.parse().unwrap();
+        return if index < MODIFIED {
+            ("MODIFIED", 1, 0)
+        } else {
+            ("DELETED", 0, 1)
+        };
+    }
+    match path {
+        p if p.starts_with("new/n") => ("ADDED", 1, 0),
+        p if HOSTILE.contains(&p) => ("ADDED", 1, 0),
+        "elsewhere/moved2.txt" => ("RENAMED", 0, 0),
+        "new dir/basename.rs" => ("RENAMED", 1, 0),
+        "bin.dat" => ("MODIFIED", 0, 0),
+        other => panic!("the recipe never writes {other:?}"),
+    }
+}
+
+/// The same for a diff from the empty tree to head: every file in the
+/// head tree is added. Head holds 3,050 two-line modified files, 100
+/// one-line adds, 7 hostile files, both renamed files (40 and 41 lines),
+/// the binary and `.gitattributes` (1 line): 3,161 files, 6,289 lines.
+pub const ALL_ADDED_FILES: i64 = 3161;
+pub const ALL_ADDED_ADDITIONS: i64 = 6289;
+
+pub fn recipe_all_added(path: &str) -> (&'static str, i64, i64) {
+    let lines = match path {
+        ".gitattributes" => 1,
+        "bin.dat" => 0,
+        "elsewhere/moved2.txt" => 40,
+        "new dir/basename.rs" => 41,
+        p if p.starts_with("new/n") || HOSTILE.contains(&p) => 1,
+        p if p.starts_with("d/f") => 2,
+        other => panic!("not in the head tree: {other:?}"),
+    };
+    ("ADDED", lines, 0)
+}

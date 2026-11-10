@@ -250,35 +250,68 @@ fn user_cursor_does_not_advance_past_a_failed_upsert() {
 /// prolific contributor's backfill is complete rather than truncated.
 #[test]
 fn a_window_over_the_result_cap_is_split() {
-    let warehouse = los_angeles_warehouse();
-    let transport = FixtureTransport::new(vec![
-        // author, 2026-08-13..2026-08-15: more matches than search serves
-        Ok(search_response(
-            2500,
-            vec![search_node(
-                1,
+    use crate::collection::tests::fake::{FakeGitHub, FakePr};
+
+    // 400 + 650 + 300 PRs created on the 13th, 14th and 15th, plus one
+    // just before and one just after the window. The 13th..14th half holds
+    // 1,050, so it must split again.
+    let mut prs = Vec::new();
+    let mut number = 0;
+    let mut add = |count: usize, created: &str| {
+        for _ in 0..count {
+            number += 1;
+            prs.push(FakePr::new(
                 "acme/widgets",
-                "2026-08-14T18:00:00Z",
-                "2026-08-15T09:00:00Z",
-            )],
-        )),
-        // first half (08-13..08-14) and second half (08-15..08-15)
-        Ok(search_page("acme/widgets", &[1])),
-        Ok(search_page("acme/widgets", &[2])),
-        // reviewed-by, whole window, under the cap
-        Ok(search_page("acme/widgets", &[3])),
-    ]);
-    let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
+                number,
+                "octocat",
+                created,
+                created,
+            ));
+        }
+    };
+    add(400, "2026-08-13T12:00:00Z");
+    add(650, "2026-08-14T12:00:00Z");
+    add(300, "2026-08-15T12:00:00Z");
+    add(1, "2026-08-12T23:59:59Z");
+    add(1, "2026-08-16T00:00:00Z");
+    let fake = FakeGitHub::new(prs);
+
+    let warehouse = los_angeles_warehouse();
+    let mut client = fake.client();
     let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
     let summary = syncer
         .sync_user("octocat", &fast_user_options(Some(3)))
         .unwrap();
 
-    assert_eq!(summary.pages_fetched, 4);
+    // The author search asks for exactly these ranges, in this order: the
+    // whole window, then bisection. The ranges tile 13th..15th with no gap
+    // and no overlap. The reviewer search fits in one query.
+    let mut queries = fake.requests().queries;
+    queries.dedup(); // later pages of a query repeat its text
     assert_eq!(
-        summary.pull_requests_synced, 3,
-        "only the split halves are ingested; the over-cap query is abandoned before work"
+        queries,
+        [
+            "is:pr author:octocat created:2026-08-13..2026-08-15 sort:updated-desc",
+            "is:pr author:octocat created:2026-08-13..2026-08-14 sort:updated-desc",
+            "is:pr author:octocat created:2026-08-13..2026-08-13 sort:updated-desc",
+            "is:pr author:octocat created:2026-08-14..2026-08-14 sort:updated-desc",
+            "is:pr author:octocat created:2026-08-15..2026-08-15 sort:updated-desc",
+            "is:pr reviewed-by:octocat created:2026-08-13..2026-08-15 sort:updated-desc",
+        ]
     );
+
+    // Every PR in the window lands exactly once; neither outsider does.
+    assert_eq!(summary.pull_requests_synced, 1350);
+    let (rows, distinct): (i64, i64) = warehouse
+        .connection()
+        .query_row(
+            "SELECT COUNT(*), COUNT(DISTINCT pr_key) FROM fact_pull_requests",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((rows, distinct), (1350, 1350));
+    assert!(!summary.partial);
     assert!(
         summary.notes.is_empty(),
         "a window that could be narrowed needs no caveat"

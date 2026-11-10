@@ -247,91 +247,92 @@ fn seed_comments(warehouse: &GithubDW) {
     .unwrap();
 }
 
-/// The comment source as it was before it was restricted per branch: every
-/// comment, unioned, then joined to the pull requests to filter by repository.
-/// Kept as the reference the restricted shape must agree with.
-const LEGACY_COMMENTS: &str =
-    "(SELECT author_key, pr_key, created_date_key FROM fact_review_comments
-      UNION ALL
-      SELECT author_key, parent_key AS pr_key, created_date_key
-      FROM fact_issue_comments WHERE parent_type = 'pull_request') fc
-     JOIN fact_pull_requests p ON p.pr_key = fc.pr_key";
-
+/// Comment counts for `seed_comments`, counted by hand from the rows above.
+/// Q2 is 2026-04-01..06-30 and the previous window is Q1.
+///
+/// octo/alpha keeps RC1 RC2 RC2b RC3 RC5 (review comments) and IC1 IC2 IC3
+/// (issue comments on its PRs). RC4 and IC4 sit on octo/beta; IC5 is on an
+/// issue; IC6 is on a PR that has no row. RC5 (July) is in neither window.
+///
+/// As of 2026-07-01 (Q2 complete):
+///   current  RC1 RC2 RC2b IC1 IC2 = 5   (bob 4: RC1 RC2 RC2b IC2; alice 1: IC1)
+///   previous RC3 IC3 = 2                (alice 1: RC3; bob 1: IC3)
+///   with beta: current 5 + RC4 + IC4 = 7, previous 2
+///
+/// As of 2026-04-12 (12 days into Q2, so Q1 is cut to 01-01..01-12):
+///   current  RC1 RC2 RC2b IC1 = 4      (bob 3, alice 1; IC2 on 05-02 is later)
+///   previous RC3 = 1                   (alice 1; IC3 on 03-31 is past day 12)
+///   with beta: current 4 + RC4 + IC4 = 6, previous 1
 #[test]
-fn repo_comment_metrics_match_the_unrestricted_union() {
+fn repo_comment_metrics_match_hand_counts() {
     let warehouse = GithubDW::open_in_memory().unwrap();
     seed_comments(&warehouse);
     let conn = warehouse.connection();
     let period = Period::Quarter(2026, 2);
-    for as_of in [
-        NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
-        // Partial current quarter: the previous window is truncated too.
-        NaiveDate::from_ymd_opt(2026, 4, 12).unwrap(),
-    ] {
+    // (as of, alpha total, alpha board as (key, current, previous,
+    // previous rank), alpha+beta total)
+    type Row = (&'static str, u64, u64, Option<u32>);
+    type Case = (NaiveDate, (u64, u64), [Row; 2], (u64, u64));
+    let cases: [Case; 2] = [
+        (
+            NaiveDate::from_ymd_opt(2026, 7, 1).unwrap(),
+            (5, 2),
+            [("user:bob", 4, 1, Some(2)), ("user:alice", 1, 1, Some(1))],
+            (7, 2),
+        ),
+        (
+            NaiveDate::from_ymd_opt(2026, 4, 12).unwrap(),
+            (4, 1),
+            [("user:bob", 3, 0, None), ("user:alice", 1, 1, Some(1))],
+            (6, 1),
+        ),
+    ];
+    for (as_of, total, board_rows, group_total) in cases {
         let engine = MetricsEngine::new(conn).as_of(as_of);
-        let windows = engine.windows(&period);
-        let repo = vec![SqlValue::Text("octo/alpha".into())];
-
-        let legacy_total = engine
-            .split_measure(
-                LEGACY_COMMENTS,
-                "fc.created_date_key",
-                "AND p.repo_key = ?",
-                "1",
-                &repo,
-                &windows,
-            )
-            .unwrap();
-        let legacy_board = engine
-            .leaderboard(
-                "fc.author_key",
-                LEGACY_COMMENTS,
-                "fc.created_date_key",
-                "AND p.repo_key = ?",
-                &repo,
-                &windows,
-                10,
-            )
-            .unwrap();
-        let legacy_group = engine
-            .split_measure(
-                LEGACY_COMMENTS,
-                "fc.created_date_key",
-                "AND p.repo_key IN (?, ?)",
-                "1",
-                &[
-                    SqlValue::Text("octo/alpha".into()),
-                    SqlValue::Text("octo/beta".into()),
-                ],
-                &windows,
-            )
-            .unwrap();
 
         let metrics = engine.repo_metrics("octo/alpha", &period).unwrap();
+        assert_eq!(
+            (
+                metrics.total_comments.current,
+                metrics.total_comments.previous
+            ),
+            total,
+            "alpha total as of {as_of}"
+        );
+
         let board = engine
             .repo_aggregations("octo/alpha", &period, 10)
             .unwrap()
             .top_commenters;
+        let got: Vec<_> = board
+            .iter()
+            .map(|e| {
+                (
+                    e.entity_key.as_str(),
+                    e.current,
+                    e.previous,
+                    e.rank_previous,
+                )
+            })
+            .collect();
+        assert_eq!(got, board_rows, "alpha leaderboard as of {as_of}");
+        assert_eq!(
+            board.iter().map(|e| e.rank_current).collect::<Vec<_>>(),
+            [1, 2],
+            "as of {as_of}"
+        );
+
         let group = engine
             .repo_group_metrics("both", &["octo/alpha".into(), "octo/beta".into()], &period)
             .unwrap()
             .total_comments
             .unwrap();
-
-        assert_eq!(metrics.total_comments, legacy_total, "as of {as_of}");
         assert_eq!(
-            serde_json::to_value(&board).unwrap(),
-            serde_json::to_value(&legacy_board).unwrap(),
-            "as of {as_of}"
+            (group.current, group.previous),
+            group_total,
+            "group total as of {as_of}"
         );
-        assert_eq!(group, legacy_group, "as of {as_of}");
     }
-    // The fixture exercises the filter: alpha's current quarter has comments
-    // from both kinds, and beta's, the issue's and the orphan's are excluded.
-    let engine = MetricsEngine::new(conn).as_of(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
-    let metrics = engine.repo_metrics("octo/alpha", &period).unwrap();
-    assert_eq!(metrics.total_comments.current, 5, "RC1 RC2 RC2b IC1 IC2");
-    assert_eq!(metrics.total_comments.previous, 2, "RC3 IC3");
 }
 
 /// Hand count for alice, Q2 (2026-04-01..06-30) against Q1:
