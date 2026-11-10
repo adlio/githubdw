@@ -6,6 +6,7 @@ use crate::fetch::pull_requests::{
     ActorReference, REPOSITORY_HEADER_SELECTION, RepositoryMetadata, ReviewData,
     parse_repository_metadata,
 };
+use crate::fetch::{is_inaccessible, node_index};
 
 /// Search query for the counts stage. Per node: identifying metadata, title
 /// and body (always retained when fetched), sizes, connection totals with no
@@ -205,33 +206,6 @@ pub(super) struct LightPage {
 pub(super) enum PageError {
     RateLimited(String),
     Failed(String),
-}
-
-/// An error the provider raises for a node the viewer may not see. These are
-/// expected skips (counted, never stored, never failures).
-fn is_inaccessible(error: &Value) -> bool {
-    let kind = error
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    let message = error
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_lowercase();
-    matches!(kind, "FORBIDDEN" | "NOT_FOUND")
-        || message.contains("saml")
-        || message.contains("ip allow list")
-        || message.contains("resource not accessible")
-}
-
-/// The search node index an error points at (`["search","nodes",i,...]`).
-fn node_index(error: &Value) -> Option<usize> {
-    let path = error.get("path")?.as_array()?;
-    if path.first()?.as_str()? != "search" || path.get(1)?.as_str()? != "nodes" {
-        return None;
-    }
-    path.get(2)?.as_u64().map(|i| i as usize)
 }
 
 fn text(value: &Value, field: &str) -> Option<String> {

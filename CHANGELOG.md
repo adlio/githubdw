@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- User sync no longer fails a search page because one pull request sits in a
+  SAML-protected or forbidden repository. The node is skipped, counted in
+  `skipped`, and named in a note with GitHub's message; the rest of the page is
+  stored, and the cursor moves past it. Any other GraphQL error still fails the
+  page.
+
+### Changed
+
+- Library API: `fetch::user_search::parse_user_search_page` takes the response's
+  `errors` as a second argument, and `UserSearchPage` has a new `inaccessible`
+  field.
+
 ## [0.4.0] - 2026-11-09
 
 ### Breaking

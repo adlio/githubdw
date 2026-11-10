@@ -175,6 +175,33 @@ impl GhTransport for GhCommandLine {
     }
 }
 
+/// An error the provider raises for a node the viewer may not see. These are
+/// expected skips (counted, never stored, never failures).
+pub(crate) fn is_inaccessible(error: &Value) -> bool {
+    let kind = error
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let message = error
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_lowercase();
+    matches!(kind, "FORBIDDEN" | "NOT_FOUND")
+        || message.contains("saml")
+        || message.contains("ip allow list")
+        || message.contains("resource not accessible")
+}
+
+/// The search node index an error points at (`["search","nodes",i,...]`).
+pub(crate) fn node_index(error: &Value) -> Option<usize> {
+    let path = error.get("path")?.as_array()?;
+    if path.first()?.as_str()? != "search" || path.get(1)?.as_str()? != "nodes" {
+        return None;
+    }
+    path.get(2)?.as_u64().map(|i| i as usize)
+}
+
 /// Maximum retry attempts for retryable errors.
 const RETRY_ATTEMPTS: u32 = 7;
 /// Exponential backoff schedule in seconds (attempt N sleeps SCHEDULE[N-1]).
