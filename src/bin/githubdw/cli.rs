@@ -51,7 +51,12 @@ pub enum Command {
         command: ConfigCommand,
     },
     /// Run the MCP (Model Context Protocol) stdio server
-    Mcp,
+    Mcp {
+        /// Hide trigger_sync and refuse monitor writes (add/remove); list
+        /// actions and read tools stay available
+        #[arg(long)]
+        read_only: bool,
+    },
 }
 
 #[derive(clap::Args)]

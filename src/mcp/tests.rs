@@ -5,6 +5,11 @@ fn server() -> GithubDwServer {
     GithubDwServer::new(GithubDW::open_in_memory().unwrap())
 }
 
+/// A `--read-only` server over an empty in-memory warehouse.
+fn read_only_server() -> GithubDwServer {
+    GithubDwServer::new_read_only(GithubDW::open_in_memory().unwrap())
+}
+
 /// Build a tool-arguments map from a JSON object literal.
 fn args(value: serde_json::Value) -> Map<String, serde_json::Value> {
     match value {
@@ -48,6 +53,173 @@ fn router_registers_every_tool_with_a_schema() {
             tool.name
         );
     }
+}
+
+// ─── Tool annotations ─────────────────────────────────────────────────────
+
+/// Hand-written expected hints per tool, independent of the production code.
+fn expected_annotations(name: &str) -> ToolAnnotations {
+    match name {
+        "query_pull_requests" | "get_metrics" | "search" => ToolAnnotations::new().read_only(true),
+        "manage_monitors" => ToolAnnotations::new()
+            .read_only(false)
+            .destructive(true)
+            .idempotent(true),
+        "trigger_sync" => ToolAnnotations::new()
+            .read_only(false)
+            .destructive(false)
+            .open_world(true),
+        other => panic!("no expected annotations for {other}"),
+    }
+}
+
+#[test]
+fn every_tool_carries_its_expected_annotations() {
+    for tool in server().tool_router.list_all() {
+        let annotations = tool
+            .annotations
+            .clone()
+            .unwrap_or_else(|| panic!("{} has no annotations", tool.name));
+        assert_eq!(
+            annotations,
+            expected_annotations(&tool.name),
+            "{} annotations",
+            tool.name
+        );
+    }
+}
+
+// ─── Read-only mode ────────────────────────────────────────────────────────
+
+/// Serve `server` over an in-process duplex pipe and return a line-based
+/// JSON-RPC client, matching the wire-level setup already used for the
+/// `trigger_sync` concurrency test below.
+async fn serve_over_duplex(
+    server: GithubDwServer,
+) -> (
+    tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    tokio::io::Lines<tokio::io::BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+) {
+    use rmcp::ServiceExt;
+    use tokio::io::AsyncBufReadExt;
+
+    let (client_io, server_io) = tokio::io::duplex(1 << 16);
+    tokio::spawn(async move {
+        let running = server.serve(server_io).await.unwrap();
+        let _ = running.waiting().await;
+    });
+    let (reader, mut writer) = tokio::io::split(client_io);
+    let mut lines = tokio::io::BufReader::new(reader).lines();
+
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+            "protocolVersion": "2025-06-18", "capabilities": {},
+            "clientInfo": {"name": "test", "version": "0"}
+        }}),
+    )
+    .await;
+    assert_eq!(receive(&mut lines).await["id"], 1);
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+    )
+    .await;
+    (writer, lines)
+}
+
+/// A read-only server's `tools/list` omits `trigger_sync`; a default
+/// server's `tools/list` carries all five, each with its annotations.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_tools_list_omits_trigger_sync() {
+    let (mut writer, mut lines) = serve_over_duplex(read_only_server()).await;
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    )
+    .await;
+    let reply = receive(&mut lines).await;
+    let names: Vec<String> = reply["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!names.contains(&"trigger_sync".to_string()), "{names:?}");
+    assert_eq!(names.len(), 4, "{names:?}");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn default_tools_list_carries_all_five_with_annotations() {
+    let (mut writer, mut lines) = serve_over_duplex(server()).await;
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/list"}),
+    )
+    .await;
+    let reply = receive(&mut lines).await;
+    let tools = reply["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 5, "{tools:?}");
+    for tool in tools {
+        assert!(
+            tool.get("annotations").is_some(),
+            "{} has no annotations: {tool}",
+            tool["name"]
+        );
+    }
+}
+
+/// A direct `trigger_sync` call on a read-only server is refused before any
+/// `gh` call: no transport is installed on this server, so a sync that
+/// reached `gh` would panic the spawned task instead of returning cleanly.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_only_trigger_sync_call_is_refused_without_a_gh_call() {
+    let (mut writer, mut lines) = serve_over_duplex(read_only_server()).await;
+    send(
+        &mut writer,
+        json!({"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {
+            "name": "trigger_sync",
+            "arguments": {"entity_type": "repo", "name": "octocat/hello", "days": 30}
+        }}),
+    )
+    .await;
+    let reply = receive(&mut lines).await;
+    let error = reply
+        .get("error")
+        .unwrap_or_else(|| panic!("an error reply: {reply}"));
+    assert!(
+        error["message"].as_str().unwrap().contains("read-only"),
+        "{error}"
+    );
+}
+
+#[test]
+fn read_only_manage_monitors_list_works_add_is_refused() {
+    let server = read_only_server();
+
+    let listed = text_of(server.manage_monitors(None).expect("list still works"));
+    assert!(listed.contains("users"));
+
+    let add = args(json!({ "action": "add", "entity_type": "repo", "name": "adlio/githubdw" }));
+    let error = server.manage_monitors(Some(&add)).expect_err("add refused");
+    assert!(error.message.contains("read-only"), "{error:?}");
+
+    let after = text_of(server.manage_monitors(None).expect("list"));
+    assert!(
+        !after.contains("adlio/githubdw"),
+        "monitor table unchanged: {after}"
+    );
+}
+
+#[test]
+fn read_only_manage_monitors_remove_is_refused() {
+    let server = read_only_server();
+    let remove =
+        args(json!({ "action": "remove", "entity_type": "repo", "name": "adlio/githubdw" }));
+    let error = server
+        .manage_monitors(Some(&remove))
+        .expect_err("remove refused");
+    assert!(error.message.contains("read-only"), "{error:?}");
 }
 
 #[test]
