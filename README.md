@@ -23,17 +23,30 @@ authentication is entirely delegated to `gh auth` — githubdw never sees a toke
 
 ## Install
 
-Requires Rust (stable) and an authenticated `gh` CLI (`gh auth login`).
+Requires an authenticated `gh` CLI (`gh auth login`).
+
+From [crates.io](https://crates.io/crates/githubdw) (requires Rust/Cargo):
 
 ```bash
-cargo install --path .
+cargo install githubdw --locked
+```
+
+Or download a prebuilt binary from the
+[GitHub releases](https://github.com/adlio/githubdw/releases) page
+(`x86_64`/`aarch64`, Linux musl or macOS) and verify the checksum:
+
+```bash
+curl -LO https://github.com/adlio/githubdw/releases/latest/download/githubdw-0.5.0-x86_64-unknown-linux-musl.tar.gz
+curl -LO https://github.com/adlio/githubdw/releases/latest/download/githubdw-0.5.0-x86_64-unknown-linux-musl.tar.gz.sha256
+sha256sum -c githubdw-0.5.0-x86_64-unknown-linux-musl.tar.gz.sha256
+tar xzf githubdw-0.5.0-x86_64-unknown-linux-musl.tar.gz
 ```
 
 ## Quick start
 
 ```bash
-# Sync a repository's pull requests and issues (first run backfills 90 days;
-# use --days to widen the window)
+# Sync a repository's pull requests and issues (first run backfills 90 days
+# of coverage by default; see "Sync" below for what --days actually does)
 githubdw sync repo adlio/mixtape --days 365
 
 # Re-running is an incremental no-op — only changed PRs are fetched
@@ -53,8 +66,8 @@ githubdw metrics repo adlio/mixtape --period this-quarter
 githubdw metrics user adlio --period 2026-Q2 --json
 ```
 
-The database lives at `~/.githubdw/githubdw.db` by default (override with
-`--db <path>`).
+The database lives at `~/.githubdw/githubdw.db` by default. Every subcommand
+accepts a global `--db <path>` to use a different file.
 
 ## Sync
 
@@ -62,13 +75,20 @@ The database lives at `~/.githubdw/githubdw.db` by default (override with
 githubdw sync repo <owner/name> [--days N] [--skip-diffs] [--pull-requests-only | --issues-only]
 githubdw sync user <login>      [--days N] [--skip-diffs]
 githubdw sync all            # sync every enabled monitored source
-githubdw sync watch          # live progress of a running sync
+githubdw sync watch          # print one snapshot of any sync in progress, then exit
 ```
 
 Sync is **incremental and resumable**: covered date ranges are recorded and
 merged, an `updated_at` cursor stops pagination early when nothing changed, and
 a stale-lock timeout recovers from crashes. `--skip-diffs` skips per-file patch
 text for a much faster first pass.
+
+`--days N` limits the *recorded coverage window*, not the fetch itself: the
+PR/issue walk still pages until the source is exhausted or the incremental
+cursor stops it. A repository or user synced for the first time backfills 90
+days by default (`--days` overrides that starting point); the MCP
+`trigger_sync` tool defaults to 30 days instead. `sync watch` is a one-shot
+status check, not a live stream — run it again to refresh.
 
 `sync repo` walks one repository's pull requests and issues. `sync user`
 answers the other question — everything one person did, wherever they did it —
@@ -91,13 +111,36 @@ Manage what `sync all` covers:
 ```bash
 githubdw monitor add-repo owner/name
 githubdw monitor add-user login
+githubdw monitor add-org org-login
 githubdw monitor list
 githubdw monitor remove owner/name
 ```
 
 `sync all` runs repositories first, then users, and prints a line for every
 enabled source it will not serve — an unimplemented source type or a disabled
-row is named, never dropped in silence.
+row is named, never dropped in silence. Monitored **orgs** are one such
+source: `sync all` currently names and skips them rather than syncing their
+repositories.
+
+### Re-fetching specific items
+
+```bash
+# Re-fetch exact PRs/issues through the normal hydrate/store path (1-64 at a
+# time). Does not move cursors or coverage, and does not enroll monitoring.
+githubdw sync targets --pr octocat/hello#1467 --issue octocat/hello#12
+
+# Find stored items whose row counts suggest first-slice truncation
+# (read-only, prints --pr/--issue arguments for `sync targets`)
+githubdw sync repair-plan --repo octocat/hello
+
+# Re-read check runs across every head commit a PR has had, storing each run
+# under its own commit (idempotent — re-run the same targets to resume)
+githubdw sync check-history --pr octocat/hello#1467 --json
+
+# Find stored PRs with several check-run heads — the signature of partly
+# observed history (read-only, prints --pr arguments for `sync check-history`)
+githubdw sync check-history-plan --repo octocat/hello
+```
 
 ## Query
 
@@ -126,13 +169,22 @@ Every headline number is compared against the previous period —
 the previous period is truncated to the same number of elapsed days so
 comparisons stay apples-to-apples.
 
-Custom groups treat several users or repos as one unit:
+Custom groups treat several users or repos as one unit. `group user` and
+`group repo` take the same subcommands:
 
 ```bash
 githubdw group user create core --description "core team"
-githubdw group user add core alice bob
+githubdw group user add core alice bob       # add members
+githubdw group user show core                # list a group's members
+githubdw group user list                     # list all groups
+githubdw group user set core alice bob carol # replace the member set
+githubdw group user remove core bob          # remove members
+githubdw group user delete core              # delete the group
 githubdw metrics group core --period this-quarter
 ```
+
+`group repo` works the same way, with repository names (`owner/name`) as
+members instead of logins.
 
 ## Fulltext search
 
@@ -148,8 +200,18 @@ indexed.
 ## MCP server (AI assistants)
 
 `githubdw mcp` starts a Model Context Protocol server on stdio with five tools:
-`query_pull_requests`, `get_metrics`, `search`, `manage_monitors`, and
-`trigger_sync`.
+
+- `query_pull_requests` — filter by author, reviewer, repo, org, group,
+  state, label, and period; `output` controls totals vs. breakdowns.
+- `get_metrics` — period-over-period metrics for a user, repo, user_group, or
+  repo_group.
+- `search` — full-text search over synced PR/issue titles, bodies, and
+  comments.
+- `manage_monitors` — list, add, or remove monitored users, repos, and orgs
+  (`action='list'` is the default).
+- `trigger_sync` — fetch fresh PR/issue data for one repository from the
+  GitHub API (`days` defaults to 30, independently of the CLI's 90-day
+  default). Requires an authenticated `gh` CLI.
 
 Example client configuration (any MCP-capable assistant):
 
@@ -181,6 +243,7 @@ GH_HOST=github.example.com githubdw sync repo owner/name
 
 ```bash
 githubdw config list
+githubdw config get timezone
 githubdw config set timezone America/New_York   # IANA timezone for date bucketing
 githubdw config set core_hours_start 8
 ```
