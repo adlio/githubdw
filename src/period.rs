@@ -5,6 +5,11 @@ use chrono_tz::Tz;
 
 use crate::error::{Error, Result};
 
+/// Upper bound on `last-N`: 10 years. Past this, callers almost certainly
+/// meant a different period form, and unchecked date math would otherwise
+/// have to cover N up to `u32::MAX` days.
+const MAX_ROLLING_DAYS: u32 = 3660;
+
 /// A named time window with period-over-period semantics.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Period {
@@ -107,6 +112,11 @@ impl Period {
             let days: u32 = days_text
                 .parse()
                 .map_err(|_| Error::InvalidArgument(format!("bad rolling period '{text}'")))?;
+            if !(1..=MAX_ROLLING_DAYS).contains(&days) {
+                return Err(Error::InvalidArgument(format!(
+                    "bad rolling period '{text}': days must be 1..={MAX_ROLLING_DAYS}"
+                )));
+            }
             return Ok(Period::Rolling(days, reference));
         }
         if let Some((year_text, rest)) = text.split_once('-') {
@@ -136,12 +146,21 @@ impl Period {
                 let week: u8 = week
                     .parse()
                     .map_err(|_| Error::InvalidArgument(format!("bad week '{text}'")))?;
+                let last_week = last_iso_week_of_year(year);
+                if week < 1 || week > last_week {
+                    return Err(Error::InvalidArgument(format!(
+                        "bad week '{text}': {year} has weeks 1..={last_week}"
+                    )));
+                }
                 return Ok(Period::Week(year, week));
             }
             if let Some(month) = rest_upper.strip_prefix('M') {
                 let month: u8 = month
                     .parse()
                     .map_err(|_| Error::InvalidArgument(format!("bad month '{text}'")))?;
+                if !(1..=12).contains(&month) {
+                    return Err(Error::InvalidArgument(format!("bad month '{text}'")));
+                }
                 return Ok(Period::Month(year, month));
             }
             let month: u8 = rest
@@ -185,7 +204,12 @@ impl Period {
                     .unwrap_or_else(|| ymd(*year, 1, 1));
                 (start, start + Duration::days(6))
             }
-            Period::Rolling(days, end) => (*end - Duration::days(*days as i64 - 1), *end),
+            Period::Rolling(days, end) => {
+                let start = end
+                    .checked_sub_signed(Duration::days(*days as i64 - 1))
+                    .unwrap_or(NaiveDate::MIN);
+                (start, *end)
+            }
         }
     }
 
@@ -201,15 +225,17 @@ impl Period {
             Period::Month(year, month) => Period::Month(*year, month - 1),
             Period::Week(year, week) => {
                 if *week <= 1 {
-                    let last_week = ymd(year - 1, 12, 28).iso_week().week() as u8;
+                    let last_week = last_iso_week_of_year(year - 1);
                     Period::Week(year - 1, last_week)
                 } else {
                     Period::Week(*year, week - 1)
                 }
             }
-            Period::Rolling(days, end) => {
-                Period::Rolling(*days, *end - Duration::days(*days as i64))
-            }
+            Period::Rolling(days, end) => Period::Rolling(
+                *days,
+                end.checked_sub_signed(Duration::days(*days as i64))
+                    .unwrap_or(NaiveDate::MIN),
+            ),
         }
     }
 
@@ -288,6 +314,13 @@ fn ymd(year: i32, month: u32, day: u32) -> NaiveDate {
     })
 }
 
+/// The last ISO week number in `year`: 52 or 53. December 28 falls in the
+/// last ISO week of every year (ISO 8601's own definition), so reading its
+/// week number is exact rather than a guess.
+fn last_iso_week_of_year(year: i32) -> u8 {
+    ymd(year, 12, 28).iso_week().week() as u8
+}
+
 fn last_day_of_month(year: i32, month: u32) -> NaiveDate {
     let (next_year, next_month) = if month == 12 {
         (year + 1, 1)
@@ -326,6 +359,89 @@ mod tests {
         assert!(matches!(parse("last-30").unwrap(), Period::Rolling(30, _)));
         assert!(parse("garbage").is_err());
         assert!(parse("2026-Q5").is_err());
+    }
+
+    /// Nearby good inputs, so the new range checks reject only what they
+    /// should. 2026-M12 and 2026-W01 sit right beside the bad inputs below;
+    /// last-3660 is the cap itself, not just something under it.
+    #[test]
+    fn boundary_inputs_near_the_bad_ones_are_still_accepted() {
+        assert_eq!(parse("2026-M12").unwrap(), Period::Month(2026, 12));
+        assert_eq!(parse("2026-M1").unwrap(), Period::Month(2026, 1));
+        assert_eq!(parse("2026-W01").unwrap(), Period::Week(2026, 1));
+        // 2026 has 53 ISO weeks (calendar fact, verified independently via
+        // `date -d 2026-12-28 +%V` => 53; `date -d 2025-12-28 +%V` => 52).
+        assert_eq!(parse("2026-W53").unwrap(), Period::Week(2026, 53));
+        assert_eq!(
+            parse("last-1").unwrap(),
+            Period::Rolling(1, any_reference())
+        );
+        assert_eq!(
+            parse("last-3660").unwrap(),
+            Period::Rolling(3660, any_reference())
+        );
+    }
+
+    /// Every bad input from the bug report, plus the ones right next to the
+    /// cap/limits, must return an error rather than silently becoming 0 or
+    /// some other period, or panicking.
+    #[test]
+    fn invalid_periods_are_rejected_not_silently_substituted() {
+        assert!(parse("2026-M13").is_err(), "no 13th month");
+        assert!(parse("2026-M0").is_err(), "no 0th month");
+        assert!(parse("2026-W99").is_err(), "2026 only has 53 weeks");
+        assert!(parse("2026-W0").is_err(), "no week 0");
+        // 2025 has only 52 ISO weeks (verified via `date`, not chrono): its
+        // W53 must be rejected even though some other years accept it.
+        assert!(parse("2025-W53").is_err(), "2025 has only 52 ISO weeks");
+        assert!(parse("last-0").is_err(), "0 days is not a window");
+        assert!(parse("last-3661").is_err(), "one past the 3660-day cap");
+        assert!(parse("last-99999999").is_err(), "far past the cap");
+        assert!(
+            parse("last-4294967295").is_err(),
+            "u32::MAX must not overflow date math"
+        );
+        assert!(parse("2026-Q0").is_err());
+        assert!(parse("2026-Q5").is_err());
+        assert!(parse("2026-H0").is_err());
+        assert!(parse("2026-H3").is_err());
+        assert!(parse("2026-13").is_err(), "bare month form, no 13th month");
+        assert!(parse("2026-00").is_err(), "bare month form, no 0th month");
+    }
+
+    /// `last-N` windows are inclusive of today, so `last-1` is today alone:
+    /// one day, not two. The old `Duration::days(days - 1)` math is right
+    /// for small N; this pins it so a future change to the subtraction
+    /// cannot silently add or drop a day.
+    #[test]
+    fn last_1_covers_exactly_today() {
+        let today = ymd(2026, 7, 24);
+        let period = Period::Rolling(1, today);
+        assert_eq!(period.date_range(), (today, today));
+    }
+
+    /// Hand-written expected periods at every `previous()` boundary, computed
+    /// from a calendar rather than from `Period` itself.
+    #[test]
+    fn previous_at_every_boundary_matches_a_hand_written_calendar() {
+        // ISO week 2027-W01 contains 2026-12-28..2027-01-03, so the week
+        // right before it is the last week of 2026: 2026-W53 (2026 has 53
+        // ISO weeks, confirmed above).
+        assert_eq!(Period::Week(2027, 1).previous(), Period::Week(2026, 53));
+        // 2026-M01's previous is 2025-M12: a plain calendar year rollback.
+        assert_eq!(Period::Month(2026, 1).previous(), Period::Month(2025, 12));
+        // Q1's previous is the prior year's Q4.
+        assert_eq!(
+            Period::Quarter(2026, 1).previous(),
+            Period::Quarter(2025, 4)
+        );
+        // H1's previous is the prior year's H2.
+        assert_eq!(Period::Half(2026, 1).previous(), Period::Half(2025, 2));
+        // A week that is not W01 just decrements within the same year.
+        assert_eq!(Period::Week(2026, 10).previous(), Period::Week(2026, 9));
+        // 2026-W01's previous is 2025's last week: 2025 has 52 ISO weeks
+        // (confirmed above), so 2025-W52, not 2025-W53.
+        assert_eq!(Period::Week(2026, 1).previous(), Period::Week(2025, 52));
     }
 
     /// The defect this pins: an evening instant in a zone behind UTC is
