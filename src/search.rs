@@ -81,6 +81,12 @@ pub fn search(
     let quoted = fts_quote(query);
     let mut hits: Vec<SearchHit> = Vec::new();
     let limit = options.effective_limit();
+    // repo_key is stored lowercased (see storage::repository::upsert_repository),
+    // so the filter must lowercase its input once here rather than trust callers.
+    let repository = options
+        .repository
+        .as_ref()
+        .map(|value| value.to_lowercase());
 
     if matches!(options.scope, SearchScope::All | SearchScope::PullRequests) {
         let sql = "SELECT f.pr_key, p.repo_key, p.title, p.author_key, p.state,
@@ -93,23 +99,20 @@ pub fn search(
                      AND (?2 IS NULL OR p.repo_key = ?2)
                    ORDER BY rank LIMIT ?3";
         let mut statement = connection.prepare(sql)?;
-        let rows = statement.query_map(
-            rusqlite::params![quoted, options.repository, limit],
-            |row| {
-                let (author, author_type) = author_identity(row.get(3)?, row.get(7)?, row.get(8)?);
-                Ok(SearchHit {
-                    key: row.get(0)?,
-                    kind: "pull_request".into(),
-                    repository: row.get(1)?,
-                    title: row.get(2)?,
-                    author,
-                    author_type,
-                    state: row.get(4)?,
-                    snippet: row.get(5)?,
-                    rank: row.get(6)?,
-                })
-            },
-        )?;
+        let rows = statement.query_map(rusqlite::params![quoted, repository, limit], |row| {
+            let (author, author_type) = author_identity(row.get(3)?, row.get(7)?, row.get(8)?);
+            Ok(SearchHit {
+                key: row.get(0)?,
+                kind: "pull_request".into(),
+                repository: row.get(1)?,
+                title: row.get(2)?,
+                author,
+                author_type,
+                state: row.get(4)?,
+                snippet: row.get(5)?,
+                rank: row.get(6)?,
+            })
+        })?;
         for row in rows {
             hits.push(row?);
         }
@@ -126,23 +129,20 @@ pub fn search(
                      AND (?2 IS NULL OR i.repo_key = ?2)
                    ORDER BY rank LIMIT ?3";
         let mut statement = connection.prepare(sql)?;
-        let rows = statement.query_map(
-            rusqlite::params![quoted, options.repository, limit],
-            |row| {
-                let (author, author_type) = author_identity(row.get(3)?, row.get(7)?, row.get(8)?);
-                Ok(SearchHit {
-                    key: row.get(0)?,
-                    kind: "issue".into(),
-                    repository: row.get(1)?,
-                    title: row.get(2)?,
-                    author,
-                    author_type,
-                    state: row.get(4)?,
-                    snippet: row.get(5)?,
-                    rank: row.get(6)?,
-                })
-            },
-        )?;
+        let rows = statement.query_map(rusqlite::params![quoted, repository, limit], |row| {
+            let (author, author_type) = author_identity(row.get(3)?, row.get(7)?, row.get(8)?);
+            Ok(SearchHit {
+                key: row.get(0)?,
+                kind: "issue".into(),
+                repository: row.get(1)?,
+                title: row.get(2)?,
+                author,
+                author_type,
+                state: row.get(4)?,
+                snippet: row.get(5)?,
+                rank: row.get(6)?,
+            })
+        })?;
         for row in rows {
             hits.push(row?);
         }
@@ -160,55 +160,59 @@ pub fn search(
                      AND (?2 IS NULL OR p.repo_key = ?2)
                    ORDER BY rank LIMIT ?3";
         let mut statement = connection.prepare(sql)?;
-        let rows = statement.query_map(
-            rusqlite::params![quoted, options.repository, limit],
-            |row| {
-                let (author, author_type) = author_identity(row.get(4)?, row.get(7)?, row.get(8)?);
-                Ok(SearchHit {
-                    key: row.get::<_, String>(1)?, // anchor to the PR
-                    kind: "review_comment".into(),
-                    repository: row.get(2)?,
-                    title: row.get(3)?,
-                    author,
-                    author_type,
-                    state: None,
-                    snippet: row.get(5)?,
-                    rank: row.get(6)?,
-                })
-            },
-        )?;
+        let rows = statement.query_map(rusqlite::params![quoted, repository, limit], |row| {
+            let (author, author_type) = author_identity(row.get(4)?, row.get(7)?, row.get(8)?);
+            Ok(SearchHit {
+                key: row.get::<_, String>(1)?, // anchor to the PR
+                kind: "review_comment".into(),
+                repository: row.get(2)?,
+                title: row.get(3)?,
+                author,
+                author_type,
+                state: None,
+                snippet: row.get(5)?,
+                rank: row.get(6)?,
+            })
+        })?;
         for row in rows {
             hits.push(row?);
         }
 
+        // parent_key means two different things depending on parent_type: for a
+        // pull-request comment it's the pr_key ("owner/repo#n"); for an issue
+        // comment it's the issue's node id. A repo filter has to join to whichever
+        // row parent_type names and compare that row's own repo_key, rather than
+        // pattern-match parent_key itself (which both misses issue comments and
+        // false-matches sibling repos like "octo/alpha-ng" when filtering for
+        // "octo/alpha").
         let sql = "SELECT c.comment_key, c.parent_key, c.author_key,
                           snippet(issue_comments_fts, -1, '[', ']', '…', 12), rank,
                           ae.login, ae.entity_type
                    FROM issue_comments_fts f
                    JOIN fact_issue_comments c ON c.comment_key = f.comment_key
                    LEFT JOIN dim_entities ae ON ae.entity_key = c.author_key
+                   LEFT JOIN fact_pull_requests pr
+                     ON c.parent_type = 'pull_request' AND pr.pr_key = c.parent_key
+                   LEFT JOIN issues iss
+                     ON c.parent_type = 'issue' AND iss.id = c.parent_key
                    WHERE issue_comments_fts MATCH ?1
-                     AND (?2 IS NULL OR c.parent_key LIKE ?2 || '%'
-                          OR c.parent_key IN (SELECT id FROM issues WHERE repo_key = ?2))
+                     AND (?2 IS NULL OR pr.repo_key = ?2 OR iss.repo_key = ?2)
                    ORDER BY rank LIMIT ?3";
         let mut statement = connection.prepare(sql)?;
-        let rows = statement.query_map(
-            rusqlite::params![quoted, options.repository, limit],
-            |row| {
-                let (author, author_type) = author_identity(row.get(2)?, row.get(5)?, row.get(6)?);
-                Ok(SearchHit {
-                    key: row.get::<_, String>(1)?, // parent PR key or issue id
-                    kind: "issue_comment".into(),
-                    repository: None,
-                    title: None,
-                    author,
-                    author_type,
-                    state: None,
-                    snippet: row.get(3)?,
-                    rank: row.get(4)?,
-                })
-            },
-        )?;
+        let rows = statement.query_map(rusqlite::params![quoted, repository, limit], |row| {
+            let (author, author_type) = author_identity(row.get(2)?, row.get(5)?, row.get(6)?);
+            Ok(SearchHit {
+                key: row.get::<_, String>(1)?, // parent PR key or issue id
+                kind: "issue_comment".into(),
+                repository: None,
+                title: None,
+                author,
+                author_type,
+                state: None,
+                snippet: row.get(3)?,
+                rank: row.get(4)?,
+            })
+        })?;
         for row in rows {
             hits.push(row?);
         }
@@ -334,6 +338,194 @@ mod tests {
             .expect("the person-authored PR is found by its bare login");
         assert_eq!(human_hit.author_type.as_deref(), Some("user"));
     }
+    /// Three repos chosen so a prefix/LIKE match would blur them:
+    /// `octo/alpha` is a prefix of `octo/alpha-ng`, and `octo/al_ha` has a
+    /// literal `_` that is also the SQL LIKE single-char wildcard. Each repo
+    /// gets a PR, an issue, a PR comment and an issue comment containing the
+    /// same search word ("widget"). The issue comment on `octo/al_ha` is
+    /// stored with its parent as a node id (`"ISSNODE3"`), matching how a
+    /// real issue-type `fact_issue_comments` row is written.
+    fn seed_repo_filter_fixture(warehouse: &GithubDW) {
+        warehouse
+            .connection()
+            .execute_batch(
+                "INSERT INTO dim_entities (entity_key, entity_type, login, is_human, is_bot, name)
+                 VALUES ('user:alice', 'user', 'alice', 1, 0, 'alice');
+                 INSERT INTO dim_repositories (repo_key, owner, name)
+                 VALUES ('octo/alpha', 'octo', 'alpha'),
+                        ('octo/alpha-ng', 'octo', 'alpha-ng'),
+                        ('octo/al_ha', 'octo', 'al_ha');
+                 INSERT INTO dim_date (date_key, year, quarter, month, day_of_month, day_of_week,
+                     is_weekend, week_of_year, week_key, month_key, quarter_key, year_key, half_key)
+                 VALUES ('2026-01-10', 2026, 1, 1, 10, 6, 1, 2, '2026-W02', '2026-01', '2026-Q1', '2026', '2026-H1');
+                 INSERT INTO dim_time (time_key, hour, hour_12, am_pm, time_bucket, is_core_hours)
+                 VALUES ('10:00', 10, 10, 'AM', 'Morning', 1);
+
+                 INSERT INTO fact_pull_requests (pr_key, number, repo_key, author_key, state, title, body,
+                     created_at, created_date_key, created_time_key)
+                 VALUES ('octo/alpha#1', 1, 'octo/alpha', 'user:alice', 'OPEN', 'widget pr alpha', NULL,
+                         '2026-01-10T18:00:00Z', '2026-01-10', '10:00'),
+                        ('octo/alpha-ng#1', 1, 'octo/alpha-ng', 'user:alice', 'OPEN', 'widget pr alpha-ng', NULL,
+                         '2026-01-10T18:00:00Z', '2026-01-10', '10:00'),
+                        ('octo/al_ha#1', 1, 'octo/al_ha', 'user:alice', 'OPEN', 'widget pr al_ha', NULL,
+                         '2026-01-10T18:00:00Z', '2026-01-10', '10:00');
+
+                 INSERT INTO issues (id, repo_key, number, title, body, state, created_at, updated_at)
+                 VALUES ('ISSNODE1', 'octo/alpha', 2, 'widget issue alpha', NULL, 'open',
+                         '2026-01-10T18:00:00Z', '2026-01-10T18:00:00Z'),
+                        ('ISSNODE2', 'octo/alpha-ng', 2, 'widget issue alpha-ng', NULL, 'open',
+                         '2026-01-10T18:00:00Z', '2026-01-10T18:00:00Z'),
+                        ('ISSNODE3', 'octo/al_ha', 2, 'widget issue al_ha', NULL, 'open',
+                         '2026-01-10T18:00:00Z', '2026-01-10T18:00:00Z');
+
+                 INSERT INTO fact_review_comments (comment_key, pr_key, author_key, body,
+                     created_at, created_date_key, created_time_key)
+                 VALUES ('RC-alpha', 'octo/alpha#1', 'user:alice', 'widget review comment alpha',
+                         '2026-01-10T18:30:00Z', '2026-01-10', '10:00'),
+                        ('RC-alpha-ng', 'octo/alpha-ng#1', 'user:alice', 'widget review comment alpha-ng',
+                         '2026-01-10T18:30:00Z', '2026-01-10', '10:00'),
+                        ('RC-al_ha', 'octo/al_ha#1', 'user:alice', 'widget review comment al_ha',
+                         '2026-01-10T18:30:00Z', '2026-01-10', '10:00');
+
+                 INSERT INTO fact_issue_comments (comment_key, parent_type, parent_key, author_key, body,
+                     created_at, created_date_key, created_time_key)
+                 VALUES ('IC-alpha', 'pull_request', 'octo/alpha#1', 'user:alice', 'widget issue comment alpha',
+                         '2026-01-10T18:30:00Z', '2026-01-10', '10:00'),
+                        ('IC-alpha-ng', 'pull_request', 'octo/alpha-ng#1', 'user:alice', 'widget issue comment alpha-ng',
+                         '2026-01-10T18:30:00Z', '2026-01-10', '10:00'),
+                        -- parent stored by node id, not 'owner/repo#n' -- the issue-type shape.
+                        ('IC-al_ha', 'issue', 'ISSNODE3', 'user:alice', 'widget issue comment al_ha',
+                         '2026-01-10T18:30:00Z', '2026-01-10', '10:00');",
+            )
+            .unwrap();
+    }
+
+    /// Hand-counted expected hit keys per repo, across all four kinds, for the
+    /// "widget" search term in `seed_repo_filter_fixture`.
+    fn expected_keys_for(repo: &str) -> Vec<&'static str> {
+        match repo {
+            "octo/alpha" => vec![
+                "octo/alpha#1",
+                "octo/alpha#2",
+                "octo/alpha#1",
+                "octo/alpha#1",
+            ],
+            "octo/alpha-ng" => vec![
+                "octo/alpha-ng#1",
+                "octo/alpha-ng#2",
+                "octo/alpha-ng#1",
+                "octo/alpha-ng#1",
+            ],
+            "octo/al_ha" => vec!["octo/al_ha#1", "octo/al_ha#2", "octo/al_ha#1", "ISSNODE3"],
+            other => panic!("no expectations recorded for {other}"),
+        }
+    }
+
+    /// `repository: Some("octo/alpha")` must return exactly octo/alpha's four
+    /// rows (PR, issue, review comment, issue comment) and nothing from the
+    /// sibling repos `octo/alpha-ng` or `octo/al_ha`, even though the old
+    /// `LIKE ?2 || '%'` filter on `issue_comments.parent_key` would have let
+    /// `octo/alpha-ng`'s PR-shaped parent key slip through a prefix match.
+    #[test]
+    fn repository_filter_matches_the_exact_repo_only() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        seed_repo_filter_fixture(&warehouse);
+        let conn = warehouse.connection();
+
+        for repo in ["octo/alpha", "octo/alpha-ng", "octo/al_ha"] {
+            let hits = search(
+                conn,
+                "widget",
+                &SearchOptions {
+                    repository: Some(repo.into()),
+                    limit: 20,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let mut keys: Vec<&str> = hits.iter().map(|hit| hit.key.as_str()).collect();
+            keys.sort_unstable();
+            let mut expected = expected_keys_for(repo);
+            expected.sort_unstable();
+            assert_eq!(
+                keys, expected,
+                "repository filter {repo:?} must return exactly its own rows"
+            );
+        }
+    }
+
+    /// A repository filter is case-insensitive the same way GitHub treats
+    /// `owner/repo`: `repo_key` is stored lowercased at write time, so the
+    /// filter has to lowercase its own input rather than rely on callers.
+    #[test]
+    fn repository_filter_is_case_insensitive() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        seed_repo_filter_fixture(&warehouse);
+        let conn = warehouse.connection();
+
+        let lower = search(
+            conn,
+            "widget",
+            &SearchOptions {
+                repository: Some("octo/alpha".into()),
+                limit: 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let upper = search(
+            conn,
+            "widget",
+            &SearchOptions {
+                repository: Some("OCTO/Alpha".into()),
+                limit: 20,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let mut lower_keys: Vec<&str> = lower.iter().map(|hit| hit.key.as_str()).collect();
+        let mut upper_keys: Vec<&str> = upper.iter().map(|hit| hit.key.as_str()).collect();
+        lower_keys.sort_unstable();
+        upper_keys.sort_unstable();
+        assert_eq!(lower_keys, upper_keys);
+        let mut expected = expected_keys_for("octo/alpha");
+        expected.sort_unstable();
+        assert_eq!(lower_keys, expected);
+    }
+
+    /// An issue comment whose parent is stored by node id (`parent_type =
+    /// "issue"`) is still found by a repository filter -- the join has to
+    /// follow `parent_type` to the right table, not pattern-match
+    /// `parent_key` itself.
+    #[test]
+    fn repository_filter_finds_issue_comment_stored_by_node_id() {
+        let warehouse = GithubDW::open_in_memory().unwrap();
+        seed_repo_filter_fixture(&warehouse);
+        let conn = warehouse.connection();
+
+        let hits = search(
+            conn,
+            "widget",
+            &SearchOptions {
+                scope: SearchScope::Comments,
+                repository: Some("octo/al_ha".into()),
+                limit: 20,
+            },
+        )
+        .unwrap();
+
+        assert!(
+            hits.iter()
+                .any(|hit| hit.kind == "issue_comment" && hit.key == "ISSNODE3"),
+            "the node-id-parented issue comment on octo/al_ha must be found"
+        );
+        assert!(
+            hits.iter().all(|hit| hit.key != "ISSNODE2"),
+            "octo/alpha-ng's issue comment must not leak into octo/al_ha's results"
+        );
+    }
+
     #[test]
     fn scope_and_repository_filters() {
         let warehouse = GithubDW::open_in_memory().unwrap();
