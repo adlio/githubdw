@@ -167,6 +167,18 @@ fn sync_all_exits_one_when_gh_is_unauthenticated() {
 }
 
 #[test]
+fn mcp_exits_nonzero_when_stdin_closes_before_a_client_connects() {
+    // Not a `sync` command, but it shares the dispatch in `main::run` that
+    // `.map(ok)` now wraps around every arm, and it has no other exit-code
+    // test anywhere. `Cli::run` already closes the child's stdin, which is
+    // enough for the MCP transport to see EOF and return an error instead
+    // of blocking, so this exercises that dispatch arm without needing a
+    // live MCP client.
+    let cli = Cli::new();
+    cli.run(&["mcp"]).code(1);
+}
+
+#[test]
 fn targets_refresh_pull_requests_and_issues() {
     let cli = Cli::seeded();
     let mut refreshed = pr(1, "first feature");
