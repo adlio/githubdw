@@ -339,6 +339,179 @@ fn raw_query_allows_read_only_forms() {
     assert_eq!(rows[0]["n"], serde_json::Value::from(2));
 }
 
+/// Seven PRs in `octo/alpha`, five of them (#1-#5) sharing one `created_at`
+/// second — the common case (imports, bots, same-second creates) that a bare
+/// `ORDER BY created_at DESC` leaves unordered among themselves, so a page
+/// boundary can land inside the tie and repeat or drop a row. `#3` carries
+/// three reviews by `carol` and `#2` carries two labels, to prove the
+/// reviewer/label EXISTS filters still select exactly one row per matching
+/// PR instead of one row per match.
+fn seed_tied_created_at(warehouse: &GithubDW) {
+    warehouse
+        .connection()
+        .execute_batch(
+            "INSERT INTO dim_entities (entity_key, entity_type, login, is_human, is_bot, name)
+             VALUES ('user:alice', 'user', 'alice', 1, 0, 'Alice'),
+                    ('user:carol', 'user', 'carol', 1, 0, 'Carol');
+             INSERT INTO dim_repositories (repo_key, owner, name)
+             VALUES ('octo/alpha', 'octo', 'alpha');
+             INSERT INTO dim_date (date_key, year, quarter, month, day_of_month, day_of_week,
+                 is_weekend, week_of_year, week_key, month_key, quarter_key, year_key, half_key)
+             VALUES ('2026-01-10', 2026, 1, 1, 10, 6, 1, 2, '2026-W02', '2026-01', '2026-Q1', '2026', '2026-H1');
+             INSERT INTO dim_time (time_key, hour, hour_12, am_pm, time_bucket, is_core_hours)
+             VALUES ('10:00', 10, 10, 'AM', 'Morning', 1);
+             INSERT INTO labels (id, repo_key, name, color, description)
+             VALUES ('L1', 'octo/alpha', 'bugfix', 'ff0000', '');
+             INSERT INTO fact_pull_requests (pr_key, number, repo_key, author_key, state, title,
+                 created_at, created_date_key, created_time_key, additions, deletions)
+             VALUES
+               ('octo/alpha#10', 10, 'octo/alpha', 'user:alice', 'OPEN', 'Tied A',
+                '2026-05-01T12:00:00Z', '2026-01-10', '10:00', 1, 0),
+               ('octo/alpha#11', 11, 'octo/alpha', 'user:alice', 'OPEN', 'Tied B',
+                '2026-05-01T12:00:00Z', '2026-01-10', '10:00', 1, 0),
+               ('octo/alpha#12', 12, 'octo/alpha', 'user:alice', 'OPEN', 'Tied C',
+                '2026-05-01T12:00:00Z', '2026-01-10', '10:00', 1, 0),
+               ('octo/alpha#13', 13, 'octo/alpha', 'user:alice', 'OPEN', 'Tied D',
+                '2026-05-01T12:00:00Z', '2026-01-10', '10:00', 1, 0),
+               ('octo/alpha#14', 14, 'octo/alpha', 'user:alice', 'OPEN', 'Tied E',
+                '2026-05-01T12:00:00Z', '2026-01-10', '10:00', 1, 0),
+               ('octo/alpha#15', 15, 'octo/alpha', 'user:alice', 'OPEN', 'Newer',
+                '2026-05-02T12:00:00Z', '2026-01-10', '10:00', 1, 0),
+               ('octo/alpha#16', 16, 'octo/alpha', 'user:alice', 'OPEN', 'Newest',
+                '2026-05-03T12:00:00Z', '2026-01-10', '10:00', 1, 0);
+             INSERT INTO fact_reviews (review_key, pr_key, reviewer_key, state, submitted_at,
+                 submitted_date_key, submitted_time_key)
+             VALUES ('TR1', 'octo/alpha#12', 'user:carol', 'APPROVED', '2026-05-01T13:00:00Z',
+                 '2026-01-10', '10:00'),
+                    ('TR2', 'octo/alpha#12', 'user:carol', 'COMMENTED', '2026-05-01T13:05:00Z',
+                 '2026-01-10', '10:00'),
+                    ('TR3', 'octo/alpha#12', 'user:carol', 'COMMENTED', '2026-05-01T13:10:00Z',
+                 '2026-01-10', '10:00');
+             INSERT INTO pr_labels (pr_key, label_id) VALUES ('octo/alpha#11', 'L1');
+             INSERT INTO labels (id, repo_key, name, color, description)
+             VALUES ('L2', 'octo/alpha', 'docs', '00ff00', '');
+             INSERT INTO pr_labels (pr_key, label_id) VALUES ('octo/alpha#11', 'L2');",
+        )
+        .unwrap();
+}
+
+/// Hand-written order for `seed_tied_created_at`: newest `created_at` first,
+/// `pr_key` DESC breaking the five-way tie. Never computed by the production
+/// query under test.
+const TIED_FIXTURE_ORDER: [&str; 7] = [
+    "octo/alpha#16",
+    "octo/alpha#15",
+    "octo/alpha#14",
+    "octo/alpha#13",
+    "octo/alpha#12",
+    "octo/alpha#11",
+    "octo/alpha#10",
+];
+
+#[test]
+fn paging_through_a_created_at_tie_covers_every_row_once() {
+    let warehouse = GithubDW::open_in_memory().unwrap();
+    seed_tied_created_at(&warehouse);
+    let conn = warehouse.connection();
+
+    let mut seen = Vec::new();
+    for offset in [0, 2, 4, 6] {
+        let page = QueryBuilder::new(conn)
+            .limit(2)
+            .offset(offset)
+            .pull_requests()
+            .unwrap();
+        seen.extend(page.into_iter().map(|row| row.pr_key));
+    }
+    assert_eq!(
+        seen, TIED_FIXTURE_ORDER,
+        "every page's union must be each PR once, in the hand-written order"
+    );
+}
+
+#[test]
+fn paging_through_a_created_at_tie_with_a_reviewer_filter() {
+    let warehouse = GithubDW::open_in_memory().unwrap();
+    seed_tied_created_at(&warehouse);
+    let conn = warehouse.connection();
+
+    // octo/alpha#12 has three reviews by carol; the EXISTS filter must still
+    // return that PR exactly once, not once per review.
+    let rows = QueryBuilder::new(conn)
+        .reviewer("carol")
+        .pull_requests()
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.pr_key.as_str()).collect::<Vec<_>>(),
+        vec!["octo/alpha#12"],
+        "no duplicate row per matching review"
+    );
+    assert_eq!(
+        QueryBuilder::new(conn).reviewer("carol").count().unwrap(),
+        1
+    );
+}
+
+#[test]
+fn paging_through_a_created_at_tie_with_a_label_filter() {
+    let warehouse = GithubDW::open_in_memory().unwrap();
+    seed_tied_created_at(&warehouse);
+    let conn = warehouse.connection();
+
+    // octo/alpha#11 carries two labels; "bugfix" and "docs" both match it,
+    // but the EXISTS filter must still return that PR exactly once.
+    let rows = QueryBuilder::new(conn)
+        .label("bugfix")
+        .pull_requests()
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.pr_key.as_str()).collect::<Vec<_>>(),
+        vec!["octo/alpha#11"],
+        "no duplicate row per matching label"
+    );
+    assert_eq!(QueryBuilder::new(conn).label("bugfix").count().unwrap(), 1);
+
+    // A PR with two matching labels still counts once if both are filtered.
+    let rows = QueryBuilder::new(conn)
+        .label("bugfix")
+        .label("docs")
+        .pull_requests()
+        .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.pr_key.as_str()).collect::<Vec<_>>(),
+        vec!["octo/alpha#11"],
+        "two matching labels on one PR still yield one row"
+    );
+}
+
+/// `EXPLAIN QUERY PLAN` for the base listing should no longer show a
+/// `USE TEMP B-TREE FOR DISTINCT`, since `pull_requests()` dropped DISTINCT
+/// now that reviewer/label filters no longer join.
+#[test]
+fn pull_requests_plan_has_no_temp_btree_for_distinct() {
+    let warehouse = GithubDW::open_in_memory().unwrap();
+    seed_tied_created_at(&warehouse);
+    let conn = warehouse.connection();
+
+    let sql = "EXPLAIN QUERY PLAN SELECT p.pr_key, p.number, p.repo_key, p.author_key, p.state, \
+               p.title, p.created_at, p.merged_at, p.comment_count, p.review_count, \
+               p.additions, p.deletions, ae.login, ae.entity_type \
+               FROM fact_pull_requests p \
+               LEFT JOIN dim_entities ae ON ae.entity_key = p.author_key \
+               ORDER BY p.created_at DESC, p.pr_key DESC LIMIT 2";
+    let mut statement = conn.prepare(sql).unwrap();
+    let mut rows = statement.query([]).unwrap();
+    let mut plan_lines = Vec::new();
+    while let Some(row) = rows.next().unwrap() {
+        let detail: String = row.get(3).unwrap();
+        plan_lines.push(detail);
+    }
+    assert!(
+        !plan_lines.iter().any(|line| line.contains("DISTINCT")),
+        "plan should not need a temp B-tree for DISTINCT: {plan_lines:?}"
+    );
+}
+
 #[test]
 fn empty_groups_match_no_pull_requests() {
     let warehouse = GithubDW::open_in_memory().unwrap();
