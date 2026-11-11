@@ -436,3 +436,126 @@ fn empty_group_metrics_are_zero() {
     let repos = engine.repo_group_metrics("none", &[], &period).unwrap();
     assert_eq!(repos.prs_opened.current, 0);
 }
+
+/// alice leaves one review of each state on bob's PR: APPROVED,
+/// CHANGES_REQUESTED, COMMENTED, PENDING, DISMISSED. PENDING never reaches
+/// `fact_reviews` in production (no `submitted_at` to key a date off), but a
+/// row is seeded here anyway to prove the metrics query itself excludes it,
+/// not just the sync path. By hand: only APPROVED, CHANGES_REQUESTED and
+/// COMMENTED count, so every review count and leaderboard reads 3, never 5.
+fn seed_review_states(warehouse: &GithubDW) {
+    seed(warehouse);
+    let conn = warehouse.connection();
+    conn.execute_batch(
+        "INSERT INTO fact_reviews (review_key, pr_key, reviewer_key, state, submitted_at,
+             submitted_date_key, submitted_time_key)
+         VALUES
+           ('RS1', 'octo/alpha#4', 'user:alice', 'APPROVED', '2026-04-21T10:00:00Z', '2026-04-20', '10:00'),
+           ('RS2', 'octo/alpha#4', 'user:alice', 'CHANGES_REQUESTED', '2026-04-21T11:00:00Z', '2026-04-20', '10:00'),
+           ('RS3', 'octo/alpha#4', 'user:alice', 'COMMENTED', '2026-04-21T12:00:00Z', '2026-04-20', '10:00'),
+           ('RS4', 'octo/alpha#4', 'user:alice', 'PENDING', '2026-04-21T13:00:00Z', '2026-04-20', '10:00'),
+           ('RS5', 'octo/alpha#4', 'user:alice', 'DISMISSED', '2026-04-21T14:00:00Z', '2026-04-20', '10:00');",
+    )
+    .unwrap();
+}
+
+#[test]
+fn review_counts_exclude_pending_and_dismissed() {
+    let warehouse = GithubDW::open_in_memory().unwrap();
+    seed_review_states(&warehouse);
+    let conn = warehouse.connection();
+    let engine = MetricsEngine::new(conn).as_of(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+    let period = Period::Quarter(2026, 2);
+
+    // user_metrics: reviews_given for alice already includes the pre-existing
+    // R2 (APPROVED, on bob's PR #4) from `seed`, plus the three counted new
+    // ones here = 4; PENDING and DISMISSED must not add to it.
+    let user = engine.user_metrics("alice", &period).unwrap();
+    assert_eq!(user.reviews_given.current, 4, "1 pre-seeded + 3 of 5 new");
+
+    // reviews_received for bob (PR #4's author) must match the same filter.
+    let bob = engine.user_metrics("bob", &period).unwrap();
+    assert_eq!(bob.reviews_received.current, 4);
+
+    // Reviewer leaderboard on PR #4's repo: alice's count is 4, not 6.
+    let repo_board = engine
+        .repo_aggregations("octo/alpha", &period, 10)
+        .unwrap()
+        .top_reviewers;
+    let alice_repo_count = repo_board
+        .iter()
+        .find(|e| e.entity_key == "user:alice")
+        .expect("alice reviewed in this repo")
+        .current;
+    assert_eq!(alice_repo_count, 4);
+
+    // Repo total_reviews: bob's R1 (APPROVED, PR #2) + alice's 4 = 5.
+    let repo = engine.repo_metrics("octo/alpha", &period).unwrap();
+    assert_eq!(repo.total_reviews.current, 5);
+
+    // user_group_metrics and repo_group_metrics apply the same filter.
+    let user_group = engine
+        .user_group_metrics("g", &["alice".into()], &period)
+        .unwrap();
+    assert_eq!(user_group.reviews_given.unwrap().current, 4);
+
+    let repo_group = engine
+        .repo_group_metrics("rg", &["octo/alpha".into()], &period)
+        .unwrap();
+    assert_eq!(repo_group.total_reviews.unwrap().current, 5);
+
+    // top_reviewed_authors (bob is reviewed by alice): 4, not 6.
+    let reviewed_authors = engine
+        .user_aggregations("alice", &period, 10)
+        .unwrap()
+        .top_reviewed_authors;
+    let bob_reviewed_count = reviewed_authors
+        .iter()
+        .find(|e| e.entity_key == "user:bob")
+        .expect("bob was reviewed by alice")
+        .current;
+    assert_eq!(bob_reviewed_count, 4);
+
+    // Previous-period comparisons apply the same state filter: seed the
+    // same five states in Q1 and confirm the previous-window count is 3,
+    // not 5, exactly like the current window.
+    conn.execute_batch(
+        "INSERT INTO fact_reviews (review_key, pr_key, reviewer_key, state, submitted_at,
+             submitted_date_key, submitted_time_key)
+         VALUES
+           ('RQ1', 'octo/alpha#1', 'user:bob', 'APPROVED', '2026-01-10T19:00:00Z', '2026-01-10', '10:00'),
+           ('RQ2', 'octo/alpha#1', 'user:bob', 'CHANGES_REQUESTED', '2026-01-10T20:00:00Z', '2026-01-10', '10:00'),
+           ('RQ3', 'octo/alpha#1', 'user:bob', 'COMMENTED', '2026-01-10T21:00:00Z', '2026-01-10', '10:00'),
+           ('RQ4', 'octo/alpha#1', 'user:bob', 'PENDING', '2026-01-10T22:00:00Z', '2026-01-10', '10:00'),
+           ('RQ5', 'octo/alpha#1', 'user:bob', 'DISMISSED', '2026-01-10T23:00:00Z', '2026-01-10', '10:00');",
+    )
+    .unwrap();
+    let bob_previous = engine.user_metrics("bob", &period).unwrap();
+    assert_eq!(
+        bob_previous.reviews_given.previous, 3,
+        "previous window applies the same APPROVED/CHANGES_REQUESTED/COMMENTED filter"
+    );
+}
+
+/// Case sensitivity: the fixture recipes and GitHub's API both write review
+/// states upper case, but the filter must not silently drop a differently
+/// cased row — it should still be counted if it matches case-insensitively.
+#[test]
+fn review_state_filter_is_case_insensitive() {
+    let warehouse = GithubDW::open_in_memory().unwrap();
+    seed(&warehouse);
+    let conn = warehouse.connection();
+    conn.execute_batch(
+        "INSERT INTO fact_reviews (review_key, pr_key, reviewer_key, state, submitted_at,
+             submitted_date_key, submitted_time_key)
+         VALUES ('RC-LOWER', 'octo/alpha#4', 'user:alice', 'approved',
+             '2026-04-21T10:00:00Z', '2026-04-20', '10:00');",
+    )
+    .unwrap();
+    let engine = MetricsEngine::new(conn).as_of(NaiveDate::from_ymd_opt(2026, 7, 1).unwrap());
+    let user = engine
+        .user_metrics("alice", &Period::Quarter(2026, 2))
+        .unwrap();
+    // 1 pre-seeded (R2, APPROVED) + 1 lower-case 'approved' = 2.
+    assert_eq!(user.reviews_given.current, 2);
+}

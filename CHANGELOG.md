@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Review counts exclude pending and dismissed reviews, so numbers change.
+  Every review metric and leaderboard (`reviews_given`, `reviews_received`,
+  `total_reviews`, `top_reviewers`, `top_reviewed_authors`) now counts only
+  APPROVED, CHANGES_REQUESTED and COMMENTED reviews. PENDING (an unsubmitted
+  draft) and DISMISSED (withdrawn by a maintainer) no longer count.
+
 ## [0.5.0] - 2026-11-09
 
 ### Fixed
