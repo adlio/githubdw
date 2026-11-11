@@ -1,13 +1,25 @@
 //! `githubdw sync ...`: run walks, targeted refreshes, and repair plans.
 
 use std::path::PathBuf;
+use std::process::ExitCode;
 
 use githubdw::GithubDW;
 use githubdw::fetch::git_files::GitRecoveryConfig;
 use githubdw::storage::sync_state_repository as sync_state;
 
 use crate::cli::SyncCommand;
-use crate::open_warehouse;
+use crate::{EXIT_PARTIAL_FAILURE, open_warehouse};
+
+/// Exit `ExitCode::SUCCESS` when `failed` is true, else the "ran but some
+/// source or item failed" code. A `sync all`/`repo`/`user` run keeps working
+/// through every source either way; only the exit code marks the outcome.
+fn exit_for(failed: bool) -> ExitCode {
+    if failed {
+        ExitCode::from(EXIT_PARTIAL_FAILURE)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
 
 /// Pull requests one repository may process per `sync all` run before it
 /// checkpoints and yields to the next source.
@@ -23,7 +35,7 @@ fn git_recovery_for(warehouse: &GithubDW) -> Option<GitRecoveryConfig> {
     Some(GitRecoveryConfig::github(parent.join("git-cache")))
 }
 
-pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<()> {
+pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCode> {
     // Plans only read: open without migrating or taking write locks.
     let warehouse = if matches!(
         &command,
@@ -69,6 +81,10 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<()> {
             for (item, error) in &summary.failed {
                 eprintln!("failed {item}: {error}");
             }
+            if !summary.failed.is_empty() {
+                eprintln!("1 of 1 sources failed");
+            }
+            return Ok(exit_for(!summary.failed.is_empty()));
         }
         SyncCommand::User {
             login,
@@ -104,6 +120,10 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<()> {
             for (item, error) in &summary.failed {
                 eprintln!("failed {item}: {error}");
             }
+            if !summary.failed.is_empty() {
+                eprintln!("1 of 1 sources failed");
+            }
+            return Ok(exit_for(!summary.failed.is_empty()));
         }
         SyncCommand::All => {
             let mut client = githubdw::fetch::GhClient::new();
@@ -116,6 +136,7 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<()> {
                 println!("{notice}");
             }
             let sources = plan.fair_sources(warehouse.connection())?;
+            let mut failed_sources = 0usize;
             for (index, source) in sources.iter().enumerate() {
                 // Record the successor first: a killed run resumes at
                 // another source rather than starving it indefinitely.
@@ -155,10 +176,20 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<()> {
                         for (item, error) in &summary.failed {
                             eprintln!("failed {item}: {error}");
                         }
+                        if !summary.failed.is_empty() {
+                            failed_sources += 1;
+                        }
                     }
-                    Err(error) => eprintln!("{label}: {error}"),
+                    Err(error) => {
+                        eprintln!("{label}: {error}");
+                        failed_sources += 1;
+                    }
                 }
             }
+            if failed_sources > 0 {
+                eprintln!("{failed_sources} of {} sources failed", sources.len());
+            }
+            return Ok(exit_for(failed_sources > 0));
         }
         SyncCommand::Targets {
             pull_requests,
@@ -420,5 +451,30 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<()> {
             }
         }
     }
-    Ok(())
+    Ok(ExitCode::SUCCESS)
+}
+
+#[cfg(test)]
+mod exit_code_tests {
+    use super::exit_for;
+    use std::process::ExitCode;
+
+    #[test]
+    fn no_failures_is_success_even_when_budget_partial() {
+        // `exit_for` only ever sees whether `failed` is non-empty: a
+        // budget-partial run (resumes next run) with nothing failed must
+        // still map to success, so the caller passes `false` for it.
+        assert_eq!(
+            format!("{:?}", exit_for(false)),
+            format!("{:?}", ExitCode::SUCCESS)
+        );
+    }
+
+    #[test]
+    fn a_failure_maps_to_the_partial_failure_code() {
+        assert_eq!(
+            format!("{:?}", exit_for(true)),
+            format!("{:?}", ExitCode::from(super::EXIT_PARTIAL_FAILURE))
+        );
+    }
 }

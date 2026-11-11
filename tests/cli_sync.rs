@@ -82,7 +82,11 @@ fn sync_all_walks_every_monitored_source_and_reports_failures_per_source() {
         pr_page(&[pr(1, "first feature"), pr(2, "second change")]),
     );
 
-    let run = cli.run(&["sync", "all"]).ok();
+    // One of three sources errors outright (no fixture for octocat/broken):
+    // the other two still sync, and the run exits 3 ("ran, something
+    // failed") rather than the 1 used for errors that stop the run before
+    // any work happens.
+    let run = cli.run(&["sync", "all"]).code(3);
     assert!(
         run.stdout.contains("skipping org 'acme'"),
         "orgs are announced as unsupported:\n{}",
@@ -98,8 +102,13 @@ fn sync_all_walks_every_monitored_source_and_reports_failures_per_source() {
         "{}",
         run.stdout
     );
-    // One failing source does not stop the others or fail the run.
+    // One failing source does not stop the others.
     assert!(run.stderr.contains("octocat/broken: "), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("1 of 3 sources failed"),
+        "{}",
+        run.stderr
+    );
     assert!(
         cli.run(&["monitor", "list"])
             .ok()
@@ -108,6 +117,53 @@ fn sync_all_walks_every_monitored_source_and_reports_failures_per_source() {
             .any(|line| line.contains("octocat/hello") && !line.ends_with("never")),
         "the synced repository records its last sync"
     );
+}
+
+#[test]
+fn sync_all_exits_zero_when_every_source_succeeds() {
+    let cli = Cli::new();
+    cli.run(&["monitor", "add-repo", REPO]).ok();
+    cli.route("issues(first", issue_page(&[]));
+    cli.route(
+        "name=hello",
+        pr_page(&[pr(1, "first feature"), pr(2, "second change")]),
+    );
+
+    cli.run(&["sync", "all"]).ok();
+}
+
+#[test]
+fn sync_repo_exits_nonzero_when_one_item_fails() {
+    let cli = Cli::new();
+    // PR #1 is fine. PR #2 claims a further page of comments but gives no
+    // cursor to fetch it from, which the walk records as a failed item
+    // (unretrievable, not truncated) instead of aborting the whole sync.
+    let mut broken = pr(2, "second change");
+    broken["comments"] = json!({
+        "pageInfo": {"hasNextPage": true, "endCursor": null},
+        "nodes": [comment("C2")]
+    });
+    cli.queue(pr_page(&[broken, pr(1, "first feature")]));
+    cli.queue(issue_page(&[]));
+
+    let run = cli.run(&["sync", "repo", REPO, "--skip-diffs"]).code(3);
+    assert!(
+        run.stderr.contains("failed octocat/hello#2"),
+        "{}",
+        run.stderr
+    );
+    assert!(
+        run.stderr.contains("1 of 1 sources failed"),
+        "{}",
+        run.stderr
+    );
+}
+
+#[test]
+fn sync_all_exits_one_when_gh_is_unauthenticated() {
+    let cli = Cli::new();
+    cli.fail_auth();
+    cli.run(&["sync", "all"]).code(1);
 }
 
 #[test]
