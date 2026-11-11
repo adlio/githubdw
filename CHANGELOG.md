@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `search`'s repository filter (`SearchOptions::repository`) no longer matches
+  by prefix. Searching `octo/alpha` no longer also returns rows from
+  `octo/alpha-ng`, and a repo name containing `_` or `%` (both legal in GitHub
+  repo names and both SQL `LIKE` wildcards) no longer matches unrelated repos.
+  The filter now compares `repo_key` with `=` everywhere, including issue
+  comments, which are joined through `parent_type` to the pull request or
+  issue row that owns them rather than pattern-matched on `parent_key` (needed
+  because an issue comment's `parent_key` is a node id, not an `owner/repo#n`
+  key). The filter also lowercases its own input once, since `repo_key` is
+  always stored lowercased.
+
 ## [0.5.0] - 2026-11-09
 
 ### Fixed
