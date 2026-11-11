@@ -327,22 +327,26 @@ impl<'a> QueryBuilder<'a> {
             joins.push("JOIN dim_repositories dr ON dr.repo_key = p.repo_key".into());
             add_in_clause("dr.owner", &self.orgs, &mut conditions, &mut parameters);
         }
+        // Reviewers and labels are one-to-many on a PR (one PR can have many
+        // reviews or many matching labels), so a JOIN would multiply the PR
+        // row once per match. EXISTS tests the match without adding a row,
+        // so the result stays one row per PR and needs no DISTINCT.
         if !self.reviewers.is_empty() {
-            joins.push("JOIN fact_reviews qr ON qr.pr_key = p.pr_key".into());
-            add_in_clause(
-                "qr.reviewer_key",
-                &self.reviewers,
-                &mut conditions,
-                &mut parameters,
-            );
+            let placeholders = vec!["?"; self.reviewers.len()].join(", ");
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM fact_reviews qr \
+                 WHERE qr.pr_key = p.pr_key AND qr.reviewer_key IN ({placeholders}))"
+            ));
+            parameters.extend(self.reviewers.iter().map(|v| SqlValue::Text(v.clone())));
         }
         if !self.labels.is_empty() {
-            joins.push(
-                "JOIN pr_labels pl ON pl.pr_key = p.pr_key \
-                 JOIN labels lbl ON lbl.id = pl.label_id"
-                    .into(),
-            );
-            add_in_clause("lbl.name", &self.labels, &mut conditions, &mut parameters);
+            let placeholders = vec!["?"; self.labels.len()].join(", ");
+            conditions.push(format!(
+                "EXISTS (SELECT 1 FROM pr_labels pl \
+                 JOIN labels lbl ON lbl.id = pl.label_id \
+                 WHERE pl.pr_key = p.pr_key AND lbl.name IN ({placeholders}))"
+            ));
+            parameters.extend(self.labels.iter().map(|v| SqlValue::Text(v.clone())));
         }
         if let Some(period_key) = self.period.as_deref() {
             let column = Period::column_for_key(period_key);
@@ -393,18 +397,22 @@ impl<'a> QueryBuilder<'a> {
         )
     }
 
-    /// Matching PRs ordered by created_at DESC. Honors limit/offset.
+    /// Matching PRs ordered by created_at DESC, with `pr_key` DESC as a
+    /// tie-break. Reviewer/label filters match via EXISTS rather than a join,
+    /// so each PR appears at most once and a LIMIT/OFFSET page never repeats
+    /// or drops a row that shares a `created_at` with another. Honors
+    /// limit/offset.
     pub fn pull_requests(self) -> Result<Vec<PullRequestSummary>> {
         let (joins, conditions, parameters) = self.assemble();
         // The author is resolved back to `dim_entities` so callers get the login
         // GitHub uses. LEFT so the join can only add columns, never drop a row.
         let sql = format!(
-            "SELECT DISTINCT p.pr_key, p.number, p.repo_key, p.author_key, p.state, p.title,
+            "SELECT p.pr_key, p.number, p.repo_key, p.author_key, p.state, p.title,
                     p.created_at, p.merged_at, p.comment_count, p.review_count,
                     p.additions, p.deletions, ae.login, ae.entity_type
              FROM fact_pull_requests p {joins}
              LEFT JOIN dim_entities ae ON ae.entity_key = p.author_key {}
-             ORDER BY p.created_at DESC{}",
+             ORDER BY p.created_at DESC, p.pr_key DESC{}",
             Self::where_clause(&conditions),
             self.pagination_clause(),
         );
@@ -455,11 +463,11 @@ impl<'a> QueryBuilder<'a> {
     /// `(SUM(additions), SUM(deletions))`.
     pub fn lines_changed(self) -> Result<(u64, u64)> {
         let (joins, conditions, parameters) = self.assemble();
+        // No join here is one-to-many anymore (reviewer/label filters match
+        // via EXISTS), so each PR contributes exactly one row to sum.
         let sql = format!(
-            "SELECT COALESCE(SUM(additions), 0), COALESCE(SUM(deletions), 0) FROM (
-                SELECT DISTINCT p.pr_key, p.additions, p.deletions
-                FROM fact_pull_requests p {joins} {}
-             )",
+            "SELECT COALESCE(SUM(p.additions), 0), COALESCE(SUM(p.deletions), 0)
+             FROM fact_pull_requests p {joins} {}",
             Self::where_clause(&conditions)
         );
         let (added, removed): (i64, i64) =

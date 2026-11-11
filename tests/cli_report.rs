@@ -12,11 +12,13 @@ fn query_table_lists_pull_requests() {
     let cli = Cli::seeded();
     let run = cli.run(&["query"]).ok();
     let lines: Vec<&str> = run.stdout.lines().collect();
+    // Both PRs share one `createdAt`; the pr_key DESC tie-break orders #2
+    // before #1.
     assert_eq!(
         lines,
         [
-            "octocat/hello#1\tMERGED\toctocat\t2026-01-05T18:00:00Z\tfirst feature",
             "octocat/hello#2\tMERGED\toctocat\t2026-01-05T18:00:00Z\tsecond change",
+            "octocat/hello#1\tMERGED\toctocat\t2026-01-05T18:00:00Z\tfirst feature",
         ]
     );
 }
@@ -47,7 +49,8 @@ fn query_json_and_csv_carry_the_same_rows() {
         .iter()
         .map(|row| row["pr_key"].as_str().unwrap())
         .collect();
-    assert_eq!(keys, ["octocat/hello#1", "octocat/hello#2"]);
+    // Tied createdAt; pr_key DESC tie-break orders #2 before #1.
+    assert_eq!(keys, ["octocat/hello#2", "octocat/hello#1"]);
     assert_eq!(json[0]["review_count"], 1);
 
     let csv = cli.run(&["query", "--output", "csv"]).ok().stdout;
@@ -100,12 +103,13 @@ fn query_filters_narrow_the_rows() {
     assert_eq!(count(&["--period", "2025-12"]), "0");
     assert_eq!(count(&["--label", "bug"]), "0");
 
+    // Tied createdAt; pr_key DESC puts #2 first, so offset 1 lands on #1.
     let page = cli
         .run(&["query", "--limit", "1", "--offset", "1"])
         .ok()
         .stdout;
     assert_eq!(page.lines().count(), 1, "{page}");
-    assert!(page.starts_with("octocat/hello#2\t"), "{page}");
+    assert!(page.starts_with("octocat/hello#1\t"), "{page}");
 }
 
 #[test]
