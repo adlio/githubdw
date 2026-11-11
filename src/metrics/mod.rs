@@ -12,6 +12,19 @@ use crate::query::{entity_namespace, resolve_entity_keys, to_bare_login};
 use crate::storage::time_dimension;
 pub use types::*;
 
+/// Review states counted toward every review metric and leaderboard.
+/// PENDING (an unsubmitted draft, invisible to anyone else) and DISMISSED
+/// (withdrawn by a maintainer) are excluded; APPROVED, CHANGES_REQUESTED
+/// and COMMENTED are kept. Compared case-insensitively since the fixture
+/// recipes and GitHub's API both write upper case, but nothing guarantees it.
+const COUNTED_REVIEW_STATES: &str = "('APPROVED', 'CHANGES_REQUESTED', 'COMMENTED')";
+
+/// SQL fragment restricting a `fact_reviews` alias to `COUNTED_REVIEW_STATES`.
+/// `alias` is the table alias the query joins `fact_reviews` under (e.g. `fr`).
+fn review_state_filter(alias: &str) -> String {
+    format!("AND UPPER({alias}.state) IN {COUNTED_REVIEW_STATES}")
+}
+
 /// The key a user report is labeled with when a login resolves to several,
 /// normalized so it is always `<type>:<login>`.
 fn primary_key(keys: &[String], login: &str) -> String {
@@ -243,7 +256,8 @@ impl<'a> MetricsEngine<'a> {
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
             &format!(
-                "AND fr.reviewer_key IN ({placeholders}) AND p.author_key NOT IN ({placeholders})"
+                "AND fr.reviewer_key IN ({placeholders}) AND p.author_key NOT IN ({placeholders}) {}",
+                review_state_filter("fr")
             ),
             "1",
             &both_parameter,
@@ -253,7 +267,8 @@ impl<'a> MetricsEngine<'a> {
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
             &format!(
-                "AND p.author_key IN ({placeholders}) AND fr.reviewer_key NOT IN ({placeholders})"
+                "AND p.author_key IN ({placeholders}) AND fr.reviewer_key NOT IN ({placeholders}) {}",
+                review_state_filter("fr")
             ),
             "1",
             &both_parameter,
@@ -342,7 +357,8 @@ impl<'a> MetricsEngine<'a> {
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
             &format!(
-                "AND p.author_key IN ({placeholders}) AND fr.reviewer_key NOT IN ({placeholders})"
+                "AND p.author_key IN ({placeholders}) AND fr.reviewer_key NOT IN ({placeholders}) {}",
+                review_state_filter("fr")
             ),
             &both_parameter,
             &windows,
@@ -353,7 +369,8 @@ impl<'a> MetricsEngine<'a> {
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
             &format!(
-                "AND fr.reviewer_key IN ({placeholders}) AND p.author_key NOT IN ({placeholders})"
+                "AND fr.reviewer_key IN ({placeholders}) AND p.author_key NOT IN ({placeholders}) {}",
+                review_state_filter("fr")
             ),
             &both_parameter,
             &windows,
@@ -393,7 +410,7 @@ impl<'a> MetricsEngine<'a> {
         let total_reviews = self.split_measure(
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
-            "AND p.repo_key = ?",
+            &format!("AND p.repo_key = ? {}", review_state_filter("fr")),
             "1",
             &repo_parameter,
             &windows,
@@ -478,7 +495,7 @@ impl<'a> MetricsEngine<'a> {
             "fr.reviewer_key",
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
-            "AND p.repo_key = ?",
+            &format!("AND p.repo_key = ? {}", review_state_filter("fr")),
             &repo_parameter,
             &windows,
             top,
@@ -545,7 +562,8 @@ impl<'a> MetricsEngine<'a> {
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
             &format!(
-                "AND fr.reviewer_key IN ({placeholders}) AND p.author_key NOT IN ({placeholders})"
+                "AND fr.reviewer_key IN ({placeholders}) AND p.author_key NOT IN ({placeholders}) {}",
+                review_state_filter("fr")
             ),
             "1",
             &doubled_parameters,
@@ -599,7 +617,10 @@ impl<'a> MetricsEngine<'a> {
         let total_reviews = self.split_measure(
             "fact_reviews fr JOIN fact_pull_requests p ON p.pr_key = fr.pr_key",
             "fr.submitted_date_key",
-            &format!("AND p.repo_key IN ({placeholders})"),
+            &format!(
+                "AND p.repo_key IN ({placeholders}) {}",
+                review_state_filter("fr")
+            ),
             "1",
             &repo_parameters,
             &windows,
