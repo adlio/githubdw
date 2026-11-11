@@ -122,6 +122,22 @@ fn query_rejects_bad_arguments() {
             vec!["query", "--output", "yaml"],
             "unknown output format 'yaml'",
         ),
+        (
+            vec!["query", "--period", "2026-M13", "--output", "count"],
+            "bad month '2026-M13'",
+        ),
+        (
+            vec!["query", "--period", "2026-M0", "--output", "count"],
+            "bad month '2026-M0'",
+        ),
+        (
+            vec!["query", "--period", "2026-W99", "--output", "count"],
+            "bad week '2026-W99'",
+        ),
+        (
+            vec!["query", "--period", "last-0", "--output", "count"],
+            "bad rolling period 'last-0'",
+        ),
     ] {
         let run = cli.run(&arguments).failed();
         assert!(run.stderr.contains(needle), "{arguments:?}: {}", run.stderr);

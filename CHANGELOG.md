@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `--period` no longer silently accepts out-of-range input. `2026-M13`,
+  `2026-M0`, `2026-W99`, and `last-0` now return an error naming the bad value
+  and the valid range instead of printing `0` or risking a panic. Months are
+  checked to 1-12, ISO weeks to 1 through the year's actual last week (52 or
+  53), and `last-N` to 1 through a 3660-day cap. All date arithmetic in
+  `period.rs` now uses checked operations.
+
 ## [0.5.0] - 2026-11-09
 
 ### Fixed
