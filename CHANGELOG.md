@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `githubdw mcp --read-only` runs the MCP server with no write access: the
+  `trigger_sync` tool is omitted from `tools/list` and refuses a direct call,
+  and `manage_monitors` refuses `add`/`remove` while `action=list` still
+  works. Default behavior (no flag) is unchanged.
+- Every MCP tool now carries annotations describing its effect:
+  `readOnlyHint` for `query_pull_requests`, `get_metrics`, and `search`;
+  `destructiveHint`/`idempotentHint` for `manage_monitors`; `openWorldHint`
+  for `trigger_sync`.
+
 ## [0.5.0] - 2026-11-09
 
 ### Fixed

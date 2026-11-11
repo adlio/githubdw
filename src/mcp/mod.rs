@@ -16,8 +16,8 @@ use std::time::Duration;
 use rmcp::handler::server::router::tool::{ToolRoute, ToolRouter};
 use rmcp::handler::server::tool::ToolCallContext;
 use rmcp::model::{
-    CallToolRequestParam, CallToolResult, Content, Implementation, ListToolsResult,
-    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool,
+    CallToolRequestParam, CallToolResult, Content, ErrorCode, Implementation, ListToolsResult,
+    PaginatedRequestParam, ServerCapabilities, ServerInfo, Tool, ToolAnnotations,
 };
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{ErrorData as McpError, ServerHandler};
@@ -51,6 +51,10 @@ pub struct GithubDwServer {
     /// Builds the GitHub client for each sync. Replaceable in tests.
     client_factory: Arc<dyn Fn() -> crate::fetch::GhClient + Send + Sync>,
     sync_item_budget: i64,
+    /// When true, `trigger_sync` is hidden from `tools/list` and refused if
+    /// called directly; `manage_monitors` keeps listing but refuses `add`
+    /// and `remove`. `list` always stays available in both modes.
+    read_only: bool,
     tool_router: ToolRouter<Self>,
 }
 
@@ -72,24 +76,43 @@ fn caller_error(error: crate::Error) -> McpError {
     }
 }
 
+/// The server is configured `--read-only` and refuses a write action.
+fn read_only_refused(action: &str) -> McpError {
+    McpError::new(
+        ErrorCode::INVALID_REQUEST,
+        format!("the server is running read-only; {action} is disabled"),
+        None,
+    )
+}
+
 /// Pretty-print a JSON value into a single text content block.
 fn json_result(value: serde_json::Value) -> Result<CallToolResult, McpError> {
     let text = serde_json::to_string_pretty(&value).map_err(internal_error)?;
     Ok(CallToolResult::success(vec![Content::text(text)]))
 }
 
-/// Build a `Tool` descriptor with a schemars-derived input schema.
-fn tool<T: schemars::JsonSchema + 'static>(name: &'static str, description: &'static str) -> Tool {
+/// Build a `Tool` descriptor with a schemars-derived input schema and the
+/// given annotation hints.
+fn tool<T: schemars::JsonSchema + 'static>(
+    name: &'static str,
+    description: &'static str,
+    annotations: ToolAnnotations,
+) -> Tool {
     Tool {
         name: name.into(),
         title: None,
         description: Some(description.into()),
         input_schema: rmcp::handler::server::common::schema_for_type::<T>(),
         output_schema: None,
-        annotations: None,
+        annotations: Some(annotations),
         icons: None,
         meta: None,
     }
+}
+
+/// Hints for a tool that only reads the warehouse.
+fn read_only_annotations() -> ToolAnnotations {
+    ToolAnnotations::new().read_only(true)
 }
 
 /// Deserialize a tool call's arguments into its parameter struct.
@@ -116,11 +139,22 @@ fn ready(result: Result<CallToolResult, McpError>) -> ToolFuture<'static> {
 
 impl GithubDwServer {
     pub fn new(warehouse: GithubDW) -> Self {
+        Self::with_mode(warehouse, false)
+    }
+
+    /// A server that hides `trigger_sync` from `tools/list` and refuses it
+    /// and `manage_monitors`'s `add`/`remove` actions on direct calls.
+    pub fn new_read_only(warehouse: GithubDW) -> Self {
+        Self::with_mode(warehouse, true)
+    }
+
+    fn with_mode(warehouse: GithubDW, read_only: bool) -> Self {
         Self {
             database_path: warehouse.database_path().to_path_buf(),
             warehouse: Arc::new(Mutex::new(warehouse)),
             client_factory: Arc::new(crate::fetch::GhClient::new),
             sync_item_budget: SYNC_ITEM_BUDGET,
+            read_only,
             tool_router: Self::build_tool_router(),
         }
     }
@@ -134,6 +168,7 @@ impl GithubDwServer {
                  reviewer, repo, org, user/repo group, state (open/merged/closed), label, and \
                  period. Use output='count' for totals or 'count_by_author'/'count_by_repo'/\
                  'count_by_state'/'count_by_period' for breakdowns.",
+                read_only_annotations(),
             ),
             |ctx: ToolCallContext<'_, Self>| {
                 ready(ctx.service.query_pull_requests(ctx.arguments.as_ref()))
@@ -145,6 +180,7 @@ impl GithubDwServer {
                 "Period-over-period metrics for a user, repo, user_group, or \
                  repo_group. Returns PR counts, reviews, comments, and churn with deltas vs. \
                  the previous period, plus ranked leaderboards.",
+                read_only_annotations(),
             ),
             |ctx: ToolCallContext<'_, Self>| ready(ctx.service.get_metrics(ctx.arguments.as_ref())),
         ));
@@ -153,6 +189,7 @@ impl GithubDwServer {
                 "search",
                 "Full-text search across synced pull request and issue titles, \
                  bodies, and comments (SQLite FTS5 trigram — substrings of 3+ characters match).",
+                read_only_annotations(),
             ),
             |ctx: ToolCallContext<'_, Self>| ready(ctx.service.search(ctx.arguments.as_ref())),
         ));
@@ -160,7 +197,12 @@ impl GithubDwServer {
             tool::<MonitorParams>(
                 "manage_monitors",
                 "List, add, or remove monitored users, repos, and orgs. \
-                 action='list' (default) shows everything currently tracked.",
+                 action='list' (default) shows everything currently tracked. In \
+                 --read-only mode, add and remove are refused; list still works.",
+                ToolAnnotations::new()
+                    .read_only(false)
+                    .destructive(true)
+                    .idempotent(true),
             ),
             |ctx: ToolCallContext<'_, Self>| {
                 ready(ctx.service.manage_monitors(ctx.arguments.as_ref()))
@@ -171,9 +213,17 @@ impl GithubDwServer {
                 "trigger_sync",
                 "Fetch fresh pull-request and issue data for a repository from \
                  the GitHub API into the local database. Specify days to bound the window. \
-                 Requires an authenticated gh CLI.",
+                 Requires an authenticated gh CLI. Not listed, and refused if called, when \
+                 the server is running --read-only.",
+                ToolAnnotations::new()
+                    .read_only(false)
+                    .destructive(false)
+                    .open_world(true),
             ),
             |ctx: ToolCallContext<'_, Self>| {
+                if ctx.service.read_only {
+                    return ready(Err(read_only_refused("trigger_sync")));
+                }
                 let sync = ctx.service.prepare_sync(ctx.arguments.as_ref());
                 Box::pin(async move { sync?.run().await })
             },
@@ -358,6 +408,11 @@ impl GithubDwServer {
                 json_result(json!({ "users": users, "repos": repos, "orgs": orgs }))
             }
             "add" | "remove" => {
+                if self.read_only {
+                    return Err(read_only_refused(&format!(
+                        "manage_monitors (action={action})"
+                    )));
+                }
                 let entity_type = params
                     .entity_type
                     .as_deref()
@@ -495,8 +550,14 @@ impl ServerHandler for GithubDwServer {
         _request: Option<PaginatedRequestParam>,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
+        let mut tools = self.tool_router.list_all();
+        if self.read_only {
+            // manage_monitors stays listed: its read-only `list` action still
+            // works, only `add`/`remove` are refused on direct call.
+            tools.retain(|tool| tool.name != "trigger_sync");
+        }
         std::future::ready(Ok(ListToolsResult {
-            tools: self.tool_router.list_all(),
+            tools,
             next_cursor: None,
             meta: None,
         }))
@@ -512,11 +573,16 @@ impl ServerHandler for GithubDwServer {
     }
 }
 
-/// Run the stdio MCP server until the client disconnects.
-pub async fn serve_stdio(warehouse: GithubDW) -> crate::Result<()> {
+/// Run the stdio MCP server until the client disconnects. `read_only` hides
+/// `trigger_sync` and refuses monitor writes; see [`GithubDwServer::new_read_only`].
+pub async fn serve_stdio(warehouse: GithubDW, read_only: bool) -> crate::Result<()> {
     use rmcp::ServiceExt;
 
-    let server = GithubDwServer::new(warehouse);
+    let server = if read_only {
+        GithubDwServer::new_read_only(warehouse)
+    } else {
+        GithubDwServer::new(warehouse)
+    };
     let service = server
         .serve(rmcp::transport::stdio())
         .await
