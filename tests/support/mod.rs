@@ -22,6 +22,7 @@ pub struct Cli {
 /// Captured result of one `githubdw` run.
 pub struct Run {
     pub success: bool,
+    pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,
 }
@@ -30,6 +31,7 @@ impl From<Output> for Run {
     fn from(output: Output) -> Self {
         Self {
             success: output.status.success(),
+            exit_code: output.status.code(),
             stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
         }
@@ -53,6 +55,18 @@ impl Run {
             !self.success,
             "expected failure\nstdout:\n{}\nstderr:\n{}",
             self.stdout, self.stderr
+        );
+        self
+    }
+
+    /// Panic with both streams unless the run exited with exactly `code`.
+    pub fn code(self, code: i32) -> Self {
+        assert_eq!(
+            self.exit_code,
+            Some(code),
+            "expected exit code {code}\nstdout:\n{}\nstderr:\n{}",
+            self.stdout,
+            self.stderr
         );
         self
     }

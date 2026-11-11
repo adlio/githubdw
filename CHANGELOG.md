@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `sync all`, `sync repo`, and `sync user` now exit 3 when any source or item
+  failed, instead of always exiting 0. A failure that only hit the item
+  budget (and will resume next run) is not counted as a failure. `sync all`
+  still runs every source even after one fails, and prints a one-line
+  summary of failures to stderr. Exit 1 is unchanged for errors that stop the
+  run before any work happens (missing `gh`, lock held, bad arguments).
+
 ## [0.5.0] - 2026-11-09
 
 ### Fixed
