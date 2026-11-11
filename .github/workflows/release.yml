@@ -14,8 +14,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  ci:
+    name: CI
+    uses: ./.github/workflows/ci.yml
+    secrets: inherit
+
   build:
     name: Build ${{ matrix.target }}
+    needs: ci
     runs-on: ${{ matrix.runner }}
     strategy:
       # A release is all-or-nothing: if one platform fails, fix it and re-tag
@@ -76,6 +82,22 @@ jobs:
             dist/*.tar.gz.sha256
           if-no-files-found: error
 
+  dry-run-publish:
+    name: Dry-run cargo publish
+    # Manual workflow_dispatch only: surfaces a packaging failure before a
+    # real tag triggers the release job's real publish.
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Publish dry run
+        run: cargo publish --dry-run --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+
   release:
     name: Release
     # Dry-runs (workflow_dispatch) stop after the builds succeed.
@@ -102,11 +124,25 @@ jobs:
         run: |
           # Extract the section for this version from CHANGELOG.md
           section=$(awk '/^## \['"${{ steps.version.outputs.version }}"'\]/{found=1; next} /^## \[/{if(found) exit} found{print}' CHANGELOG.md)
+          if [ -z "$(echo "$section" | tr -d '[:space:]')" ]; then
+            echo "No CHANGELOG.md section found for version ${{ steps.version.outputs.version }}" >&2
+            exit 1
+          fi
           {
             echo "notes<<EOF"
             echo "$section"
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Publish to crates.io
+        # Runs before the GitHub release is created: if publish fails, no
+        # tag is burned and no public release exists yet to clean up.
+        run: cargo publish --locked
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
 
       - name: Download build artifacts
         uses: actions/download-artifact@v4
@@ -127,11 +163,3 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_NOTES: ${{ steps.changelog.outputs.notes }}
-
-      - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Publish to crates.io
-        run: cargo publish
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
