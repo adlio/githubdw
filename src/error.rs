@@ -100,8 +100,9 @@ impl Error {
     }
 
     /// True when a smaller page could cure the failure: the provider timed out,
-    /// answered 502/504, or reported its resource limits. Any other error
-    /// would fail again at every size.
+    /// answered 502/504, reported its resource limits, or sent an empty or
+    /// cut-off JSON body (gh's `unexpected end of JSON input`, which hides the
+    /// HTTP status). Any other error would fail again at every size.
     pub fn is_page_size_symptom(&self) -> bool {
         let text = match self {
             Error::GhCommand { stderr, .. } => stderr,
@@ -115,6 +116,7 @@ impl Error {
             "timeout",
             "resource_limits",
             "something went wrong",
+            "unexpected end of json input",
         ]
         .iter()
         .any(|symptom| text.contains(symptom))
@@ -158,6 +160,7 @@ mod tests {
         assert!(gh("HTTP 504").is_page_size_symptom());
         assert!(gh("request timeout").is_page_size_symptom());
         assert!(Error::GitHubApi("RESOURCE_LIMITS_EXCEEDED".into()).is_page_size_symptom());
+        assert!(gh("unexpected end of JSON input\n").is_page_size_symptom());
         assert!(!gh("HTTP 401: Bad credentials").is_page_size_symptom());
         assert!(!gh("HTTP 403").is_page_size_symptom());
         assert!(!Error::Cancelled.is_page_size_symptom());

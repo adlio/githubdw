@@ -98,6 +98,36 @@ fn a_run_level_error_on_page_two_keeps_the_page_one_checkpoint() {
     assert_eq!(saved_checkpoint(conn).expect("durable").after, "C1");
 }
 
+/// An empty GraphQL body on the user search halves the page and the walk
+/// completes, as it did before size-only halving.
+#[test]
+fn an_empty_json_body_halves_the_user_search_page() {
+    let warehouse = los_angeles_warehouse();
+    monitor_repository::add_user(warehouse.connection(), "octocat").unwrap();
+    let mut responses = vec![Err(gh("unexpected end of JSON input\n"))];
+    responses.extend((0..16).map(|_| Ok(search_response(0, vec![]))));
+    let (mut client, transport) = shared_client(responses);
+    let summary = Syncer::new(warehouse.connection(), &mut client)
+        .as_of(evening_instant())
+        .sync_user("octocat", &fast_user_options(Some(1)))
+        .unwrap();
+    assert!(summary.failed.is_empty(), "{:?}", summary.failed);
+    let sizes: Vec<String> = transport
+        .calls
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|call| {
+            call.iter()
+                .find_map(|argument| argument.strip_prefix("query="))
+                .and_then(|query| query.split("first: ").nth(1))
+                .map(|rest| rest.split(',').next().unwrap().to_string())
+        })
+        .take(2)
+        .collect();
+    assert_eq!(sizes, ["25", "12"], "the retry asks for half the page");
+}
+
 /// The user search path stops the same way.
 #[test]
 fn a_run_level_error_stops_the_user_walk() {
@@ -174,6 +204,9 @@ fn page_size_halves_only_for_size_symptoms() {
             crate::Error::GitHubApi("RESOURCE_LIMITS_EXCEEDED".into()),
             1,
         ),
+        // gh's own json.Unmarshal error for an empty or cut-off GraphQL body;
+        // gh drops the HTTP status in this case.
+        (gh("unexpected end of JSON input\n"), 1),
     ];
     for (error, attempts) in size_errors {
         let label = error.to_string();

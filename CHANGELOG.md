@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `sync`: a repository or user walk no longer fails when `gh` reports
+  `unexpected end of JSON input` for an empty or cut-off GraphQL body. That
+  error now halves the page size and retries, as it did before 0.4.0. A body
+  that stays empty still fails after the page reaches one item, and errors such
+  as 401 are still not retried.
+
 ## [0.5.0] - 2026-11-09
 
 ### Fixed
