@@ -175,7 +175,8 @@ impl Syncer<'_> {
                 }
                 Err(error) => return Err(error),
             };
-            let page = pull_requests::parse_pull_request_page(&data)?;
+            let page =
+                pull_requests::parse_pull_request_page_with_files(&data, !options.skip_files)?;
             summary.pages_fetched += 1;
 
             // Upsert the repository dimension from the page header.

@@ -260,7 +260,11 @@ impl Syncer<'_> {
                 }
                 Err(error) => return Err(error),
             };
-            let page = match user_search::parse_user_search_page(&data, &errors) {
+            let page = match user_search::parse_user_search_page_with_files(
+                &data,
+                &errors,
+                !options.skip_files,
+            ) {
                 Ok(page) => page,
                 Err(error) if page_size > 1 && error.is_page_size_symptom() => {
                     page_size = (page_size / 2).max(1);
@@ -491,9 +495,13 @@ impl Syncer<'_> {
                     &query,
                     &[("q", expression.as_str()), ("includeFiles", include_files)],
                 );
-                match answer
-                    .and_then(|(data, errors)| user_search::parse_user_search_page(&data, &errors))
-                {
+                match answer.and_then(|(data, errors)| {
+                    user_search::parse_user_search_page_with_files(
+                        &data,
+                        &errors,
+                        !options.skip_files,
+                    )
+                }) {
                     Ok(page) => break page,
                     Err(error) if page_size > 1 && error.is_page_size_symptom() => {
                         page_size = (page_size / 2).max(1)

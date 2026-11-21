@@ -168,7 +168,11 @@ impl Syncer<'_> {
                     &pull_requests::single_pull_request_query(),
                     &pull_request_variables,
                 )?;
-                let (metadata, mut pull_request) = pull_requests::parse_single_pull_request(&data)?;
+                let (metadata, mut pull_request) =
+                    pull_requests::parse_single_pull_request_with_files(
+                        &data,
+                        !options.skip_files,
+                    )?;
                 check_identity(&metadata, pull_request.number)?;
                 let note = pull_requests::hydrate_pull_request(self.client, &mut pull_request)?;
                 let repo_key = metadata.name_with_owner.to_lowercase();

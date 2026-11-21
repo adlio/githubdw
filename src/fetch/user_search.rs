@@ -23,7 +23,7 @@
 
 use serde_json::Value;
 
-use super::pull_requests::{PullRequestData, RepositoryMetadata, parse_pull_request_node};
+use super::pull_requests::{PullRequestData, RepositoryMetadata};
 use super::{is_inaccessible, node_index};
 use crate::error::{Error, Result};
 
@@ -145,6 +145,16 @@ impl UserSearchPage {
 /// and marks it inaccessible (the same rule the collection path uses) skips
 /// that node; any other error fails the page.
 pub fn parse_user_search_page(data: &Value, errors: &[Value]) -> Result<UserSearchPage> {
+    parse_user_search_page_with_files(data, errors, true)
+}
+
+/// Parse a user-search page when the query may have intentionally omitted
+/// changed-file connections.
+pub fn parse_user_search_page_with_files(
+    data: &Value,
+    errors: &[Value],
+    include_files: bool,
+) -> Result<UserSearchPage> {
     let mut skipped: std::collections::BTreeMap<usize, String> = Default::default();
     let mut fatal = Vec::new();
     for error in errors {
@@ -200,7 +210,10 @@ pub fn parse_user_search_page(data: &Value, errors: &[Value]) -> Result<UserSear
             .ok_or_else(|| Error::GitHubApi("search node has no repository".into()))?;
         items.push(SearchedPullRequest {
             repository: super::pull_requests::parse_repository_metadata(repository)?,
-            pull_request: parse_pull_request_node(node)?,
+            pull_request: super::pull_requests::parse_pull_request_node_with_files(
+                node,
+                include_files,
+            )?,
         });
     }
 

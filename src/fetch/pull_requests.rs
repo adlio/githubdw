@@ -319,6 +319,15 @@ pub fn strict_nodes<'a>(value: &'a Value, collection: &str, label: &str) -> Resu
 /// A `null` pull request (deleted, or the number names an issue) is an error,
 /// never an empty success.
 pub fn parse_single_pull_request(data: &Value) -> Result<(RepositoryMetadata, PullRequestData)> {
+    parse_single_pull_request_with_files(data, true)
+}
+
+/// Parse a single pull request when the query may have intentionally omitted
+/// its changed-file connection.
+pub fn parse_single_pull_request_with_files(
+    data: &Value,
+    include_files: bool,
+) -> Result<(RepositoryMetadata, PullRequestData)> {
     let repository = data
         .get("repository")
         .filter(|value| !value.is_null())
@@ -328,7 +337,10 @@ pub fn parse_single_pull_request(data: &Value) -> Result<(RepositoryMetadata, Pu
         .get("pullRequest")
         .filter(|value| !value.is_null())
         .ok_or_else(|| Error::GitHubApi("pull request not found".into()))?;
-    Ok((metadata, parse_pull_request_node(node)?))
+    Ok((
+        metadata,
+        parse_pull_request_node_with_files(node, include_files)?,
+    ))
 }
 
 /// Parse a `repository { … }` selection into its dimension metadata.
@@ -363,6 +375,15 @@ pub fn parse_repository_metadata(repository: &Value) -> Result<RepositoryMetadat
 
 /// Parse one page of the repository pull-requests query response (`data` value).
 pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
+    parse_pull_request_page_with_files(data, true)
+}
+
+/// Parse a repository page when the query may have intentionally omitted
+/// changed-file connections.
+pub fn parse_pull_request_page_with_files(
+    data: &Value,
+    include_files: bool,
+) -> Result<PullRequestPage> {
     let repository = data
         .get("repository")
         .filter(|value| !value.is_null())
@@ -378,7 +399,7 @@ pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
 
     let mut pull_requests = Vec::new();
     for node in strict_nodes(repository, "pullRequests", "repository.pullRequests")? {
-        pull_requests.push(parse_pull_request_node(node)?);
+        pull_requests.push(parse_pull_request_node_with_files(node, include_files)?);
     }
 
     Ok(PullRequestPage {
@@ -394,6 +415,15 @@ pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
 /// The repository query and the user-search query select the same node shape, so
 /// a PR ingested through either path parses to the identical value.
 pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
+    parse_pull_request_node_with_files(node, true)
+}
+
+/// Parse one pull request, optionally allowing the query to omit its files
+/// connection. All other selected connections remain required.
+pub fn parse_pull_request_node_with_files(
+    node: &Value,
+    include_files: bool,
+) -> Result<PullRequestData> {
     let number = node
         .get("number")
         .and_then(Value::as_i64)
@@ -446,7 +476,7 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
         .collect::<Result<Vec<_>>>()?;
 
     let files_reported = node.get("files").is_some();
-    let files = if files_reported {
+    let files = if include_files || files_reported {
         let (file_nodes, more) = required_connection(
             node,
             "files",
