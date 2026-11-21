@@ -94,7 +94,7 @@ pub fn user_pull_requests_query(page_size: u32) -> String {
 }
 
 const USER_PULL_REQUESTS_QUERY_TEMPLATE: &str = r#"
-query($q: String!, $cursor: String) {
+query($q: String!, $cursor: String, $includeFiles: Boolean!) {
   rateLimit { limit cost remaining resetAt }
   search(query: $q, type: ISSUE, first: {PAGE_SIZE}, after: $cursor) {
     issueCount

@@ -1015,7 +1015,7 @@ fn a_plain_syncer_never_blanks_a_stored_body() {
     )
     .refresh_targets(
         &target,
-        &crate::refresh::RefreshOptions { skip_diffs: true },
+        &crate::refresh::RefreshOptions { skip_diffs: true, skip_files: false },
     )
     .unwrap();
     github.with(|w| w.prs.iter_mut().for_each(|p| p.body = String::new()));
@@ -1026,7 +1026,7 @@ fn a_plain_syncer_never_blanks_a_stored_body() {
     )
     .refresh_targets(
         &target,
-        &crate::refresh::RefreshOptions { skip_diffs: true },
+        &crate::refresh::RefreshOptions { skip_diffs: true, skip_files: false },
     )
     .unwrap();
     assert_eq!(

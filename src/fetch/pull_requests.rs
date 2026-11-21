@@ -73,7 +73,7 @@ pub const PULL_REQUEST_NODE_SELECTION: &str = r#"id number title body state isDr
             author { login __typename }
           }
         }
-        files(first: 100) {
+        files(first: 100) @include(if: $includeFiles) {
           pageInfo { hasNextPage endCursor }
           nodes { path changeType additions deletions }
         }
@@ -96,7 +96,7 @@ pub const PULL_REQUEST_NODE_SELECTION: &str = r#"id number title body state isDr
         }"#;
 
 const REPOSITORY_PULL_REQUESTS_QUERY_TEMPLATE: &str = r#"
-query($owner: String!, $name: String!, $cursor: String) {
+query($owner: String!, $name: String!, $cursor: String, $includeFiles: Boolean!) {
   rateLimit { limit cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     {REPOSITORY}
@@ -112,7 +112,7 @@ query($owner: String!, $name: String!, $cursor: String) {
 "#;
 
 const SINGLE_PULL_REQUEST_QUERY_TEMPLATE: &str = r#"
-query($owner: String!, $name: String!, $number: Int!) {
+query($owner: String!, $name: String!, $number: Int!, $includeFiles: Boolean!) {
   rateLimit { limit cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     {REPOSITORY}
@@ -174,6 +174,9 @@ pub struct PullRequestData {
     /// field reads as 0 in `changed_files`, which must never be mistaken for
     /// an authoritative empty file set.
     pub changed_files_reported: bool,
+    /// Whether this response included the file connection. A user sync may
+    /// omit it to reduce search response size while preserving stored file rows.
+    pub files_reported: bool,
     pub author: Option<ActorReference>,
     pub merged_by: Option<ActorReference>,
     pub reviews: Vec<ReviewData>,
@@ -442,18 +445,23 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
         .map(parse_conversation_comment)
         .collect::<Result<Vec<_>>>()?;
 
-    let (file_nodes, more) = required_connection(
-        node,
-        "files",
-        &format!("{label} files"),
-        owner,
-        "PullRequest",
-    )?;
-    pending.extend(more);
-    let files = file_nodes
-        .into_iter()
-        .map(parse_file)
-        .collect::<Result<Vec<_>>>()?;
+    let files_reported = node.get("files").is_some();
+    let files = if files_reported {
+        let (file_nodes, more) = required_connection(
+            node,
+            "files",
+            &format!("{label} files"),
+            owner,
+            "PullRequest",
+        )?;
+        pending.extend(more);
+        file_nodes
+            .into_iter()
+            .map(parse_file)
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
 
     let (head_sha, check_runs, check_runs_truncated) =
         parse_head_commit(node, &label, &mut pending)?;
@@ -477,6 +485,7 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
         deletions: integer_field(node, "deletions"),
         changed_files: integer_field(node, "changedFiles"),
         changed_files_reported: node.get("changedFiles").and_then(Value::as_i64).is_some(),
+        files_reported,
         author: node.get("author").and_then(ActorReference::from_value),
         merged_by: node.get("mergedBy").and_then(ActorReference::from_value),
         reviews,

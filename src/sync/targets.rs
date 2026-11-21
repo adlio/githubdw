@@ -120,10 +120,17 @@ impl Syncer<'_> {
             .split_once('/')
             .ok_or_else(|| crate::Error::InvalidArgument(target.reference()))?;
         let number = target.number.to_string();
+        let include_files = if options.skip_files { "false" } else { "true" };
         let variables = [
             ("owner", owner),
             ("name", name),
             ("number", number.as_str()),
+        ];
+        let pull_request_variables = [
+            ("owner", owner),
+            ("name", name),
+            ("number", number.as_str()),
+            ("includeFiles", include_files),
         ];
         let check_identity = |metadata: &pull_requests::RepositoryMetadata, found: i64| {
             let resolved = metadata.name_with_owner.to_lowercase();
@@ -157,9 +164,10 @@ impl Syncer<'_> {
         // writes nothing at all.
         match target.kind {
             TargetKind::PullRequest => {
-                let data = self
-                    .client
-                    .graphql(&pull_requests::single_pull_request_query(), &variables)?;
+                let data = self.client.graphql(
+                    &pull_requests::single_pull_request_query(),
+                    &pull_request_variables,
+                )?;
                 let (metadata, mut pull_request) = pull_requests::parse_single_pull_request(&data)?;
                 check_identity(&metadata, pull_request.number)?;
                 let note = pull_requests::hydrate_pull_request(self.client, &mut pull_request)?;
@@ -170,21 +178,26 @@ impl Syncer<'_> {
                 // its file-set prune, and the repository row too.
                 let retention = self.decide(options.skip_diffs);
                 let want_patches = retention == crate::retention::DiffRetention::Retain;
-                let patches = (want_patches && !pull_request.files.is_empty()).then(|| {
-                    pull_requests::fetch_file_patches(self.client, &repo_key, pull_request.number)
-                });
-                let recovered = recover_files(
-                    self.client,
-                    if recovery_allowed(retention) {
-                        self.git_recovery.as_ref()
-                    } else {
-                        None
-                    },
-                    &repo_key,
-                    &pull_request,
-                    patches.as_ref(),
-                    want_patches,
-                );
+                let patches = (want_patches
+                    && pull_request.files_reported
+                    && !pull_request.files.is_empty())
+                    .then(|| pull_requests::fetch_file_patches(self.client, &repo_key, pull_request.number));
+                let recovered = if pull_request.files_reported {
+                    recover_files(
+                        self.client,
+                        if recovery_allowed(retention) {
+                            self.git_recovery.as_ref()
+                        } else {
+                            None
+                        },
+                        &repo_key,
+                        &pull_request,
+                        patches.as_ref(),
+                        want_patches,
+                    )
+                } else {
+                    None
+                };
                 let connection = self.connection;
                 within_savepoint(connection, || {
                     upsert_repo(connection, &metadata)?;

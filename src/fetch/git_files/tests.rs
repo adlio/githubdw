@@ -72,6 +72,7 @@ pub(crate) fn pull_request_for(
         deletions: totals.deletions,
         changed_files: totals.changed_files,
         changed_files_reported: true,
+        files_reported: true,
         author: None,
         merged_by: None,
         reviews: vec![],

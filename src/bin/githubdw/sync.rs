@@ -89,6 +89,7 @@ pub fn run(
             repository,
             days,
             skip_diffs,
+            skip_files,
             pull_requests_only,
             issues_only,
         } => {
@@ -97,6 +98,7 @@ pub fn run(
             let options = githubdw::sync::SyncOptions {
                 days,
                 skip_diffs,
+                skip_files,
                 pull_requests_only,
                 issues_only,
             };
@@ -129,12 +131,14 @@ pub fn run(
             login,
             days,
             skip_diffs,
+            skip_files,
         } => {
             let mut client = capped_client(&warehouse, max_rate_use)?;
             client.preflight()?;
             let options = githubdw::sync::SyncOptions {
                 days,
                 skip_diffs,
+                skip_files,
                 pull_requests_only: true,
                 issues_only: false,
             };
@@ -210,6 +214,7 @@ pub fn run(
             pull_requests,
             issues,
             skip_diffs,
+            skip_files,
             json,
         } => {
             use githubdw::refresh::{RefreshTarget, TargetKind, TargetStatus};
@@ -229,8 +234,13 @@ pub fn run(
             if let Some(config) = git_recovery_for(&warehouse) {
                 syncer = syncer.with_git_recovery(config);
             }
-            let report = syncer
-                .refresh_targets(&targets, &githubdw::refresh::RefreshOptions { skip_diffs })?;
+            let report = syncer.refresh_targets(
+                &targets,
+                &githubdw::refresh::RefreshOptions {
+                    skip_diffs,
+                    skip_files,
+                },
+            )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {
