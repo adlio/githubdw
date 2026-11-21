@@ -17,7 +17,7 @@
 //!   paces on that tighter clock.
 //!
 //! Every node is parsed by the same
-//! [`parse_pull_request_node`]
+//! [`super::pull_requests::parse_pull_request_node`]
 //! used for repository pages, so a PR ingested through either path lands
 //! identically in the warehouse.
 
