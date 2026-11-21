@@ -55,7 +55,7 @@ pub const PULL_REQUEST_NODE_SELECTION: &str = r#"id number title body state isDr
         reviewThreads(first: 50) {
           pageInfo { hasNextPage endCursor }
           nodes {
-            id
+            id isResolved isOutdated resolutionReason resolvedBy { login __typename }
             comments(first: 50) {
               pageInfo { hasNextPage endCursor }
               nodes {
@@ -177,6 +177,7 @@ pub struct PullRequestData {
     pub author: Option<ActorReference>,
     pub merged_by: Option<ActorReference>,
     pub reviews: Vec<ReviewData>,
+    pub review_threads: Vec<ReviewThreadData>,
     pub review_comments: Vec<ReviewCommentData>,
     pub conversation_comments: Vec<ConversationCommentData>,
     pub files: Vec<FileDiffData>,
@@ -198,7 +199,7 @@ pub struct PullRequestData {
 const REVIEW_SELECTION: &str = "id state body submittedAt author { login __typename }";
 const REVIEW_COMMENT_SELECTION: &str =
     "id body path line createdAt author { login __typename } replyTo { id }";
-const REVIEW_THREAD_SELECTION: &str = "id comments(first: 50) { pageInfo { hasNextPage endCursor } \
+const REVIEW_THREAD_SELECTION: &str = "id isResolved isOutdated resolutionReason resolvedBy { login __typename } comments(first: 50) { pageInfo { hasNextPage endCursor } \
      nodes { id body path line createdAt author { login __typename } replyTo { id } } }";
 const CONVERSATION_COMMENT_SELECTION: &str = "id body createdAt author { login __typename }";
 const FILE_SELECTION: &str = "path changeType additions deletions";
@@ -218,12 +219,22 @@ pub struct ReviewData {
 #[derive(Debug, Clone)]
 pub struct ReviewCommentData {
     pub id: String,
+    pub thread_id: String,
     pub body: Option<String>,
     pub path: Option<String>,
     pub line: Option<i64>,
     pub created_at: String,
     pub author: Option<ActorReference>,
     pub in_reply_to: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ReviewThreadData {
+    pub id: String,
+    pub is_resolved: bool,
+    pub is_outdated: bool,
+    pub resolution_reason: Option<String>,
+    pub resolved_by: Option<ActorReference>,
 }
 
 #[derive(Debug, Clone)]
@@ -416,6 +427,7 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
         .map(parse_review)
         .collect::<Result<Vec<_>>>()?;
 
+    let mut review_threads = Vec::new();
     let mut review_comments = Vec::new();
     let (threads, more) = required_connection(
         node,
@@ -426,7 +438,12 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
     )?;
     pending.extend(more);
     for thread in threads {
-        collect_thread(thread, &mut review_comments, &mut pending)?;
+        collect_thread(
+            thread,
+            &mut review_threads,
+            &mut review_comments,
+            &mut pending,
+        )?;
     }
 
     let (comment_nodes, more) = required_connection(
@@ -480,6 +497,7 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
         author: node.get("author").and_then(ActorReference::from_value),
         merged_by: node.get("mergedBy").and_then(ActorReference::from_value),
         reviews,
+        review_threads,
         review_comments,
         conversation_comments,
         files,
@@ -583,11 +601,12 @@ fn parse_review(review: &Value) -> Result<ReviewData> {
     })
 }
 
-fn parse_review_comment(comment: &Value) -> Result<ReviewCommentData> {
+fn parse_review_comment(comment: &Value, thread_id: &str) -> Result<ReviewCommentData> {
     let id = required_str(comment, "id", "review comment")?;
     let label = format!("review comment {id}");
     Ok(ReviewCommentData {
         body: string_field(comment, "body"),
+        thread_id: thread_id.to_string(),
         path: Some(required_str(comment, "path", &label)?),
         // Null when the comment is outdated against the current diff.
         line: comment.get("line").and_then(Value::as_i64),
@@ -604,10 +623,26 @@ fn parse_review_comment(comment: &Value) -> Result<ReviewCommentData> {
 
 fn collect_thread(
     thread: &Value,
+    review_threads: &mut Vec<ReviewThreadData>,
     review_comments: &mut Vec<ReviewCommentData>,
     pending: &mut Vec<PendingConnection>,
 ) -> Result<()> {
     let thread_id = required_str(thread, "id", "review thread")?;
+    review_threads.push(ReviewThreadData {
+        id: thread_id.clone(),
+        is_resolved: thread
+            .get("isResolved")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        is_outdated: thread
+            .get("isOutdated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        resolution_reason: string_field(thread, "resolutionReason"),
+        resolved_by: thread
+            .get("resolvedBy")
+            .and_then(ActorReference::from_value),
+    });
     let (comments, more) = required_connection(
         thread,
         "comments",
@@ -616,7 +651,7 @@ fn collect_thread(
         "PullRequestReviewThread",
     )?;
     for comment in comments {
-        review_comments.push(parse_review_comment(comment)?);
+        review_comments.push(parse_review_comment(comment, &thread_id)?);
     }
     pending.extend(more);
     Ok(())
@@ -665,15 +700,23 @@ pub fn hydrate_pull_request(
             ("PullRequest", "reviewThreads") => {
                 let more = fetch_remaining(client, &next, REVIEW_THREAD_SELECTION)?;
                 for thread in &more {
-                    collect_thread(thread, &mut pull_request.review_comments, &mut queue)?;
+                    collect_thread(
+                        thread,
+                        &mut pull_request.review_threads,
+                        &mut pull_request.review_comments,
+                        &mut queue,
+                    )?;
                 }
             }
             ("PullRequestReviewThread", "comments") => {
                 let more = fetch_remaining(client, &next, REVIEW_COMMENT_SELECTION)?;
+                let thread_id = next.owner_id.as_deref().ok_or_else(|| {
+                    Error::GitHubApi("pending review-thread comments have no owner id".into())
+                })?;
                 for comment in &more {
                     pull_request
                         .review_comments
-                        .push(parse_review_comment(comment)?);
+                        .push(parse_review_comment(comment, thread_id)?);
                 }
             }
             ("PullRequest", "comments") => {

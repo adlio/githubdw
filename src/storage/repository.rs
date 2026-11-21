@@ -112,6 +112,46 @@ pub struct PullRequestRow<'a> {
     pub deletions: i64,
 }
 
+pub fn upsert_review_thread(
+    conn: &Connection,
+    thread_key: &str,
+    pr_key: &str,
+    is_resolved: bool,
+    is_outdated: bool,
+    resolution_reason: Option<&str>,
+    resolved_by_key: Option<&str>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO fact_review_threads (
+            thread_key, pr_key, is_resolved, is_outdated, resolution_reason, resolved_by_key
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+         ON CONFLICT (thread_key) DO UPDATE SET
+            is_resolved = excluded.is_resolved,
+            is_outdated = excluded.is_outdated,
+            resolution_reason = excluded.resolution_reason,
+            resolved_by_key = excluded.resolved_by_key
+         WHERE fact_review_threads.is_resolved IS NOT excluded.is_resolved
+            OR fact_review_threads.is_outdated IS NOT excluded.is_outdated
+            OR fact_review_threads.resolution_reason IS NOT excluded.resolution_reason
+            OR fact_review_threads.resolved_by_key IS NOT excluded.resolved_by_key",
+        params![thread_key, pr_key, is_resolved as i64, is_outdated as i64, resolution_reason, resolved_by_key],
+    )?;
+    Ok(())
+}
+
+pub fn link_review_comment_to_thread(
+    conn: &Connection,
+    comment_key: &str,
+    thread_key: &str,
+) -> Result<()> {
+    conn.execute(
+        "UPDATE fact_review_comments SET thread_key = ?2
+         WHERE comment_key = ?1 AND thread_key IS NOT ?2",
+        params![comment_key, thread_key],
+    )?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn upsert_review_comment(
     conn: &Connection,

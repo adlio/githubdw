@@ -52,6 +52,7 @@ pub fn init(conn: &mut Connection) -> Result<()> {
     ensure_sort_indexes(conn)?;
     ensure_lock_holder_column(conn)?;
     ensure_change_notes_table(conn)?;
+    ensure_review_thread_tables(conn)?;
     Ok(())
 }
 
@@ -60,6 +61,32 @@ pub fn init(conn: &mut Connection) -> Result<()> {
 /// at 8, so older binaries keep opening the warehouse and ignore the table.
 pub fn ensure_change_notes_table(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("change_notes.sql"))?;
+    Ok(())
+}
+
+/// Create review-thread storage and comment links without a numbered migration.
+pub fn ensure_review_thread_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(include_str!("review_thread_tables.sql"))?;
+    let has_thread_key: bool = conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2
+         )",
+        ["fact_review_comments", "thread_key"],
+        |row| row.get(0),
+    )?;
+    if !has_thread_key {
+        conn.execute_batch(
+            "ALTER TABLE fact_review_comments
+                 ADD COLUMN thread_key TEXT REFERENCES fact_review_threads(thread_key);
+             CREATE INDEX IF NOT EXISTS idx_review_comments_thread
+                 ON fact_review_comments(thread_key);",
+        )?;
+    } else {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_review_comments_thread
+                 ON fact_review_comments(thread_key);",
+        )?;
+    }
     Ok(())
 }
 
