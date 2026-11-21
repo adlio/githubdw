@@ -683,9 +683,11 @@ fn parse_file(file: &Value) -> Result<FileDiffData> {
 /// Fetch every nested node the page query's first slices left behind.
 ///
 /// Shared by the repository and user-search paths. On success `pending` is
-/// empty. Returns a caveat when the provider served fewer files than the pull
-/// request reports changing (GitHub stops enumerating files at 3,000), so the
-/// caller can surface the truncation instead of treating the list as complete.
+/// empty. When the file connection was requested, returns a caveat if the
+/// provider served fewer files than the pull request reports changing (GitHub
+/// stops enumerating files at 3,000), so the caller does not mistake the list
+/// for complete. No file-coverage caveat is returned when that connection was
+/// intentionally omitted.
 /// Any continuation failure is returned as an error, leaving the item to the
 /// caller's failed-record handling.
 pub fn hydrate_pull_request(
@@ -751,7 +753,7 @@ pub fn hydrate_pull_request(
     pull_request.check_runs_truncated = false;
     let mut caveats = Vec::new();
     let served = pull_request.files.len() as i64;
-    if served < pull_request.changed_files {
+    if pull_request.files_reported && served < pull_request.changed_files {
         caveats.push(format!(
             "PR #{}: provider listed {served} of {} changed files; file coverage is truncated",
             pull_request.number, pull_request.changed_files
