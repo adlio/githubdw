@@ -930,7 +930,10 @@ fn missing_policy_is_legacy_and_invalid_policy_fails_closed() {
                     repository: "acme/app".into(),
                     number: 1,
                 }],
-                &crate::refresh::RefreshOptions { skip_diffs: false },
+                &crate::refresh::RefreshOptions {
+                    skip_diffs: false,
+                    skip_files: false,
+                },
             )
             .unwrap();
     }
@@ -955,7 +958,10 @@ fn missing_policy_is_legacy_and_invalid_policy_fails_closed() {
                     repository: "acme/app".into(),
                     number: 1,
                 }],
-                &crate::refresh::RefreshOptions { skip_diffs: false },
+                &crate::refresh::RefreshOptions {
+                    skip_diffs: false,
+                    skip_files: false,
+                },
             )
             .unwrap();
     }
@@ -1004,7 +1010,10 @@ fn a_mid_flight_policy_change_stops_the_diff_write() {
                 repository: "acme/app".into(),
                 number: 2,
             }],
-            &crate::refresh::RefreshOptions { skip_diffs: false },
+            &crate::refresh::RefreshOptions {
+                skip_diffs: false,
+                skip_files: false,
+            },
         )
         .unwrap();
     assert_eq!(report.failed(), 0);
@@ -1144,14 +1153,20 @@ fn without_a_policy_file_the_legacy_writes_are_unchanged() {
     Syncer::new(dw.connection(), &mut client)
         .refresh_targets(
             &target,
-            &crate::refresh::RefreshOptions { skip_diffs: true },
+            &crate::refresh::RefreshOptions {
+                skip_diffs: true,
+                skip_files: false,
+            },
         )
         .unwrap();
     github.with(|w| w.prs.iter_mut().for_each(|p| p.body = String::new()));
     Syncer::new(dw.connection(), &mut client)
         .refresh_targets(
             &target,
-            &crate::refresh::RefreshOptions { skip_diffs: true },
+            &crate::refresh::RefreshOptions {
+                skip_diffs: true,
+                skip_files: false,
+            },
         )
         .unwrap();
     assert_eq!(

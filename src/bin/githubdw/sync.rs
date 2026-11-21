@@ -51,6 +51,7 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCo
             repository,
             days,
             skip_diffs,
+            skip_files,
             pull_requests_only,
             issues_only,
         } => {
@@ -59,6 +60,7 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCo
             let options = githubdw::sync::SyncOptions {
                 days,
                 skip_diffs,
+                skip_files,
                 pull_requests_only,
                 issues_only,
             };
@@ -90,12 +92,14 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCo
             login,
             days,
             skip_diffs,
+            skip_files,
         } => {
             let mut client = githubdw::fetch::GhClient::new();
             client.preflight()?;
             let options = githubdw::sync::SyncOptions {
                 days,
                 skip_diffs,
+                skip_files,
                 pull_requests_only: true,
                 issues_only: false,
             };
@@ -195,6 +199,7 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCo
             pull_requests,
             issues,
             skip_diffs,
+            skip_files,
             json,
         } => {
             use githubdw::refresh::{RefreshTarget, TargetKind, TargetStatus};
@@ -213,8 +218,13 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCo
             if let Some(config) = git_recovery_for(&warehouse) {
                 syncer = syncer.with_git_recovery(config);
             }
-            let report = syncer
-                .refresh_targets(&targets, &githubdw::refresh::RefreshOptions { skip_diffs })?;
+            let report = syncer.refresh_targets(
+                &targets,
+                &githubdw::refresh::RefreshOptions {
+                    skip_diffs,
+                    skip_files,
+                },
+            )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&report)?);
             } else {

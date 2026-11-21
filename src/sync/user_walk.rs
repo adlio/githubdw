@@ -195,7 +195,13 @@ impl Syncer<'_> {
 
         'pages: loop {
             let query = user_search::user_pull_requests_query(page_size);
-            let mut variables: Vec<(&str, &str)> = vec![("q", expression.as_str())];
+            let mut variables: Vec<(&str, &str)> = vec![
+                ("q", expression.as_str()),
+                (
+                    "includeFiles",
+                    if options.skip_files { "false" } else { "true" },
+                ),
+            ];
             if let Some(cursor) = page_cursor.as_deref() {
                 variables.push(("cursor", cursor));
             }
@@ -207,7 +213,11 @@ impl Syncer<'_> {
                 }
                 Err(error) => return Err(error),
             };
-            let page = match user_search::parse_user_search_page(&data, &errors) {
+            let page = match user_search::parse_user_search_page_with_files(
+                &data,
+                &errors,
+                !options.skip_files,
+            ) {
                 Ok(page) => page,
                 Err(error) if page_size > 1 && error.is_page_size_symptom() => {
                     page_size = (page_size / 2).max(1);
@@ -433,12 +443,18 @@ impl Syncer<'_> {
             );
             let page = loop {
                 let query = user_search::user_pull_requests_query(page_size);
-                let answer = self
-                    .client
-                    .graphql_search_with_errors(&query, &[("q", expression.as_str())]);
-                match answer
-                    .and_then(|(data, errors)| user_search::parse_user_search_page(&data, &errors))
-                {
+                let include_files = if options.skip_files { "false" } else { "true" };
+                let answer = self.client.graphql_search_with_errors(
+                    &query,
+                    &[("q", expression.as_str()), ("includeFiles", include_files)],
+                );
+                match answer.and_then(|(data, errors)| {
+                    user_search::parse_user_search_page_with_files(
+                        &data,
+                        &errors,
+                        !options.skip_files,
+                    )
+                }) {
                     Ok(page) => break page,
                     Err(error) if page_size > 1 && error.is_page_size_symptom() => {
                         page_size = (page_size / 2).max(1)

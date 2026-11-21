@@ -77,6 +77,7 @@ pub(super) fn page_response(has_next: bool, cursor: Option<&str>, numbers: &[i64
 pub(super) fn fast_pr_options() -> SyncOptions {
     SyncOptions {
         skip_diffs: true,
+        skip_files: false,
         pull_requests_only: true,
         ..Default::default()
     }
@@ -428,6 +429,7 @@ pub(super) fn fast_user_options(days: Option<u32>) -> SyncOptions {
     SyncOptions {
         days,
         skip_diffs: true,
+        skip_files: false,
         pull_requests_only: true,
         issues_only: false,
     }
@@ -606,7 +608,10 @@ pub(super) fn refresh_pr5(
     Syncer::new(conn, &mut client)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
-            &RefreshOptions { skip_diffs },
+            &RefreshOptions {
+                skip_diffs,
+                skip_files: false,
+            },
         )
         .unwrap()
 }

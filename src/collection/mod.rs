@@ -1127,6 +1127,7 @@ pub fn fetch_pull_request_detail(
             std::slice::from_ref(&target),
             &crate::refresh::RefreshOptions {
                 skip_diffs: requested != DiffRetention::Retain,
+                skip_files: false,
             },
         )
     };

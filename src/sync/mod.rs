@@ -45,6 +45,9 @@ pub struct SyncOptions {
     pub days: Option<u32>,
     /// Skip fetching per-file patch text via REST (fast mode).
     pub skip_diffs: bool,
+    /// Skip the GraphQL changed-file connection during user sync. Existing
+    /// file rows are left untouched; aggregate changed-file counts remain.
+    pub skip_files: bool,
     /// Sync only pull requests (skip issues).
     pub pull_requests_only: bool,
     /// Sync only issues (skip pull requests).
