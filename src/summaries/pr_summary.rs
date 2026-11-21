@@ -49,9 +49,17 @@ You have access to a SQLite data warehouse of GitHub activity. Key tables:
 
 ### fact_review_comments (inline code comments)
 - pr_key: Links to the PR
+- thread_key: Links to fact_review_threads, which stores resolution state
 - author_key: Who commented
 - path, line: File and line the comment is anchored to
 - body: The comment text
+
+### fact_review_threads (one row per GitHub review thread)
+- thread_key: GitHub thread node ID
+- pr_key: Links to the PR
+- is_resolved, is_outdated: GitHub thread status
+- resolution_reason: Why GitHub marked the thread resolved, when available
+- resolved_by_key: Entity that resolved the thread, when available
 
 ### fact_issue_comments (PR conversation comments)
 - parent_type: filter to 'pull_request' for PR comments
@@ -75,6 +83,7 @@ You have access to a SQLite data warehouse of GitHub activity. Key tables:
    - Get PR metadata (title, body, author, state, additions/deletions/changed_files)
    - Get file changes and read the `patch` hunks in fact_file_diffs to see the actual code
    - Get reviews and their state (fact_reviews), inline comments (fact_review_comments),
+     and thread resolution (fact_review_threads joined on thread_key),
      and conversation comments (fact_issue_comments WHERE parent_type = 'pull_request')
    - Check CI outcomes in fact_check_runs if relevant
 

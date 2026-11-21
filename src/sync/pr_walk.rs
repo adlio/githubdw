@@ -487,6 +487,23 @@ impl Syncer<'_> {
             )?;
         }
 
+        for thread in &pull_request.review_threads {
+            let resolved_by_key = thread
+                .resolved_by
+                .as_ref()
+                .map(|actor| repository::ensure_entity(conn, actor, bot_suffix))
+                .transpose()?;
+            repository::upsert_review_thread(
+                conn,
+                &thread.id,
+                pr_key,
+                thread.is_resolved,
+                thread.is_outdated,
+                thread.resolution_reason.as_deref(),
+                resolved_by_key.as_deref(),
+            )?;
+        }
+
         for comment in &pull_request.review_comments {
             let author = self.resolve_actor(comment.author.as_ref(), bot_suffix)?;
             let created_keys = time_dimension::ensure_keys_for_timestamp(
@@ -513,6 +530,7 @@ impl Syncer<'_> {
                 &created_keys.date_key,
                 &created_keys.time_key,
             )?;
+            repository::link_review_comment_to_thread(conn, &comment.id, &comment.thread_id)?;
         }
 
         for comment in &pull_request.conversation_comments {

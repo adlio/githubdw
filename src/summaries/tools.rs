@@ -77,7 +77,7 @@ impl Tool for QueryDatabaseTool {
          Returns up to `limit` rows (default 100). Use this to explore PR data, \
          file diffs, reviews, comments, and check runs, and to gather context \
          for summaries. The database uses a star schema with fact tables \
-         (fact_pull_requests, fact_file_diffs, fact_reviews, fact_review_comments, \
+         (fact_pull_requests, fact_file_diffs, fact_reviews, fact_review_threads, fact_review_comments, \
          fact_issue_comments, fact_check_runs) and dimension tables (dim_entities, \
          dim_repositories, dim_date, dim_time)."
     }

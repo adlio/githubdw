@@ -50,6 +50,7 @@ pub fn init(conn: &mut Connection) -> Result<()> {
     ensure_collection_tables(conn)?;
     ensure_sort_indexes(conn)?;
     ensure_lock_holder_column(conn)?;
+    ensure_review_thread_tables(conn)?;
     Ok(())
 }
 
@@ -81,6 +82,33 @@ pub fn ensure_lock_holder_column(conn: &Connection) -> Result<()> {
 /// the warehouse, and the statements only add indexes.
 pub fn ensure_sort_indexes(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("sort_indexes.sql"))?;
+    Ok(())
+}
+
+/// Add the review-thread table and comment link without bumping the numbered
+/// migration version, so older binaries can still open and ignore these rows.
+pub fn ensure_review_thread_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(include_str!("review_thread_tables.sql"))?;
+    let has_thread_key: bool = conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM pragma_table_info('fact_review_comments') WHERE name = 'thread_key'
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if !has_thread_key {
+        conn.execute_batch(
+            "ALTER TABLE fact_review_comments
+                 ADD COLUMN thread_key TEXT REFERENCES fact_review_threads(thread_key);
+             CREATE INDEX IF NOT EXISTS idx_review_comments_thread
+                 ON fact_review_comments(thread_key);",
+        )?;
+    } else {
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_review_comments_thread
+                 ON fact_review_comments(thread_key);",
+        )?;
+    }
     Ok(())
 }
 
@@ -140,7 +168,7 @@ mod tests {
             .query_row(
                 "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name IN (
                     'dim_entities', 'dim_repositories', 'dim_date', 'dim_period', 'dim_time',
-                    'fact_pull_requests', 'fact_reviews', 'fact_review_comments',
+                    'fact_pull_requests', 'fact_reviews', 'fact_review_comments', 'fact_review_threads',
                     'fact_issue_comments', 'fact_check_runs', 'fact_file_diffs',
                     'issues', 'labels', 'issue_labels', 'milestones', 'issue_assignees',
                     'sync_metadata', 'sync_locks', 'sync_jobs', 'synced_ranges',
@@ -150,7 +178,7 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("count tables");
-        assert_eq!(count, 24, "all base tables should exist");
+        assert_eq!(count, 25, "all base tables should exist");
     }
 
     #[test]
@@ -437,7 +465,7 @@ mod tests {
         );
     }
 
-    /// A warehouse already at v5 (0.3.1) takes migrations 6 through 8 only.
+    /// A warehouse already at v5 (0.3.1) takes migrations 6 through 8.
     #[test]
     fn upgrade_from_v5_adds_the_later_indexes() {
         let mut conn = Connection::open_in_memory().expect("open in-memory db");
