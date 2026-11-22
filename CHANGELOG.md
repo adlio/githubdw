@@ -7,8 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-22
+
 ### Added
 
+- `githubdw diffs purge [--dry-run] [--vacuum]` and
+  `GithubDW::purge_stored_diffs(vacuum)` clear the stored patch text in
+  `fact_file_diffs.patch`, in batches of 5,000. File rows, paths, change types
+  and additions/deletions stay, so file lists and counts are unchanged, and no
+  sync treats a purged row as incomplete. The purge refuses while a sync holds
+  a live lock and holds its own lock while it runs.
 - `githubdw mcp --read-only` runs the MCP server with no write access: the
   `trigger_sync` tool is omitted from `tools/list` and refuses a direct call,
   and `manage_monitors` refuses `add`/`remove` while `action=list` still
@@ -34,6 +42,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `sync`: a rate-limit answer no longer fails the sync after the transient
+  retries run out. Several processes can share one account's budget, so a
+  client can hit a limit it did not spend. Rate-limit answers now get up to 4
+  waits per call: until the bucket's reset when the last budget seen was at
+  or below 50 requests, otherwise 1, 5, 15 and 30 minutes (GitHub reports
+  secondary limits with the same message while budget remains). Waits are
+  capped at 65 minutes, jittered by 1-10 s, and logged.
+- `sync user`: a backfill (`--days`, or a first sync) killed part-way keeps
+  the months it finished. The walk runs newest month first, records each month
+  once both roles finish it, and a rerun skips covered months. Incremental
+  runs are unchanged.
+- `sync`: a killed run no longer leaves its locks behind. Each lock records
+  its holder process (`sync_locks.holder_pid`, added outside the numbered
+  migrations so older binaries still open the warehouse), and a lock whose
+  process is gone is free at once. The CLI releases its locks on SIGTERM,
+  SIGINT and SIGHUP and exits with 128 + the signal.
+- Live diffs (`fetch_pull_request_diff_live`) read the base and head commits
+  from REST `pulls/{n}` instead of GraphQL, so an on-demand diff still works
+  after a sync has spent the GraphQL quota.
 - `--period` no longer silently accepts out-of-range input. `2026-M13`,
   `2026-M0`, `2026-W99`, and `last-0` now return an error naming the bad value
   and the valid range instead of printing `0` or risking a panic. Months are
