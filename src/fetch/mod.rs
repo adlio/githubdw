@@ -206,6 +206,12 @@ pub(crate) fn node_index(error: &Value) -> Option<usize> {
 const RETRY_ATTEMPTS: u32 = 7;
 /// Exponential backoff schedule in seconds (attempt N sleeps SCHEDULE[N-1]).
 const BACKOFF_SECONDS: [u64; 6] = [2, 4, 8, 16, 32, 64];
+/// How many times one call waits out a provider rate-limit response. These
+/// waits do not use up [`RETRY_ATTEMPTS`]: a spent primary budget can take
+/// up to an hour to reset, and the call should then go through, not fail.
+const RATE_LIMIT_WAITS: u32 = 4;
+/// Longest single wait for a reset, in case the reported time is far off.
+const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(65 * 60);
 
 /// Minimum spacing between GitHub *search* calls.
 ///
@@ -607,6 +613,7 @@ impl GhClient {
             )?;
         }
         let mut attempt: u32 = 0;
+        let mut rate_limit_waits: u32 = 0;
         // With a quota guard: which bucket this call draws from, and the
         // arguments with `--include` so the response headers come back.
         let resource = if arguments.get(1).map(String::as_str) == Some("graphql") {
@@ -686,6 +693,28 @@ impl GhClient {
                         .insert(headers.resource, (headers.remaining, headers.reset));
                     return serde_json::from_str(body).map_err(Error::from);
                 }
+                Err(error)
+                    if !probe && is_rate_limit(&error) && rate_limit_waits < RATE_LIMIT_WAITS =>
+                {
+                    rate_limit_waits += 1;
+                    // A primary budget that is spent resets at a known time;
+                    // a secondary limit asks for a minute or more.
+                    // Until the known reset; otherwise 1, 5, 15, then 30
+                    // minutes, which outlasts an hourly primary window.
+                    let fallback = [60, 300, 900, 1800][(rate_limit_waits as usize - 1).min(3)];
+                    let wait = self
+                        .rate_limit_reset_wait(resource)
+                        .unwrap_or(Duration::from_secs(fallback))
+                        .max(Duration::from_secs(60))
+                        .min(MAX_RATE_LIMIT_WAIT)
+                        + jitter();
+                    eprintln!(
+                        "githubdw: GitHub rate limit on {resource} ({}); waiting {}s before retry {rate_limit_waits}/{RATE_LIMIT_WAITS}",
+                        first_line(&error),
+                        wait.as_secs()
+                    );
+                    self.wait_for_rate_limit(resource, wait, "provider rate limit response")?;
+                }
                 Err(error) => {
                     attempt += 1;
                     if probe || attempt >= RETRY_ATTEMPTS || !is_retryable(&error) {
@@ -709,6 +738,31 @@ impl GhClient {
         }
     }
 
+    /// Time until the `resource` bucket resets, from what this client has
+    /// already seen: the GraphQL `rateLimit` block, or the quota guard's
+    /// `x-ratelimit-reset` header. `None` when nothing was seen or the reset
+    /// is already past.
+    fn rate_limit_reset_wait(&self, resource: &str) -> Option<Duration> {
+        let now = chrono::Utc::now().timestamp();
+        let from_headers = self
+            .quota_guard
+            .as_ref()
+            .and_then(|g| g.observed.get(resource))
+            .map(|(_, reset)| *reset);
+        let reset = match resource {
+            "graphql" => self
+                .rate_limit
+                .reset_at()
+                .map(|t| t.timestamp())
+                .or(from_headers),
+            _ => from_headers,
+        }?;
+        u64::try_from(reset - now)
+            .ok()
+            .filter(|s| *s > 0)
+            .map(Duration::from_secs)
+    }
+
     fn observe_rate_limit(&mut self, data: &Value) {
         if let Some(block) = data.get("rateLimit") {
             self.rate_limit.observe(block);
@@ -720,6 +774,25 @@ impl Default for GhClient {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// A few seconds of spread, so several clients waiting on the same reset do
+/// not all retry in the same second.
+fn jitter() -> Duration {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos())
+        .unwrap_or(0);
+    Duration::from_millis(1_000 + u64::from(nanos % 9_000))
+}
+
+fn first_line(error: &Error) -> String {
+    error
+        .to_string()
+        .lines()
+        .next()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// A throttle response (primary or secondary rate limit).
@@ -963,6 +1036,49 @@ mod tests {
         assert_eq!(data.get("ok"), Some(&Value::Bool(true)));
         let error = client.graphql("query {}", &[]).unwrap_err();
         assert!(matches!(error, Error::GitHubApi(_)));
+    }
+
+    /// Another process spent the shared primary budget: every call answers
+    /// "API rate limit already exceeded" until the reset. The client waits
+    /// it out (bounded) instead of failing the sync, and with a deferring
+    /// caller reports the known reset as the wake time.
+    #[test]
+    fn a_spent_primary_budget_is_waited_out_not_failed() {
+        let reset = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
+        let first = format!(
+            r#"{{"data": {{"rateLimit": {{"limit": 5000, "cost": 1, "remaining": 4000, "resetAt": "{reset}"}}, "ok": true}}}}"#
+        );
+        let spent = || {
+            Err(Error::GhCommand {
+                exit_code: Some(1),
+                stderr: "gh: API rate limit already exceeded for user ID 27492.".into(),
+            })
+        };
+        let mut responses = vec![Ok(first.clone())];
+        responses.extend((0..9).map(|_| spent()));
+        responses.push(Ok(r#"{"data": {"ok": true}}"#.into()));
+        let mut client =
+            GhClient::with_transport(Box::new(FixtureTransport::new(responses))).without_sleeping();
+        client.graphql("query {}", &[]).expect("first call");
+        let data = client
+            .graphql("query {}", &[])
+            .expect("nine rate-limit answers in a row are waited out");
+        assert_eq!(data.get("ok"), Some(&Value::Bool(true)));
+        assert_eq!(client.requests_issued(), 11);
+
+        // The known reset is the wait: a deferring caller is told to wake then.
+        let mut client =
+            GhClient::with_transport(Box::new(FixtureTransport::new(vec![Ok(first), spent()])))
+                .without_sleeping();
+        client.set_defer_waits_over(Some(Duration::from_secs(30)));
+        client.graphql("query {}", &[]).expect("first call");
+        match client.graphql("query {}", &[]).unwrap_err() {
+            Error::RateLimited { wake_at, .. } => {
+                let minutes = (wake_at - chrono::Utc::now()).num_minutes();
+                assert!((9..=10).contains(&minutes), "wake in {minutes} min");
+            }
+            other => panic!("expected RateLimited, got {other}"),
+        }
     }
 
     #[test]

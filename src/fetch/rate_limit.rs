@@ -28,6 +28,11 @@ impl RateLimitTracker {
             .and_then(|text| text.parse::<DateTime<Utc>>().ok());
     }
 
+    /// When the GraphQL budget resets, as last reported.
+    pub fn reset_at(&self) -> Option<DateTime<Utc>> {
+        self.reset_at
+    }
+
     /// If remaining budget is below the safety floor, how long to sleep.
     pub fn wait_needed(&self) -> Option<Duration> {
         let remaining = self.remaining?;
