@@ -33,6 +33,11 @@ impl RateLimitTracker {
         self.reset_at
     }
 
+    /// GraphQL budget left, as last reported.
+    pub fn remaining(&self) -> Option<i64> {
+        self.remaining
+    }
+
     /// If remaining budget is below the safety floor, how long to sleep.
     pub fn wait_needed(&self) -> Option<Duration> {
         let remaining = self.remaining?;

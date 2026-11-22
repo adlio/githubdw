@@ -210,6 +210,9 @@ const BACKOFF_SECONDS: [u64; 6] = [2, 4, 8, 16, 32, 64];
 /// waits do not use up [`RETRY_ATTEMPTS`]: a spent primary budget can take
 /// up to an hour to reset, and the call should then go through, not fail.
 const RATE_LIMIT_WAITS: u32 = 4;
+/// A budget at or below this many requests counts as spent when a
+/// rate-limit answer arrives, and the wait runs to its reset.
+const NEARLY_SPENT: i64 = 50;
 /// Longest single wait for a reset, in case the reported time is far off.
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(65 * 60);
 
@@ -738,25 +741,30 @@ impl GhClient {
         }
     }
 
-    /// Time until the `resource` bucket resets, from what this client has
-    /// already seen: the GraphQL `rateLimit` block, or the quota guard's
-    /// `x-ratelimit-reset` header. `None` when nothing was seen or the reset
-    /// is already past.
+    /// Time until the `resource` bucket resets, when this client last saw it
+    /// nearly spent (GraphQL `rateLimit` block, or the quota guard's
+    /// `x-ratelimit-*` headers). `None` otherwise: GitHub also answers "API
+    /// rate limit already exceeded" for secondary limits while the budget is
+    /// healthy, and those clear in a minute or so.
     fn rate_limit_reset_wait(&self, resource: &str) -> Option<Duration> {
         let now = chrono::Utc::now().timestamp();
-        let from_headers = self
-            .quota_guard
-            .as_ref()
-            .and_then(|g| g.observed.get(resource))
-            .map(|(_, reset)| *reset);
-        let reset = match resource {
+        let seen = match resource {
             "graphql" => self
                 .rate_limit
-                .reset_at()
-                .map(|t| t.timestamp())
-                .or(from_headers),
-            _ => from_headers,
-        }?;
+                .remaining()
+                .zip(self.rate_limit.reset_at().map(|t| t.timestamp())),
+            _ => None,
+        }
+        .or_else(|| {
+            self.quota_guard
+                .as_ref()
+                .and_then(|g| g.observed.get(resource))
+                .copied()
+        });
+        let (remaining, reset) = seen?;
+        if remaining > NEARLY_SPENT {
+            return None;
+        }
         u64::try_from(reset - now)
             .ok()
             .filter(|s| *s > 0)
@@ -1038,7 +1046,7 @@ mod tests {
         assert!(matches!(error, Error::GitHubApi(_)));
     }
 
-    /// Another process spent the shared primary budget: every call answers
+    /// The shared primary budget is nearly spent: every call answers
     /// "API rate limit already exceeded" until the reset. The client waits
     /// it out (bounded) instead of failing the sync, and with a deferring
     /// caller reports the known reset as the wake time.
@@ -1046,7 +1054,7 @@ mod tests {
     fn a_spent_primary_budget_is_waited_out_not_failed() {
         let reset = (chrono::Utc::now() + chrono::Duration::minutes(10)).to_rfc3339();
         let first = format!(
-            r#"{{"data": {{"rateLimit": {{"limit": 5000, "cost": 1, "remaining": 4000, "resetAt": "{reset}"}}, "ok": true}}}}"#
+            r#"{{"data": {{"rateLimit": {{"limit": 5000, "cost": 1, "remaining": 20, "resetAt": "{reset}"}}, "ok": true}}}}"#
         );
         let spent = || {
             Err(Error::GhCommand {
@@ -1078,6 +1086,32 @@ mod tests {
                 assert!((9..=10).contains(&minutes), "wake in {minutes} min");
             }
             other => panic!("expected RateLimited, got {other}"),
+        }
+    }
+
+    /// The same words with a healthy budget are a secondary limit: a short
+    /// wait, not the hour until the reset.
+    #[test]
+    fn a_rate_limit_answer_with_budget_left_waits_briefly() {
+        let reset = (chrono::Utc::now() + chrono::Duration::minutes(40)).to_rfc3339();
+        let first = format!(
+            r#"{{"data": {{"rateLimit": {{"limit": 5000, "cost": 1, "remaining": 4400, "resetAt": "{reset}"}}, "ok": true}}}}"#
+        );
+        let mut client = GhClient::with_transport(Box::new(FixtureTransport::new(vec![
+            Ok(first),
+            Err(Error::GhCommand {
+                exit_code: Some(1),
+                stderr: "gh: API rate limit already exceeded for user ID 27492.".into(),
+            }),
+        ])))
+        .without_sleeping();
+        client.set_defer_waits_over(Some(Duration::from_secs(120)));
+        client.graphql("query {}", &[]).expect("first call");
+        match client.graphql("query {}", &[]).unwrap_err() {
+            // 60 s + jitter is under the 120 s deferral, so it was slept;
+            // the fixture then has nothing left.
+            Error::GitHubApi(message) => assert!(message.contains("no more fixture")),
+            other => panic!("expected a short wait then a retry, got {other}"),
         }
     }
 
