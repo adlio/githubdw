@@ -1,5 +1,6 @@
 //! Fetch layer: runs the `gh` CLI as a subprocess and decodes JSON.
 
+pub mod capacity;
 pub mod check_history;
 pub mod continuation;
 pub mod git_files;
@@ -19,6 +20,7 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 
 use crate::error::{Error, Result};
+use capacity::{CapacityPause, PauseGuard, Readings};
 use rate_limit::RateLimitTracker;
 
 /// Abstraction over the `gh` subprocess so tests can substitute fixtures.
@@ -215,6 +217,9 @@ const RATE_LIMIT_WAITS: u32 = 4;
 const NEARLY_SPENT: i64 = 50;
 /// Longest single wait for a reset, in case the reported time is far off.
 const MAX_RATE_LIMIT_WAIT: Duration = Duration::from_secs(65 * 60);
+/// A capped client reads the budget from the free `rate_limit` endpoint
+/// before a request when no response has reported it for this long.
+const LIVE_READING_MAX_AGE: Duration = Duration::from_secs(10);
 
 /// Minimum spacing between GitHub *search* calls.
 ///
@@ -251,6 +256,10 @@ pub struct GhClient {
     defer_waits_over: Option<Duration>,
     /// Response bytes received (stdout length), for cost measurement.
     bytes_received: u64,
+    /// Share of each hourly budget this client may use ([`capacity`]).
+    max_rate_use: Option<f64>,
+    /// GitHub's own budget readings, for the cap.
+    readings: Readings,
 }
 
 /// Rate-limit state observed from data responses (never from the separate
@@ -335,9 +344,13 @@ pub fn split_included(raw: &str) -> Result<(Option<RateLimitHeaders>, &str)> {
 }
 
 impl GhClient {
-    /// Create a client over the real `gh` binary.
+    /// Create a client over the real `gh` binary. It uses at most
+    /// [`capacity::DEFAULT_MAX_RATE_USE`] of each hourly budget;
+    /// [`Self::set_max_rate_use`] changes that.
     pub fn new() -> Self {
-        Self::with_transport(Box::new(GhCommandLine::new()))
+        let mut client = Self::with_transport(Box::new(GhCommandLine::new()));
+        client.max_rate_use = Some(capacity::DEFAULT_MAX_RATE_USE);
+        client
     }
 
     /// Create a client over a custom transport (fixtures in tests).
@@ -354,7 +367,25 @@ impl GhClient {
             cancel: None,
             defer_waits_over: None,
             bytes_received: 0,
+            max_rate_use: None,
+            readings: Readings::default(),
         }
+    }
+
+    /// Use at most `fraction` (above 0, at most 1) of each hourly GitHub
+    /// budget, judged from GitHub's live readings before every request; at
+    /// the cap the client waits for the reset (or, with
+    /// [`Self::set_defer_waits_over`], returns [`Error::RateLimited`]).
+    /// `None` removes the cap. [`Self::new`] starts at 0.95; a client from
+    /// [`Self::with_transport`] starts with no cap.
+    pub fn set_max_rate_use(&mut self, fraction: Option<f64>) -> Result<()> {
+        self.max_rate_use = fraction.map(capacity::validate).transpose()?;
+        Ok(())
+    }
+
+    /// The cap in force, as a fraction of each budget.
+    pub fn max_rate_use(&self) -> Option<f64> {
+        self.max_rate_use
     }
 
     /// Observe `flag`: once it is set, the next request (or the current wait)
@@ -624,8 +655,10 @@ impl GhClient {
         } else {
             "core"
         };
+        // Reading the budget spends none of it.
+        let free = arguments.get(1).map(String::as_str) == Some("rate_limit");
         let included: Vec<String>;
-        let sent: &[String] = if self.quota_guard.is_some() {
+        let sent: &[String] = if self.quota_guard.is_some() || self.max_rate_use.is_some() {
             let mut with_headers = Vec::with_capacity(arguments.len() + 1);
             with_headers.push(arguments[0].clone());
             with_headers.push("--include".to_string());
@@ -638,6 +671,9 @@ impl GhClient {
         loop {
             if self.cancelled() {
                 return Err(Error::Cancelled);
+            }
+            if !free {
+                self.respect_capacity(resource)?;
             }
             // A first call against an unobserved bucket is a single probe.
             let mut probe = false;
@@ -676,8 +712,14 @@ impl GhClient {
             match self.transport.run(sent) {
                 Ok(stdout) => {
                     self.bytes_received += stdout.len() as u64;
+                    if self.max_rate_use.is_some()
+                        && let Some((seen, budget)) = capacity::from_headers(&stdout)
+                    {
+                        self.readings.record(&seen, budget);
+                    }
                     let Some(guard) = &mut self.quota_guard else {
-                        return serde_json::from_str(&stdout).map_err(Error::from);
+                        let body = split_included(&stdout).map_or(stdout.as_str(), |(_, b)| b);
+                        return serde_json::from_str(body).map_err(Error::from);
                     };
                     let (headers, body) = split_included(&stdout)?;
                     let headers = headers.ok_or_else(|| {
@@ -774,6 +816,76 @@ impl GhClient {
     fn observe_rate_limit(&mut self, data: &Value) {
         if let Some(block) = data.get("rateLimit") {
             self.rate_limit.observe(block);
+            if let Some(budget) = capacity::from_graphql_block(block) {
+                self.readings.record("graphql", budget);
+            }
+        }
+    }
+
+    /// Before spending on `resource`, wait while GitHub's live readings put
+    /// it at or over the cap. Without a recent reading, one is taken from
+    /// the free `rate_limit` endpoint first.
+    fn respect_capacity(&mut self, resource: &str) -> Result<()> {
+        let Some(max_use) = self.max_rate_use else {
+            return Ok(());
+        };
+        let mut probe = !self.readings.fresh(resource, LIVE_READING_MAX_AGE);
+        loop {
+            if probe {
+                self.read_rate_limit();
+            }
+            let now = chrono::Utc::now().timestamp();
+            let live = self.readings.live(resource, now);
+            let Some((worst, wait)) = capacity::wait_needed(&live, max_use, now) else {
+                return Ok(());
+            };
+            let until = chrono::DateTime::from_timestamp(worst.reset, 0)
+                .unwrap_or_else(|| chrono::Utc::now() + chrono::Duration::hours(1));
+            let percent = (max_use * 100.0).round();
+            let reason = format!(
+                "{} of {} {resource} points used, at the {percent}% cap; \
+                 waiting for the reset to leave the rest for other gh use",
+                worst.used, worst.limit
+            );
+            eprintln!(
+                "githubdw: GitHub {reason} ({}s, until {})",
+                wait.as_secs(),
+                until.to_rfc3339()
+            );
+            let _pause = PauseGuard::start(CapacityPause {
+                resource: resource.to_string(),
+                used: worst.used,
+                limit: worst.limit,
+                max_use,
+                until,
+            });
+            self.wait_for_rate_limit(resource, wait.min(MAX_RATE_LIMIT_WAIT) + jitter(), &reason)?;
+            // Past the reset: read the new budget before spending.
+            probe = true;
+        }
+    }
+
+    /// Record the `core` and `graphql` budgets from `gh api rate_limit`,
+    /// which costs nothing. A failure is logged; the next response's own
+    /// headers then supply the reading.
+    fn read_rate_limit(&mut self) {
+        let arguments = ["api".to_string(), "rate_limit".to_string()];
+        let body = self
+            .transport
+            .run(&arguments)
+            .and_then(|stdout| serde_json::from_str::<Value>(&stdout).map_err(Error::from));
+        match body {
+            Ok(body) => {
+                for resource in ["core", "graphql"] {
+                    if let Some(budget) = capacity::from_rate_limit_endpoint(&body, resource) {
+                        self.readings.record(resource, budget);
+                    }
+                }
+            }
+            Err(error) => eprintln!(
+                "githubdw: could not read the GitHub rate limit ({}); continuing on the last reading",
+                first_line(&error)
+            ),
         }
     }
 }
@@ -872,6 +984,154 @@ pub mod test_support {
 mod tests {
     use super::test_support::FixtureTransport;
     use super::*;
+
+    /// Shares a fixture transport with the test, to inspect its calls.
+    struct SharedFixture(std::sync::Arc<FixtureTransport>);
+    impl GhTransport for SharedFixture {
+        fn run(&self, arguments: &[String]) -> Result<String> {
+            self.0.run(arguments)
+        }
+    }
+
+    fn capped(
+        responses: Vec<Result<String>>,
+        cap: f64,
+    ) -> (GhClient, std::sync::Arc<FixtureTransport>) {
+        let transport = std::sync::Arc::new(FixtureTransport::new(responses));
+        let mut client =
+            GhClient::with_transport(Box::new(SharedFixture(transport.clone()))).without_sleeping();
+        client.set_max_rate_use(Some(cap)).unwrap();
+        (client, transport)
+    }
+
+    fn rate_limit_body(graphql_used: i64, core_used: i64) -> Result<String> {
+        let reset = chrono::Utc::now().timestamp() + 1800;
+        Ok(serde_json::json!({"resources": {
+            "core": {"limit": 5000, "used": core_used, "remaining": 5000 - core_used, "reset": reset},
+            "graphql": {"limit": 5000, "used": graphql_used, "remaining": 5000 - graphql_used, "reset": reset}
+        }})
+        .to_string())
+    }
+
+    fn with_headers(resource: &str, used: i64, body: &str) -> Result<String> {
+        let reset = chrono::Utc::now().timestamp() + 1800;
+        Ok(format!(
+            "HTTP/2.0 200 OK\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: {}\r\n\
+             X-Ratelimit-Reset: {reset}\r\nX-Ratelimit-Resource: {resource}\r\n\
+             X-Ratelimit-Used: {used}\r\n\r\n{body}",
+            5000 - used
+        ))
+    }
+
+    #[test]
+    fn a_capped_client_reads_the_live_budget_then_spends_under_the_cap() {
+        let (mut client, transport) = capped(
+            vec![
+                rate_limit_body(3999, 10),
+                with_headers("graphql", 4000, r#"{"data":{"x":1}}"#),
+            ],
+            0.8,
+        );
+        assert_eq!(
+            client.graphql("{ x }", &[]).unwrap(),
+            serde_json::json!({"x": 1})
+        );
+        let calls = transport.calls.lock().unwrap();
+        assert_eq!(calls[0], vec!["api", "rate_limit"]);
+        assert_eq!(calls[1][..3], ["api", "--include", "graphql"]);
+        assert_eq!(client.requests_issued(), 1, "reading the budget is free");
+    }
+
+    #[test]
+    fn a_capped_client_at_the_cap_waits_instead_of_spending() {
+        let (mut client, transport) = capped(vec![rate_limit_body(4000, 10)], 0.8);
+        client.set_defer_waits_over(Some(Duration::ZERO));
+        let error = client.graphql("{ x }", &[]).unwrap_err();
+        let Error::RateLimited {
+            resource,
+            wake_at,
+            reason,
+        } = &error
+        else {
+            panic!("{error}");
+        };
+        assert_eq!(resource, "graphql");
+        assert!(*wake_at > chrono::Utc::now() + chrono::Duration::minutes(29));
+        assert!(
+            reason.contains("4000 of 5000 graphql points used, at the 80% cap"),
+            "{reason}"
+        );
+        assert_eq!(transport.calls.lock().unwrap().len(), 1, "nothing spent");
+        // REST draws on the core budget, which is far under the cap.
+        let (mut client, _) = capped(
+            vec![rate_limit_body(4000, 10), with_headers("core", 11, "{}")],
+            0.8,
+        );
+        client.set_defer_waits_over(Some(Duration::ZERO));
+        client.rest("user").unwrap();
+    }
+
+    #[test]
+    fn a_response_reading_counts_without_another_probe() {
+        // The first response reports 4,750 of 5,000: the second call stops
+        // at the 95% cap on that reading, with no new rate_limit read.
+        let (mut client, transport) = capped(
+            vec![rate_limit_body(100, 100), with_headers("core", 4750, "{}")],
+            0.95,
+        );
+        client.set_defer_waits_over(Some(Duration::ZERO));
+        client.rest("a").unwrap();
+        assert!(matches!(client.rest("b"), Err(Error::RateLimited { .. })));
+        assert_eq!(transport.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_busier_of_two_answers_decides() {
+        // GitHub can answer from two views of one budget with different
+        // resets; a quieter later reading must not hide a busier one.
+        let busy = Ok(format!(
+            "HTTP/2.0 200 OK\r\nX-Ratelimit-Limit: 5000\r\nX-Ratelimit-Remaining: 200\r\n\
+             X-Ratelimit-Reset: {}\r\nX-Ratelimit-Resource: graphql\r\n\
+             X-Ratelimit-Used: 4800\r\n\r\n{{\"data\":{{}}}}",
+            chrono::Utc::now().timestamp() + 600
+        ));
+        let (mut client, _) = capped(vec![rate_limit_body(100, 0), busy], 0.95);
+        client.graphql("{ a }", &[]).unwrap();
+        client.set_defer_waits_over(Some(Duration::ZERO));
+        // The rate_limit reading (100 used, later reset) does not mask it.
+        let error = client.graphql("{ b }", &[]).unwrap_err();
+        assert!(matches!(error, Error::RateLimited { .. }), "{error}");
+    }
+
+    #[test]
+    fn an_unreadable_budget_does_not_stop_the_request() {
+        let (mut client, transport) = capped(
+            vec![
+                Err(Error::GhCommand {
+                    exit_code: Some(1),
+                    stderr: "HTTP 502".into(),
+                }),
+                with_headers("core", 10, "{}"),
+            ],
+            0.8,
+        );
+        client.rest("a").unwrap();
+        assert_eq!(transport.calls.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn caps_are_validated_and_new_clients_default_to_95_percent() {
+        let mut client = GhClient::with_transport(Box::new(FixtureTransport::new(vec![])));
+        assert_eq!(client.max_rate_use(), None);
+        assert!(client.set_max_rate_use(Some(1.2)).is_err());
+        assert!(client.set_max_rate_use(Some(0.0)).is_err());
+        client.set_max_rate_use(Some(0.8)).unwrap();
+        assert_eq!(client.max_rate_use(), Some(0.8));
+        assert_eq!(
+            GhClient::new().max_rate_use(),
+            Some(capacity::DEFAULT_MAX_RATE_USE)
+        );
+    }
 
     #[test]
     fn the_request_allowance_counts_retries_and_refuses_without_calling() {

@@ -106,6 +106,15 @@ instead of claiming coverage it does not have. Search also has its own budget of
 30 requests per minute, well under the 5,000 points/hour ordinary GraphQL gets,
 so search calls are paced on their own clock.
 
+Sync shares your `gh` sign-in, so it draws on the same hourly budgets (5,000
+GraphQL points and 5,000 REST requests) as your own `gh` commands. Before each
+request it reads the budget GitHub reports (response headers, or the free
+`rate_limit` endpoint) and, once 95% of a budget is used, waits for that
+budget's reset instead of spending the rest. Change the share per run with
+`--max-rate-use 0.8` (or `80%`), or for every run with
+`githubdw config set max_rate_use 0.8`; library callers use
+`GhClient::set_max_rate_use`.
+
 Manage what `sync all` covers:
 
 ```bash
@@ -246,6 +255,7 @@ githubdw config list
 githubdw config get timezone
 githubdw config set timezone America/New_York   # IANA timezone for date bucketing
 githubdw config set core_hours_start 8
+githubdw config set max_rate_use 0.8              # share of each GitHub budget sync may use
 ```
 
 Timestamps are stored as UTC; date/time dimension keys are derived in the

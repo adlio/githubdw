@@ -15,6 +15,13 @@ pub struct CommandLine {
     #[arg(long, global = true)]
     pub db: Option<PathBuf>,
 
+    /// Share of each hourly GitHub budget a sync may use, as a fraction
+    /// (0.95) or a percentage (95%). Your own `gh` commands share that
+    /// budget; at the cap the sync waits for the reset. Default: the
+    /// `max_rate_use` config value, else 0.95
+    #[arg(long, global = true, value_name = "FRACTION")]
+    pub max_rate_use: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }

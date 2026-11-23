@@ -604,3 +604,32 @@ fn watch_shows_recent_jobs_and_live_progress() {
     );
     assert!(busy.contains("3 synced, 1 skipped, 0 failed"), "{busy}");
 }
+
+#[test]
+fn the_rate_use_cap_comes_from_the_flag_or_the_config_and_is_checked() {
+    let cli = Cli::new();
+    let run = cli
+        .run(&["--max-rate-use", "1.5", "sync", "repo", REPO])
+        .failed();
+    assert!(run.stderr.contains("max rate use"), "{}", run.stderr);
+
+    cli.run(&["config", "set", "max_rate_use", "lots"]).ok();
+    let run = cli.run(&["sync", "user", "octocat"]).failed();
+    assert!(run.stderr.contains("max rate use"), "{}", run.stderr);
+
+    // The flag wins over the config value.
+    cli.route("search(", empty_search());
+    let run = cli
+        .run(&[
+            "--max-rate-use",
+            "80%",
+            "sync",
+            "user",
+            "octocat",
+            "--days",
+            "2",
+            "--skip-diffs",
+        ])
+        .ok();
+    assert!(run.stdout.contains("octocat"), "{}", run.stdout);
+}
