@@ -118,6 +118,8 @@ impl Cli {
             fs::write(&gh, FAKE_GH).unwrap();
             fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
         }
+        // The capacity cap reads the budget first; it is nowhere near spent.
+        cli.route("api rate_limit", healthy_rate_limit());
         cli
     }
 
@@ -199,6 +201,12 @@ impl Default for Cli {
 
 fn page_info() -> Value {
     json!({"hasNextPage": false, "endCursor": null})
+}
+
+/// A `gh api rate_limit` answer with both budgets almost untouched.
+pub fn healthy_rate_limit() -> String {
+    let budget = json!({"limit": 5000, "used": 1, "remaining": 4999, "reset": 4102444800_i64});
+    json!({"resources": {"core": budget, "graphql": budget}}).to_string()
 }
 
 fn rate_limit() -> Value {

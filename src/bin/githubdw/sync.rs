@@ -35,7 +35,31 @@ fn git_recovery_for(warehouse: &GithubDW) -> Option<GitRecoveryConfig> {
     Some(GitRecoveryConfig::github(parent.join("git-cache")))
 }
 
-pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCode> {
+/// A `gh` client capped at `--max-rate-use`, else the warehouse's
+/// `max_rate_use` config value, else the library default (0.95).
+fn capped_client(
+    warehouse: &GithubDW,
+    flag: Option<&str>,
+) -> githubdw::Result<githubdw::fetch::GhClient> {
+    use githubdw::fetch::capacity;
+    let configured = match flag {
+        Some(text) => Some(text.to_string()),
+        None => {
+            githubdw::storage::config_repository::get(warehouse.connection(), capacity::CONFIG_KEY)?
+        }
+    };
+    let mut client = githubdw::fetch::GhClient::new();
+    if let Some(text) = configured {
+        client.set_max_rate_use(Some(capacity::parse(&text)?))?;
+    }
+    Ok(client)
+}
+
+pub fn run(
+    db: Option<PathBuf>,
+    max_rate_use: Option<&str>,
+    command: SyncCommand,
+) -> githubdw::Result<ExitCode> {
     // Plans only read: open without migrating or taking write locks.
     let warehouse = if matches!(
         &command,
@@ -54,7 +78,7 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCo
             pull_requests_only,
             issues_only,
         } => {
-            let mut client = githubdw::fetch::GhClient::new();
+            let mut client = capped_client(&warehouse, max_rate_use)?;
             client.preflight()?;
             let options = githubdw::sync::SyncOptions {
                 days,
@@ -91,7 +115,7 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCo
             days,
             skip_diffs,
         } => {
-            let mut client = githubdw::fetch::GhClient::new();
+            let mut client = capped_client(&warehouse, max_rate_use)?;
             client.preflight()?;
             let options = githubdw::sync::SyncOptions {
                 days,
@@ -126,7 +150,7 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCo
             return Ok(exit_for(!summary.failed.is_empty()));
         }
         SyncCommand::All => {
-            let mut client = githubdw::fetch::GhClient::new();
+            let mut client = capped_client(&warehouse, max_rate_use)?;
             client.preflight()?;
             let sources = githubdw::storage::monitor_repository::list(warehouse.connection())?;
             let plan = githubdw::sync::plan_all(&sources);
@@ -207,7 +231,7 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCo
             }
             // Validate before touching the network, so a bad list fails fast.
             let targets = githubdw::refresh::validate_targets(targets)?;
-            let mut client = githubdw::fetch::GhClient::new();
+            let mut client = capped_client(&warehouse, max_rate_use)?;
             client.preflight()?;
             let mut syncer = githubdw::sync::Syncer::new(warehouse.connection(), &mut client);
             if let Some(config) = git_recovery_for(&warehouse) {
@@ -277,7 +301,7 @@ pub fn run(db: Option<PathBuf>, command: SyncCommand) -> githubdw::Result<ExitCo
                 targets.push(RefreshTarget::parse(TargetKind::PullRequest, reference)?);
             }
             let targets = githubdw::refresh::validate_targets(targets)?;
-            let mut client = githubdw::fetch::GhClient::new();
+            let mut client = capped_client(&warehouse, max_rate_use)?;
             client.preflight()?;
             let report = githubdw::check_history::repair_check_history(
                 warehouse.connection(),
