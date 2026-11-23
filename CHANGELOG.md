@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.4] - 2026-11-23
+
+### Added
+
+- Sync leaves part of the GitHub budget to the person whose `gh` sign-in it
+  uses. Before each request a client reads the budget GitHub reports
+  (`x-ratelimit-*` response headers, a GraphQL `rateLimit` block, or the free
+  `rate_limit` endpoint, never a local count) and, once the share used
+  reaches its cap, waits for the reset. This covers GraphQL and REST. The
+  default cap is 95%; set it with `--max-rate-use` (a fraction such as `0.8`
+  or a percentage such as `80%`), the `max_rate_use` config value, or
+  `GhClient::set_max_rate_use` in the library. GitHub can answer from two
+  views of one budget at once, so the busiest live reading decides.
+- `githubdw::fetch::capacity::current_pause()` reports the cap wait a client
+  in this process is in, so an embedding app can show it as a pause rather
+  than a failure. A client with `set_defer_waits_over` returns
+  `Error::RateLimited` with the reset time instead of sleeping.
+
 ## [0.5.3] - 2026-11-22
 
 ### Added
