@@ -32,8 +32,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requests that changed, through the walks' own hydrate and upsert path.
   A stored copy is skipped only when its `updated_at` matches, its full
   detail landed, it has no recorded failure, and its head commit has no
-  unfinished check run. The shared cursor is the frozen search bound of the
-  last complete detection.
+  unfinished check run. One whose head checks were unfinished is first
+  checked against GitHub's check rollup (about 1 point per 50) and fetched
+  only once its checks finished or its head moved. The shared cursor is the
+  frozen search bound of the last complete detection.
 - Separate `detect` and `backfill` leases (`collector_leases`) holding pid,
   process start time, host and program; a tick never sleeps longer than
   4 minutes inside a lease and reports `TickOutcome::CapPaused` with the
