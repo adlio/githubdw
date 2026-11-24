@@ -19,6 +19,7 @@ fn main() -> githubdw::Result<()> {
     let control = githubdw::collection::CollectionControl {
         cancel: None,
         defer_waits_over: Some(std::time::Duration::from_secs(30)),
+        ..Default::default()
     };
     for back in 0..days {
         let day = today - chrono::Duration::days(back);

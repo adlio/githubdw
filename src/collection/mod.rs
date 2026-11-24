@@ -72,6 +72,10 @@ pub struct CollectionControl {
     /// A rate-limit wait longer than this is not slept; the window reports
     /// `RateLimited` with the wake time. `None` sleeps as the client always has.
     pub defer_waits_over: Option<Duration>,
+    /// Set to stop [`crate::collect::tick`] at its next step boundary (after
+    /// the request in flight lands), keeping everything already done. Unlike
+    /// `cancel`, it never interrupts a request or a wait.
+    pub pause: Option<Arc<AtomicBool>>,
 }
 
 /// How one role of one day window ended.

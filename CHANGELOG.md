@@ -7,6 +7,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-24
+
+### Changed
+
+- `githubdw sync all` runs one shared collection tick instead of walking every
+  monitored user and repository with full-detail pages. A pass that finds
+  nothing new costs about 3 GraphQL points instead of about 4,966, so the
+  hourly timer no longer reaches the budget cap every run. See the README's
+  Sync section. New flags: `--history-from`, `--reconcile`, `--skip-diffs`,
+  `--json`. A run that finds another process detecting, or detection already
+  fresh, exits 0.
+- `CollectionControl` has a new `pause` field (stop at the next step
+  boundary). Code that builds it with a struct literal adds `pause: None` or
+  `..Default::default()`.
+
+### Added
+
+- `githubdw::collect`: `tick(conn, client, &TickPolicy, &CollectionControl)
+  -> TickReport`. Detection is one batched light search per role for every
+  monitored login (bisected by seconds so every window is served by one
+  100-result page, `sort:updated-asc`), an aliased head read of every
+  monitored repository, and a full fetch by `nodes(ids:)` of only the pull
+  requests that changed, through the walks' own hydrate and upsert path.
+  A stored copy is skipped only when its `updated_at` matches, its full
+  detail landed, it has no recorded failure, and its head commit has no
+  unfinished check run. One whose head checks were unfinished is first
+  checked against GitHub's check rollup (about 1 point per 50) and fetched
+  only once its checks finished or its head moved. The shared cursor is the
+  frozen search bound of the last complete detection.
+- Separate `detect` and `backfill` leases (`collector_leases`) holding pid,
+  process start time, host and program; a tick never sleeps longer than
+  4 minutes inside a lease and reports `TickOutcome::CapPaused` with the
+  wake time instead.
+- A per-pull-request retry queue: failures are retried each tick and parked
+  after 5 attempts (retried daily), so one bad pull request cannot pin the
+  cursor. Failures 0.5 walks recorded in `sync_jobs` are imported once.
+- Daily: a 48-hour reconcile walk, a check that every monitored login still
+  resolves (aliased `user(login:)`), and a retry of refused repositories.
+- Backfill lane: catch-ups for users whose 0.5 per-user state stops short
+  (including a pending `user_update_checkpoint`, which it finishes and
+  clears), then created months back to `TickPolicy::history_from`, resuming
+  existing `synced_ranges` coverage.
+- Public readers: `collect::collector_status`, `user_freshness`,
+  `warehouse_freshness`, `lease_holder`, `parked`, `blocked_sources`,
+  `unresolved_logins`. A tick keeps writing each user's `sync_metadata`
+  rows, the `sync_all` row and `synced_ranges`, so older readers stay correct.
+- `GhClient::graphql_points_spent`, `rest_requests_issued`, `used_share` and
+  `graphql_with_errors`.
+- All new tables are created outside the numbered migrations
+  (`ensure_collector_tables`), so `PRAGMA user_version` stays at 8 and 0.5.x
+  binaries keep opening the warehouse.
+
 ## [0.5.4] - 2026-11-23
 
 ### Added

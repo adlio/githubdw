@@ -305,7 +305,7 @@ impl Syncer<'_> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn upsert_one_pull_request(
+    pub(crate) fn upsert_one_pull_request(
         &mut self,
         repo_key: &str,
         pr_key: &str,

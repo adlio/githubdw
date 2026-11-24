@@ -74,7 +74,8 @@ accepts a global `--db <path>` to use a different file.
 ```bash
 githubdw sync repo <owner/name> [--days N] [--skip-diffs] [--pull-requests-only | --issues-only]
 githubdw sync user <login>      [--days N] [--skip-diffs]
-githubdw sync all            # sync every enabled monitored source
+githubdw sync all [--history-from YYYY-MM-DD] [--reconcile] [--skip-diffs] [--json]
+                             # one shared collection tick over every monitored source
 githubdw sync watch          # print one snapshot of any sync in progress, then exit
 ```
 
@@ -125,11 +126,40 @@ githubdw monitor list
 githubdw monitor remove owner/name
 ```
 
-`sync all` runs repositories first, then users, and prints a line for every
-enabled source it will not serve — an unimplemented source type or a disabled
-row is named, never dropped in silence. Monitored **orgs** are one such
-source: `sync all` currently names and skips them rather than syncing their
-repositories.
+`sync all` runs one **collection tick** (`githubdw::collect::tick` in the
+library), the same pass any application linking the crate runs, so two
+collectors on one warehouse never repeat each other's work:
+
+- **Detect** (when the last complete detection is over 30 minutes old). One
+  light search per role names every monitored user at once (`is:pr
+  author:a author:b … updated:<since>..<now>`) and returns only ids and
+  timestamps, for about 1 point per 100 pull requests. One aliased query reads
+  every monitored repository's newest pull-request and issue update. Only pull
+  requests that are new, newer than the stored copy, stored incomplete, or
+  waiting on check runs (which do not move `updatedAt`) are fetched in full, by
+  node id. A pass that finds nothing new costs about 3 points. Once a day the
+  walk also covers the previous 48 hours (search-index lag), checks that every
+  monitored login still resolves, and retries repositories GitHub refused
+  (SAML, IP allow list), which are otherwise asked only once a day.
+- **Backfill** (while under half the hourly budget is used, at most 1,000
+  points per tick). People whose older per-user state stops short get a
+  catch-up first; then history back to `--history-from` (remembered per user)
+  or 90 days for a new user, one created month at a time. Months already
+  covered are skipped, so an interrupted backfill resumes.
+
+A pull request that keeps failing to land is queued and retried each tick,
+then parked after 5 attempts and retried daily, so it never holds back the
+shared cursor. Detect and backfill each take their own lease in
+`githubdw.db`; a run that finds the detect lease held reports who holds it
+and exits 0. Every run ends with one cost line, for example
+`tick: 3 points (detect 3, fetch 0, reconcile 0, logins 0, backfill 0); 0 REST calls`.
+Blocked repositories, parked pull requests and unresolved logins are printed
+once a day.
+
+`sync all` prints a line for every enabled source it will not serve: an
+unimplemented source type or a disabled row is named, never dropped in
+silence. Monitored **orgs** are one such source: `sync all` currently names
+and skips them rather than syncing their repositories.
 
 ### Re-fetching specific items
 
