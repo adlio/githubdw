@@ -190,6 +190,16 @@ impl<'a> Syncer<'a> {
         self
     }
 
+    /// The client this syncer issues requests through.
+    pub(crate) fn client_mut(&mut self) -> &mut GhClient {
+        self.client
+    }
+
+    /// The warehouse connection this syncer writes to.
+    pub(crate) fn connection(&self) -> &'a Connection {
+        self.connection
+    }
+
     /// Sync a repository ("owner/name"): PRs (M1) and issues (M2).
     pub fn sync_repository(
         &mut self,

@@ -259,8 +259,25 @@ pub enum SyncCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Sync every enabled monitored source
-    All,
+    /// Bring every enabled monitored source up to date with one shared tick:
+    /// batched change detection, a full fetch of only what changed, and a
+    /// bounded slice of history backfill
+    All {
+        /// Oldest created date to backfill monitored users to (YYYY-MM-DD).
+        /// Remembered per user; the earliest date asked for wins.
+        #[arg(long)]
+        history_from: Option<chrono::NaiveDate>,
+        /// Run the daily 48-hour reconcile, login check and refused-source
+        /// retry now
+        #[arg(long)]
+        reconcile: bool,
+        /// Skip per-file patch text (fast mode)
+        #[arg(long)]
+        skip_diffs: bool,
+        /// Print the tick report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Watch live progress of a running sync
     Watch,
 }

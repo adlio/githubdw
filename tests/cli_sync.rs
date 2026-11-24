@@ -68,46 +68,88 @@ fn user_sync_with_nothing_new_is_up_to_date() {
     assert_eq!(run.stdout.trim(), "octocat: already up to date");
 }
 
+/// Route the queries one `sync all` tick sends for the fixture repository:
+/// the aliased head read, the light listing, the by-id fetch and the issue
+/// walk. `broken` adds a second monitored repository GitHub fails to answer.
+fn route_tick(cli: &Cli, broken: bool) {
+    // A repository never synced is listed back 90 days, so the listing's
+    // updates are recent.
+    let recent = |minutes: i64| {
+        (chrono::Utc::now() - chrono::Duration::minutes(minutes))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let rate =
+        json!({"limit": 5000, "cost": 1, "remaining": 4999, "resetAt": "2099-01-01T00:00:00Z"});
+    let heads = json!({"pullRequests": {"nodes": [{"updatedAt": recent(10)}]},
+                       "issues": {"nodes": [{"updatedAt": "2026-02-07T12:00:00Z"}]}});
+    // Monitored repositories are read in name order: broken, then hello.
+    let (data, errors) = if broken {
+        (
+            json!({"rateLimit": rate, "a0": null, "a1": heads}),
+            json!([{"type": "INTERNAL", "path": ["a0"], "message": "Something went wrong"}]),
+        )
+    } else {
+        (json!({"rateLimit": rate, "a0": heads}), json!([]))
+    };
+    cli.route(
+        "pullRequests(first: 1,",
+        json!({"data": data, "errors": errors}).to_string(),
+    );
+    cli.route(
+        "user(login",
+        json!({"data": {"rateLimit": rate, "a0": {"login": "octocat"}}}).to_string(),
+    );
+    cli.route("search(query", empty_search());
+    cli.route(
+        "first: 100, after: $cursor, orderBy",
+        json!({"data": {"rateLimit": rate, "repository": {"nameWithOwner": REPO,
+            "pullRequests": {"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": [
+                {"id": "PR_2", "number": 2, "updatedAt": recent(10)},
+                {"id": "PR_1", "number": 1, "updatedAt": recent(20)}]}}}})
+        .to_string(),
+    );
+    let with_repository = |mut node: serde_json::Value| {
+        node["repository"] = json!({"nameWithOwner": REPO, "primaryLanguage": {"name": "Rust"},
+            "isFork": false, "isPrivate": false, "defaultBranchRef": {"name": "main"},
+            "createdAt": "2020-01-01T00:00:00Z"});
+        node
+    };
+    cli.route(
+        "nodes(ids:",
+        json!({"data": {"rateLimit": rate, "nodes": [
+            with_repository(pr(2, "second change")), with_repository(pr(1, "first feature"))]}})
+        .to_string(),
+    );
+    cli.route("issues(first", issue_page(&[issue(7, "crash on startup")]));
+}
+
 #[test]
-fn sync_all_walks_every_monitored_source_and_reports_failures_per_source() {
+fn sync_all_runs_one_tick_and_reports_a_failing_repository() {
     let cli = Cli::new();
     cli.run(&["monitor", "add-org", "acme"]).ok();
     cli.run(&["monitor", "add-user", "octocat"]).ok();
     cli.run(&["monitor", "add-repo", REPO]).ok();
     cli.run(&["monitor", "add-repo", "octocat/broken"]).ok();
-    cli.route("search(", empty_search());
-    cli.route("issues(first", issue_page(&[]));
-    cli.route(
-        "name=hello",
-        pr_page(&[pr(1, "first feature"), pr(2, "second change")]),
-    );
+    route_tick(&cli, true);
 
-    // One of three sources errors outright (no fixture for octocat/broken):
-    // the other two still sync, and the run exits 3 ("ran, something
-    // failed") rather than the 1 used for errors that stop the run before
-    // any work happens.
-    let run = cli.run(&["sync", "all"]).code(3);
+    // The broken repository leaves detection incomplete: the run still
+    // fetches what changed elsewhere and exits 3 ("ran, something failed").
+    let run = cli.run(&["sync", "all", "--skip-diffs"]).code(3);
     assert!(
         run.stdout.contains("skipping org 'acme'"),
         "orgs are announced as unsupported:\n{}",
         run.stdout
     );
     assert!(
-        run.stdout.contains("octocat/hello: 2 PRs, 0 issues"),
-        "{}",
-        run.stdout
-    );
-    assert!(
-        run.stdout.contains("user octocat: 0 PRs, 0 issues"),
-        "{}",
-        run.stdout
-    );
-    // One failing source does not stop the others.
-    assert!(run.stderr.contains("octocat/broken: "), "{}", run.stderr);
-    assert!(
-        run.stderr.contains("1 of 3 sources failed"),
+        run.stderr.contains("detection incomplete"),
         "{}",
         run.stderr
+    );
+    assert!(run.stderr.contains("octocat/broken: "), "{}", run.stderr);
+    assert!(
+        run.stdout.contains("tick: "),
+        "one cost line:\n{}",
+        run.stdout
     );
     assert!(
         cli.run(&["monitor", "list"])
@@ -117,19 +159,22 @@ fn sync_all_walks_every_monitored_source_and_reports_failures_per_source() {
             .any(|line| line.contains("octocat/hello") && !line.ends_with("never")),
         "the synced repository records its last sync"
     );
+    let query = cli.run(&["query", "--output", "json"]).ok();
+    assert!(query.stdout.contains("second change"), "{}", query.stdout);
 }
 
 #[test]
 fn sync_all_exits_zero_when_every_source_succeeds() {
     let cli = Cli::new();
     cli.run(&["monitor", "add-repo", REPO]).ok();
-    cli.route("issues(first", issue_page(&[]));
-    cli.route(
-        "name=hello",
-        pr_page(&[pr(1, "first feature"), pr(2, "second change")]),
-    );
+    route_tick(&cli, false);
 
-    cli.run(&["sync", "all"]).ok();
+    let run = cli.run(&["sync", "all", "--skip-diffs"]).ok();
+    assert!(run.stdout.contains("detected "), "{}", run.stdout);
+    // A second run inside the detection interval asks GitHub nothing.
+    let again = cli.run(&["sync", "all", "--skip-diffs"]).ok();
+    assert!(again.stdout.contains("up to date"), "{}", again.stdout);
+    assert!(again.stdout.contains("tick: 0 points"), "{}", again.stdout);
 }
 
 #[test]

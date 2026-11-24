@@ -21,10 +21,6 @@ fn exit_for(failed: bool) -> ExitCode {
     }
 }
 
-/// Pull requests one repository may process per `sync all` run before it
-/// checkpoints and yields to the next source.
-const SYNC_ALL_REPO_ITEM_BUDGET: i64 = 500;
-
 /// Git-backed completion of capped pull-request file listings, cached next to
 /// the warehouse database (never under a temp directory).
 fn git_recovery_for(warehouse: &GithubDW) -> Option<GitRecoveryConfig> {
@@ -149,71 +145,45 @@ pub fn run(
             }
             return Ok(exit_for(!summary.failed.is_empty()));
         }
-        SyncCommand::All => {
+        SyncCommand::All {
+            history_from,
+            reconcile,
+            skip_diffs,
+            json,
+        } => {
+            use githubdw::collect::{TickOutcome, TickPolicy};
             let mut client = capped_client(&warehouse, max_rate_use)?;
             client.preflight()?;
             let sources = githubdw::storage::monitor_repository::list(warehouse.connection())?;
-            let plan = githubdw::sync::plan_all(&sources);
-            // Printed before any work, so a source this build cannot
-            // serve is visible even if the run is interrupted.
-            for notice in &plan.notices {
+            // Printed before any work, so a source this build cannot serve
+            // is visible even if the run is interrupted.
+            for notice in &githubdw::sync::plan_all(&sources).notices {
                 println!("{notice}");
             }
-            let sources = plan.fair_sources(warehouse.connection())?;
-            let mut failed_sources = 0usize;
-            for (index, source) in sources.iter().enumerate() {
-                // Record the successor first: a killed run resumes at
-                // another source rather than starving it indefinitely.
-                githubdw::sync::SyncPlan::checkpoint_next_source(
-                    warehouse.connection(),
-                    &sources[(index + 1) % sources.len()],
-                )?;
-                let options = githubdw::sync::SyncOptions::default();
-                let mut syncer = githubdw::sync::Syncer::new(warehouse.connection(), &mut client)
-                    .with_item_budget(SYNC_ALL_REPO_ITEM_BUDGET);
-                if let Some(config) = git_recovery_for(&warehouse) {
-                    syncer = syncer.with_git_recovery(config);
-                }
-                let (label, outcome) = match source {
-                    githubdw::sync::SyncSource::User(login) => {
-                        (format!("user {login}"), syncer.sync_user(login, &options))
-                    }
-                    githubdw::sync::SyncSource::Repository(repo) => {
-                        (repo.clone(), syncer.sync_repository(repo, &options))
-                    }
-                };
-                match outcome {
-                    Ok(summary) => {
-                        println!(
-                            "{label}: {} PRs, {} issues{}",
-                            summary.pull_requests_synced,
-                            summary.issues_synced,
-                            if summary.partial {
-                                " (partial, resumes next run)"
-                            } else {
-                                ""
-                            }
-                        );
-                        for note in &summary.notes {
-                            println!("  {note}");
-                        }
-                        for (item, error) in &summary.failed {
-                            eprintln!("failed {item}: {error}");
-                        }
-                        if !summary.failed.is_empty() {
-                            failed_sources += 1;
-                        }
-                    }
-                    Err(error) => {
-                        eprintln!("{label}: {error}");
-                        failed_sources += 1;
-                    }
-                }
+            let policy = TickPolicy {
+                program: "githubdw sync all".into(),
+                history_from,
+                force_reconcile: reconcile,
+                skip_diffs,
+                git_recovery: git_recovery_for(&warehouse),
+                ..TickPolicy::default()
+            };
+            let report = githubdw::collect::tick(
+                warehouse.connection(),
+                &mut client,
+                &policy,
+                &Default::default(),
+            )?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print_tick(&report);
             }
-            if failed_sources > 0 {
-                eprintln!("{failed_sources} of {} sources failed", sources.len());
-            }
-            return Ok(exit_for(failed_sources > 0));
+            let failed = match &report.outcome {
+                TickOutcome::Incomplete { .. } | TickOutcome::SignIn { .. } => true,
+                _ => report.fetch.failed > 0,
+            };
+            return Ok(exit_for(failed));
         }
         SyncCommand::Targets {
             pull_requests,
@@ -476,6 +446,86 @@ pub fn run(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The human summary of one tick: what happened, then one cost line.
+fn print_tick(report: &githubdw::collect::TickReport) {
+    use githubdw::collect::TickOutcome;
+    match &report.outcome {
+        TickOutcome::UpToDate { last_detect_at, by } => println!(
+            "up to date: checked {} by {}",
+            last_detect_at.to_rfc3339(),
+            by.as_deref().unwrap_or("an earlier run")
+        ),
+        TickOutcome::Busy { holder } => println!(
+            "busy: {} (pid {} on {}) is detecting since {}",
+            holder.program,
+            holder.pid,
+            holder.host,
+            holder.acquired_at.to_rfc3339()
+        ),
+        TickOutcome::Detected => println!(
+            "detected {} changed pull requests ({} needed a full fetch); fetched {}, {} failed, {} deferred",
+            report.detected,
+            report.queued,
+            report.fetch.landed,
+            report.fetch.failed,
+            report.fetch.deferred
+        ),
+        TickOutcome::Incomplete { gaps } => {
+            eprintln!(
+                "detection incomplete ({} gap(s)); the next run repeats it. Fetched {}, {} failed",
+                gaps.len(),
+                report.fetch.landed,
+                report.fetch.failed
+            );
+            for gap in gaps {
+                eprintln!("  {gap}");
+            }
+        }
+        TickOutcome::CapPaused { wake_at, reason } => println!(
+            "paused at the GitHub budget cap until {}: {reason}",
+            wake_at.to_rfc3339()
+        ),
+        TickOutcome::Stopped => println!("stopped"),
+        TickOutcome::SignIn { reason } => eprintln!("GitHub sign-in needed: {reason}"),
+    }
+    let backfill = &report.backfill;
+    if let Some(why) = &backfill.skipped {
+        println!("backfill: {why} ({} login(s) owed)", backfill.remaining);
+    } else if !backfill.windows_covered.is_empty() || !backfill.catch_ups_finished.is_empty() {
+        println!(
+            "backfill: {} month(s) covered, {} catch-up(s) finished, {} pull requests fetched; {} login(s) still owed",
+            backfill.windows_covered.len(),
+            backfill.catch_ups_finished.len(),
+            backfill.fetch.landed,
+            backfill.remaining
+        );
+    }
+    for note in &report.notes {
+        println!("  {note}");
+    }
+    // The standing problems, once a day rather than every run.
+    if report.report_due {
+        for source in &report.blocked {
+            println!(
+                "blocked: {} ({}); retried after {}",
+                source.source, source.reason, source.retry_after
+            );
+        }
+        for pr in &report.parked {
+            println!(
+                "parked: {} after {} attempts: {}",
+                pr.pr_key,
+                pr.attempts,
+                pr.last_error.as_deref().unwrap_or("unknown error")
+            );
+        }
+        for login in &report.unresolved_logins {
+            println!("unresolved login: {login} (renamed or deleted on GitHub?)");
+        }
+    }
+    println!("{}", report.cost_line());
 }
 
 #[cfg(test)]

@@ -260,6 +260,10 @@ pub struct GhClient {
     max_rate_use: Option<f64>,
     /// GitHub's own budget readings, for the cap.
     readings: Readings,
+    /// Sum of `rateLimit.cost` over every GraphQL response that reported it.
+    graphql_points: i64,
+    /// REST calls issued (every attempt), against the separate core budget.
+    rest_requests: u64,
 }
 
 /// Rate-limit state observed from data responses (never from the separate
@@ -369,7 +373,38 @@ impl GhClient {
             bytes_received: 0,
             max_rate_use: None,
             readings: Readings::default(),
+            graphql_points: 0,
+            rest_requests: 0,
         }
+    }
+
+    /// GraphQL points this client has spent, summed from the `rateLimit.cost`
+    /// each response reported. A query that selects no `rateLimit` block is
+    /// not counted, so every query githubdw issues selects one.
+    pub fn graphql_points_spent(&self) -> i64 {
+        self.graphql_points
+    }
+
+    /// REST calls issued so far (every attempt), against the core budget.
+    pub fn rest_requests_issued(&self) -> u64 {
+        self.rest_requests
+    }
+
+    /// The share of `resource`'s hourly budget already used, judged from the
+    /// most used live reading GitHub has given this client. Reads the free
+    /// `rate_limit` endpoint first when no reading is recent. `None` when
+    /// GitHub gave no usable reading.
+    pub fn used_share(&mut self, resource: &str) -> Option<f64> {
+        if !self.readings.fresh(resource, LIVE_READING_MAX_AGE) {
+            self.read_rate_limit();
+        }
+        let now = chrono::Utc::now().timestamp();
+        self.readings
+            .live(resource, now)
+            .iter()
+            .filter(|b| b.limit > 0)
+            .map(|b| b.used as f64 / b.limit as f64)
+            .max_by(f64::total_cmp)
     }
 
     /// Use at most `fraction` (above 0, at most 1) of each hourly GitHub
@@ -549,6 +584,17 @@ impl GhClient {
         variables: &[(&str, &str)],
     ) -> Result<(Value, Vec<Value>)> {
         self.pace_search()?;
+        self.graphql_with_errors(query, variables)
+    }
+
+    /// [`Self::graphql_search_with_errors`] without the search pacing, for
+    /// queries that address nodes directly (`nodes(ids:)`, aliased lookups),
+    /// where one inaccessible or missing node must not fail the others.
+    pub fn graphql_with_errors(
+        &mut self,
+        query: &str,
+        variables: &[(&str, &str)],
+    ) -> Result<(Value, Vec<Value>)> {
         let arguments = Self::graphql_arguments(query, variables);
         let response: Value = self.run_with_retry(&arguments)?;
         let errors = response
@@ -709,6 +755,9 @@ impl GhClient {
                 self.request_allowance = Some(allowance - 1);
             }
             self.requests_issued += 1;
+            if resource == "core" && !free {
+                self.rest_requests += 1;
+            }
             match self.transport.run(sent) {
                 Ok(stdout) => {
                     self.bytes_received += stdout.len() as u64;
@@ -815,6 +864,7 @@ impl GhClient {
 
     fn observe_rate_limit(&mut self, data: &Value) {
         if let Some(block) = data.get("rateLimit") {
+            self.graphql_points += block.get("cost").and_then(Value::as_i64).unwrap_or(0);
             self.rate_limit.observe(block);
             if let Some(budget) = capacity::from_graphql_block(block) {
                 self.readings.record("graphql", budget);

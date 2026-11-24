@@ -722,6 +722,7 @@ fn rate_limits_report_a_wake_time_and_cancellation_claims_nothing() {
     let control = CollectionControl {
         cancel: None,
         defer_waits_over: Some(Duration::from_secs(5)),
+        pause: None,
     };
     let outcome = collect_day(
         dw.connection(),
@@ -759,6 +760,7 @@ fn rate_limits_report_a_wake_time_and_cancellation_claims_nothing() {
     let control = CollectionControl {
         cancel: Some(cancel.clone()),
         defer_waits_over: None,
+        pause: None,
     };
     let outcome = collect_day(
         dw.connection(),

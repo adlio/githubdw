@@ -4,7 +4,7 @@ use super::*;
 
 impl Syncer<'_> {
     #[allow(clippy::too_many_arguments)]
-    pub(super) fn sync_issues(
+    pub(crate) fn sync_issues(
         &mut self,
         owner: &str,
         name: &str,

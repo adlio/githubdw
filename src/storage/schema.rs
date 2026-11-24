@@ -48,8 +48,17 @@ pub fn init(conn: &mut Connection) -> Result<()> {
         assert_referential_integrity(conn)?;
     }
     ensure_collection_tables(conn)?;
+    ensure_collector_tables(conn)?;
     ensure_sort_indexes(conn)?;
     ensure_lock_holder_column(conn)?;
+    Ok(())
+}
+
+/// Create the shared collector tables (`collect::tick`) when missing. Not a
+/// numbered migration, for the same reason as [`ensure_collection_tables`]:
+/// `user_version` stays at 8, so 0.5.x binaries keep opening the warehouse.
+pub fn ensure_collector_tables(conn: &Connection) -> Result<()> {
+    conn.execute_batch(include_str!("collector_tables.sql"))?;
     Ok(())
 }
 

@@ -12,6 +12,7 @@
 //! entirely delegated to `gh auth`. GitHub Enterprise works via `GH_HOST`.
 
 pub mod check_history;
+pub mod collect;
 pub mod collection;
 pub mod error;
 pub mod fetch;
