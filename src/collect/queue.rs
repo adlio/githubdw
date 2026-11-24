@@ -97,7 +97,21 @@ pub(crate) fn stored_state(conn: &Connection, found: &Found) -> Result<Stored> {
         )
         .optional()?
         .flatten();
-    Ok(head.map_or(Stored::Fetch, Stored::Checks))
+    let Some(head) = head else {
+        return Ok(Stored::Fetch);
+    };
+    // This head was already fetched again after GitHub reported its checks
+    // finished: what still looks unfinished is a run GitHub no longer lists.
+    let refetched: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM collector_check_refetch WHERE pr_key = ?1 AND head_oid = ?2)",
+        params![found.pr_key, head],
+        |r| r.get(0),
+    )?;
+    Ok(if refetched {
+        Stored::Complete
+    } else {
+        Stored::Checks(head)
+    })
 }
 
 /// True when the stored copy has the same `updated_at`, its full detail
@@ -598,6 +612,8 @@ pub(crate) fn probe_unfinished_checks(
                        WHERE c.pr_key = p.pr_key AND c.head_sha = s.head_oid
                          AND c.status <> 'COMPLETED')
            AND NOT EXISTS (SELECT 1 FROM collector_pr_queue q WHERE q.pr_key = p.pr_key)
+           AND NOT EXISTS (SELECT 1 FROM collector_check_refetch r
+                           WHERE r.pr_key = p.pr_key AND r.head_oid = s.head_oid)
          ORDER BY p.updated_at DESC LIMIT ?2",
     )?;
     let candidates: Vec<(String, String)> = statement
@@ -643,8 +659,20 @@ pub(crate) fn probe_checks(
                 .pointer("/commits/nodes/0/commit/statusCheckRollup/state")
                 .and_then(Value::as_str);
             let still_running = matches!(rollup, Some("PENDING" | "EXPECTED"));
-            if head == Some(stored_head.as_str()) && still_running {
+            let same_head = head == Some(stored_head.as_str());
+            if same_head && still_running {
                 continue;
+            }
+            if same_head {
+                // Finished on GitHub: fetch this head once more, and only
+                // once (see `collector_check_refetch`).
+                conn.execute(
+                    "INSERT INTO collector_check_refetch (pr_key, head_oid, refetched_at)
+                     VALUES (?1, ?2, ?3)
+                     ON CONFLICT (pr_key) DO UPDATE SET
+                         head_oid = excluded.head_oid, refetched_at = excluded.refetched_at",
+                    params![pr_key, stored_head, now_text()],
+                )?;
             }
             let (Some(id), Some(updated)) = (
                 pr.get("id").and_then(Value::as_str),

@@ -60,6 +60,16 @@ CREATE TABLE IF NOT EXISTS collector_members (
     catch_up_review  TEXT
 );
 
+-- Heads whose check rollup GitHub reported finished while stored check
+-- runs were not, and which were fetched again for it. A head is fetched for
+-- this once: a stored run GitHub no longer lists (a superseded re-run) would
+-- otherwise look unfinished forever.
+CREATE TABLE IF NOT EXISTS collector_check_refetch (
+    pr_key       TEXT PRIMARY KEY,
+    head_oid     TEXT NOT NULL,
+    refetched_at TEXT NOT NULL
+);
+
 -- Sources GitHub refuses (SAML, IP allow list, forbidden): retried once a
 -- day instead of every pass.
 CREATE TABLE IF NOT EXISTS collector_backoff (

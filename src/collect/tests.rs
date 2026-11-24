@@ -54,6 +54,8 @@ struct World {
     nodes_error: Option<Value>,
     /// The issue walk fails outright.
     issue_fault: bool,
+    /// The check rollup state served, whatever the runs say.
+    rollup: Option<&'static str>,
 }
 
 #[derive(Clone, Default)]
@@ -231,7 +233,9 @@ impl World {
                     continue;
                 };
                 let runs = self.checks.get(&pr.node_id()).cloned().unwrap_or_default();
-                let state = if runs.iter().any(|(_, s)| s != "COMPLETED") {
+                let state = if let Some(state) = self.rollup {
+                    state
+                } else if runs.iter().any(|(_, s)| s != "COMPLETED") {
                     "PENDING"
                 } else {
                     "SUCCESS"
@@ -1877,4 +1881,36 @@ fn running_checks_cost_a_rollup_read_not_a_full_fetch() {
         "{running:?}"
     );
     assert_eq!(running.points.fetch, 0);
+}
+
+#[test]
+fn a_stale_unfinished_run_costs_one_refetch_per_head() {
+    let dw = warehouse(&["alice"]);
+    let prs = vec![FakePr::new("acme/app", 1, "alice", &ago(60), &ago(20))];
+    let id = prs[0].node_id();
+    let fake = Fake::new(prs);
+    // GitHub still lists a run as queued on the head, but the rollup has
+    // finished (a superseded re-run).
+    fake.with(|w| {
+        w.checks
+            .insert(id.clone(), vec![("OLD".into(), "QUEUED".into())]);
+        w.rollup = Some("SUCCESS");
+    });
+    run_tick(&dw, &fake, &eager());
+    let quiet = TickPolicy {
+        force_reconcile: false,
+        ..eager()
+    };
+    let once = run_tick(&dw, &fake, &quiet);
+    assert_eq!(once.fetch.landed, 1, "fetched again once: {once:?}");
+    fake.with(|w| w.by_id = 0);
+    for _ in 0..2 {
+        let later = run_tick(&dw, &fake, &quiet);
+        assert_eq!(later.queued, 0, "{later:?}");
+    }
+    assert_eq!(
+        fake.with(|w| w.by_id),
+        0,
+        "not fetched again for the same head"
+    );
 }
