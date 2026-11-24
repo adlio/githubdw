@@ -531,6 +531,73 @@ fn print_tick(report: &githubdw::collect::TickReport) {
 #[cfg(test)]
 mod exit_code_tests {
     use super::exit_for;
+
+    /// Every outcome prints without panicking, with the daily lists.
+    #[test]
+    fn every_tick_outcome_prints() {
+        use githubdw::collect::*;
+        let now = chrono::Utc::now();
+        let holder = LeaseHolder {
+            lane: "detect".into(),
+            program: "engdash".into(),
+            pid: 1,
+            host: "h".into(),
+            acquired_at: now,
+            expires_at: now,
+        };
+        let outcomes = [
+            TickOutcome::UpToDate {
+                last_detect_at: now,
+                by: None,
+            },
+            TickOutcome::Busy { holder },
+            TickOutcome::Detected,
+            TickOutcome::Incomplete {
+                gaps: vec!["acme/app: boom".into()],
+            },
+            TickOutcome::CapPaused {
+                wake_at: now,
+                reason: "cap".into(),
+            },
+            TickOutcome::Stopped,
+            TickOutcome::SignIn {
+                reason: "gh auth login".into(),
+            },
+        ];
+        for (index, outcome) in outcomes.into_iter().enumerate() {
+            let report = TickReport {
+                outcome,
+                started_at: now,
+                finished_at: now,
+                points: PhasePoints::default(),
+                rest_calls: 0,
+                detected: 0,
+                queued: 0,
+                fetch: FetchSummary::default(),
+                backfill: BackfillSummary {
+                    skipped: (index % 2 == 0).then(|| "budget".to_string()),
+                    windows_covered: vec!["alice 2026-10".into()],
+                    ..Default::default()
+                },
+                blocked: vec![BlockedSource {
+                    source: "corp/secret".into(),
+                    reason: "SAML".into(),
+                    first_seen_at: "t".into(),
+                    retry_after: "t".into(),
+                }],
+                parked: vec![ParkedPullRequest {
+                    pr_key: "acme/app#1".into(),
+                    attempts: 5,
+                    last_error: None,
+                    parked_at: "t".into(),
+                }],
+                unresolved_logins: vec!["gone".into()],
+                report_due: true,
+                notes: vec!["note".into()],
+            };
+            super::print_tick(&report);
+        }
+    }
     use std::process::ExitCode;
 
     #[test]

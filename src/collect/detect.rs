@@ -356,6 +356,102 @@ pub(crate) fn newest_updated(connection: Option<&Value>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn search(nodes: Value, has_next: bool, end: Option<&str>) -> Value {
+        json!({"search": {"issueCount": 1, "pageInfo": {"hasNextPage": has_next, "endCursor": end},
+                          "nodes": nodes}})
+    }
+
+    #[test]
+    fn malformed_light_pages_are_refused_with_a_reason() {
+        let node = json!({"id": "PR_1", "number": 1, "updatedAt": "2026-11-01T00:00:00Z",
+                          "repository": {"nameWithOwner": "Acme/App"}});
+        let page = parse_page(&search(json!([node, {}]), false, None), &[]).unwrap();
+        assert_eq!(
+            page.items[0].pr_key, "acme/app#1",
+            "issue nodes answer with {{}}"
+        );
+        let cases: Vec<(Value, Vec<Value>, &str)> = vec![
+            (json!({}), vec![], "search block missing"),
+            (json!({"search": {}}), vec![], "issueCount"),
+            (json!({"search": {"issueCount": 1}}), vec![], "pageInfo"),
+            (
+                json!({"search": {"issueCount": 1, "pageInfo": {}}}),
+                vec![],
+                "hasNextPage",
+            ),
+            (search(json!([]), true, None), vec![], "no endCursor"),
+            (
+                json!({"search": {"issueCount": 1, "pageInfo": {"hasNextPage": false}}}),
+                vec![],
+                "nodes array",
+            ),
+            (search(json!([null]), false, None), vec![], "null node"),
+            (
+                search(
+                    json!([{"id": "x", "number": 1, "updatedAt": "t"}]),
+                    false,
+                    None,
+                ),
+                vec![],
+                "repository",
+            ),
+            (
+                search(
+                    json!([{"id": "x", "updatedAt": "t", "repository": {"nameWithOwner": "a/b"}}]),
+                    false,
+                    None,
+                ),
+                vec![],
+                "number",
+            ),
+            (
+                search(
+                    json!([{"number": 1, "updatedAt": "t", "repository": {"nameWithOwner": "a/b"}}]),
+                    false,
+                    None,
+                ),
+                vec![],
+                "no id",
+            ),
+            (
+                search(
+                    json!([{"id": "x", "number": 1, "repository": {"nameWithOwner": "a/b"}}]),
+                    false,
+                    None,
+                ),
+                vec![],
+                "updatedAt",
+            ),
+            (
+                search(json!([]), false, None),
+                vec![json!({"message": "boom"})],
+                "boom",
+            ),
+        ];
+        for (data, errors, want) in cases {
+            let error = parse_page(&data, &errors).err().unwrap_or_default();
+            assert!(error.contains(want), "{want}: {error}");
+        }
+        let skipped = json!({"type": "FORBIDDEN", "path": ["search", "nodes", 0]});
+        let page = parse_page(&search(json!([null]), false, None), &[skipped]).unwrap();
+        assert_eq!((page.items.len(), page.inaccessible), (0, 1));
+    }
+
+    #[test]
+    fn an_empty_range_asks_nothing_and_newest_reads_the_first_node() {
+        let mut client = GhClient::with_transport(Box::new(
+            crate::fetch::test_support::FixtureTransport::new(vec![]),
+        ));
+        let walk = enumerate(&mut client, "is:pr", "updated", 10, 5, &mut || Ok(())).unwrap();
+        assert!(walk.complete() && walk.items.is_empty() && walk.queries == 0);
+        assert_eq!(
+            newest_updated(Some(&json!({"nodes": [{"updatedAt": "T"}]}))).as_deref(),
+            Some("T")
+        );
+        assert_eq!(newest_updated(Some(&json!({"nodes": []}))), None);
+    }
 
     #[test]
     fn identifiers_inlined_into_queries_are_checked() {
