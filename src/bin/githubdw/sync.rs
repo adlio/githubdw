@@ -465,12 +465,13 @@ fn print_tick(report: &githubdw::collect::TickReport) {
             holder.acquired_at.to_rfc3339()
         ),
         TickOutcome::Detected => println!(
-            "detected {} changed pull requests ({} needed a full fetch); fetched {}, {} failed, {} deferred",
+            "detected {} changed pull requests ({} needed a full fetch); fetched {}, {} failed, {} deferred, {} gone",
             report.detected,
             report.queued,
             report.fetch.landed,
             report.fetch.failed,
-            report.fetch.deferred
+            report.fetch.deferred,
+            report.fetch.gone
         ),
         TickOutcome::Incomplete { gaps } => {
             eprintln!(

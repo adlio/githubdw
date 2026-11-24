@@ -1844,3 +1844,37 @@ fn a_short_catch_up_stays_owed_and_a_paused_backfill_does_nothing() {
         "{paused:?}"
     );
 }
+
+#[test]
+fn running_checks_cost_a_rollup_read_not_a_full_fetch() {
+    let dw = warehouse(&["alice"]);
+    let prs = vec![
+        FakePr::new("acme/app", 1, "alice", &ago(60), &ago(20)).reviewed("R1", "alice", &ago(20)),
+    ];
+    let id = prs[0].node_id();
+    let fake = Fake::new(prs);
+    fake.with(|w| {
+        w.checks
+            .insert(id.clone(), vec![("CR1".into(), "IN_PROGRESS".into())]);
+    });
+    run_tick(&dw, &fake, &eager());
+    fake.with(|w| w.by_id = 0);
+    let running = run_tick(
+        &dw,
+        &fake,
+        &TickPolicy {
+            force_reconcile: false,
+            ..eager()
+        },
+    );
+    assert_eq!(
+        running.detected, 1,
+        "author and reviewer sightings are one pull request"
+    );
+    assert_eq!(
+        (running.queued, fake.with(|w| w.by_id)),
+        (0, 0),
+        "{running:?}"
+    );
+    assert_eq!(running.points.fetch, 0);
+}

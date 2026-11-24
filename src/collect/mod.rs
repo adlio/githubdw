@@ -772,8 +772,18 @@ fn detect(
         report.points.reconcile += points(syncer) - before;
     }
 
+    // The author and reviewer walks can both return one pull request; keep
+    // the newest sighting.
+    found.sort_by(|a, b| {
+        a.pr_key
+            .cmp(&b.pr_key)
+            .then(b.updated_at.cmp(&a.updated_at))
+    });
+    found.dedup_by(|a, b| a.pr_key == b.pr_key);
     report.detected += found.len() as i64;
-    report.queued += queue::enqueue_changed(conn, &found)?;
+    let before = points(syncer);
+    report.queued += queue::enqueue_changed(syncer, &found, &mut renew)?;
+    report.points.detect += points(syncer) - before;
 
     // Full fetch of everything queued (new changes, earlier failures).
     let before = points(syncer);
@@ -1393,8 +1403,9 @@ fn land_all(
 ) -> Result<bool> {
     let conn = syncer.connection();
     let mut keys = HashSet::new();
+    // History needs no check-run refresh: only what is missing or stale.
     for item in found {
-        if !queue::stored_complete(conn, item)? {
+        if queue::stored_state(conn, item)? == queue::Stored::Fetch {
             queue::enqueue(conn, item)?;
             keys.insert(item.pr_key.clone());
         }

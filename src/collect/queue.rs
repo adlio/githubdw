@@ -65,15 +65,44 @@ fn instant(text: &str) -> Option<DateTime<Utc>> {
         .map(|t| t.with_timezone(&Utc))
 }
 
-/// Whether the stored copy of `found` is complete and current, so fetching
-/// it again would return nothing new. False (fetch it) when:
-///
-/// * nothing is stored, or the stored `updated_at` is older;
-/// * only a light row is stored (`pr_detail_state` without a detail fetch);
-/// * it is queued after a failure;
-/// * its stored head commit still has a check run that is not completed:
-///   check runs finishing do not move a pull request's `updatedAt`.
-pub(crate) fn stored_complete(conn: &Connection, found: &Found) -> Result<bool> {
+/// What the stored copy of a detected pull request needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Stored {
+    /// Current and complete: fetching again would return nothing new.
+    Complete,
+    /// Fetch it in full: nothing stored, an older `updated_at`, only a
+    /// light row (`pr_detail_state` without a detail fetch), or queued after
+    /// a failure.
+    Fetch,
+    /// Current, but its stored head commit (this oid) still has a check run
+    /// that is not completed. Check runs finishing do not move `updatedAt`,
+    /// so GitHub's check rollup (about 1 point per 50) is asked before a
+    /// full fetch is spent on it.
+    Checks(String),
+}
+
+/// Judge the stored copy of `found`.
+pub(crate) fn stored_state(conn: &Connection, found: &Found) -> Result<Stored> {
+    if !stored_current(conn, found)? {
+        return Ok(Stored::Fetch);
+    }
+    if !head_checks_incomplete(conn, &found.pr_key)? {
+        return Ok(Stored::Complete);
+    }
+    let head: Option<String> = conn
+        .query_row(
+            "SELECT head_oid FROM pr_detail_state WHERE pr_key = ?1",
+            [&found.pr_key],
+            |r| r.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(head.map_or(Stored::Fetch, Stored::Checks))
+}
+
+/// True when the stored copy has the same `updated_at`, its full detail
+/// landed, and it has no recorded failure.
+fn stored_current(conn: &Connection, found: &Found) -> Result<bool> {
     let stored: Option<(Option<String>, i64, Option<String>, i64)> = conn
         .query_row(
             "SELECT p.updated_at,
@@ -100,10 +129,7 @@ pub(crate) fn stored_complete(conn: &Connection, found: &Found) -> Result<bool> 
     // A row with no stage record was written by a full walk before stage
     // tracking existed: full walks land a pull request whole or not at all.
     let detailed = has_state == 0 || detail_at.is_some();
-    if !current || !detailed || queued != 0 {
-        return Ok(false);
-    }
-    Ok(!head_checks_incomplete(conn, &found.pr_key)?)
+    Ok(current && detailed && queued == 0)
 }
 
 /// True when the stored head commit has a check run that is not completed.
@@ -139,17 +165,32 @@ pub(crate) fn enqueue(conn: &Connection, found: &Found) -> Result<()> {
     Ok(())
 }
 
-/// Queue every item of `found` whose stored copy is not complete. Returns
-/// how many were queued.
-pub(crate) fn enqueue_changed(conn: &Connection, found: &[Found]) -> Result<i64> {
+/// Queue every item of `found` whose stored copy needs a full fetch, after
+/// asking GitHub's check rollup about the ones only waiting on check runs.
+/// Returns how many were queued.
+pub(crate) fn enqueue_changed(
+    syncer: &mut Syncer<'_>,
+    found: &[Found],
+    after_query: &mut dyn FnMut() -> Result<()>,
+) -> Result<i64> {
+    let conn = syncer.connection();
+    let mut seen = std::collections::HashSet::new();
     let mut queued = 0;
+    let mut checks = Vec::new();
     for item in found {
-        if !stored_complete(conn, item)? {
-            enqueue(conn, item)?;
-            queued += 1;
+        if !seen.insert(item.pr_key.as_str()) {
+            continue;
+        }
+        match stored_state(conn, item)? {
+            Stored::Complete => {}
+            Stored::Fetch => {
+                enqueue(conn, item)?;
+                queued += 1;
+            }
+            Stored::Checks(head) => checks.push((item.pr_key.clone(), head)),
         }
     }
-    Ok(queued)
+    Ok(queued + probe_checks(syncer, &checks, after_query)?)
 }
 
 /// Seed the queue from failures older walks recorded in `sync_jobs`, so a
@@ -568,6 +609,18 @@ pub(crate) fn probe_unfinished_checks(
             |r| Ok((r.get(0)?, r.get(1)?)),
         )?
         .collect::<rusqlite::Result<_>>()?;
+    probe_checks(syncer, &candidates, after_query)
+}
+
+/// Ask GitHub's check rollup about stored pull requests (`pr_key`, stored
+/// head oid) whose head checks were unfinished, and queue the ones whose
+/// checks have finished or whose head moved. Returns how many were queued.
+pub(crate) fn probe_checks(
+    syncer: &mut Syncer<'_>,
+    candidates: &[(String, String)],
+    after_query: &mut dyn FnMut() -> Result<()>,
+) -> Result<i64> {
+    let conn = syncer.connection();
     let mut queued = 0;
     const INNER: &str = "id updatedAt headRefOid commits(last: 1) { nodes { commit { oid statusCheckRollup { state } } } }";
     for chunk in candidates.chunks(ALIAS_BATCH) {
