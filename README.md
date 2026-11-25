@@ -268,6 +268,27 @@ Trigram indexing means partial words match (`edrock` finds "Bedrock"), and
 results include a highlighted snippet. Diff/patch text is deliberately not
 indexed.
 
+## Change notes
+
+A change note is one plain-English line saying what a pull request does,
+stored in the warehouse's `change_notes` table. Writing notes calls a model
+on Amazon Bedrock, so it needs the `summaries` feature
+(`cargo install githubdw --features summaries`):
+
+```bash
+githubdw config set summaries.model us.anthropic.claude-sonnet-4-5-20250929-v1:0
+githubdw config set summaries.aws_profile my-bedrock-profile   # optional
+githubdw notes summarize --author octocat --since 2026-01-01
+githubdw notes show octocat/hello#42
+```
+
+Pull requests go to the model 25 at a time. Those whose title and body do not
+say what they do get a second pass with diff excerpts read live from GitHub;
+diff text is never stored. A pull request with a current note is skipped, and
+a stored note is never deleted or blanked. Library callers use
+`githubdw::summaries::summarize_changes` with their own `NoteModel` and read
+notes with `githubdw::notes::change_notes`.
+
 ## MCP server (AI assistants)
 
 `githubdw mcp` starts a Model Context Protocol server on stdio with five tools:

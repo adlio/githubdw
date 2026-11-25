@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `change_notes` table: one plain-English line per pull request, created on
+  open with no `user_version` change, so older binaries still open the
+  warehouse. A note is replaced only by a newer non-empty note; nothing
+  deletes or blanks one. `githubdw::notes` reads notes (each marked current
+  when the pull request is unchanged since), computes input hashes and
+  imports notes written elsewhere without overwriting stored ones.
+- `githubdw notes summarize` (pull request keys, `--author`, `--repo`,
+  `--since`) and `githubdw notes show`. The model and AWS profile come from
+  `--model` / `--aws-profile` or the `summaries.model`,
+  `summaries.aws_profile` and `summaries.region` config values. Writing needs
+  the `summaries` feature.
+
+### Changed
+
+- Breaking (`summaries` feature): `summarize_pr`, its agent tools and the
+  hard-coded model are replaced by `summaries::summarize_changes`, which
+  takes any `NoteModel` (`BedrockNoteModel` for a profile and model), writes
+  25 pull requests per request with up to 8 in flight, and reads diff
+  excerpts live from GitHub for the pull requests whose title and body are
+  too thin. It no longer needs stored diffs. mixtape-core 0.4 -> 0.6. The
+  `pr_summaries` table is left in place and no longer written.
+
 ## [0.7.0] - 2026-11-25
 
 ### Changed

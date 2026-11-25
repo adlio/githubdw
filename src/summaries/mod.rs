@@ -1,26 +1,26 @@
-//! Feature-gated AI summarization of pull requests (`feature = "summaries"`).
+//! Feature-gated note writing for pull requests (`feature = "summaries"`).
 //!
-//! This module mirrors the CRUX data warehouse's summary agent so that PR and
-//! CR notability scores stay comparable, but it reads githubdw's own star
-//! schema and persists results into the `pr_summaries` table. The design
-//! principle: **each data warehouse owns the summaries of the data it holds**,
-//! stored alongside that data rather than in a downstream consumer.
+//! [`summarize_changes`](crate::summaries::summarize_changes) writes one
+//! plain-English line per pull request into the warehouse's `change_notes`
+//! table (see [`crate::notes`]). It works in batches: 25 pull requests per
+//! model request, up to 8 requests in flight. Pull requests whose title and
+//! description are too thin get a second pass with diff excerpts fetched live
+//! from GitHub; diff text is never stored. A pull request that already has a
+//! current note is skipped.
 //!
-//! Summaries are produced by a [`mixtape_core`] agent backed by Amazon Bedrock
-//! (Claude), given two trusted tools: a read-only `query_database` tool for
-//! exploring the schema and a `write_pr_summary` tool that persists the
-//! structured result. Bedrock and `mixtape-core` are public dependencies, so
-//! enabling this feature adds no Amazon-internal coupling to the crate.
-//!
-//! Entry point: [`summarize_pr`](crate::summaries::summarize_pr). Scope is intentionally single-PR only; there
-//! are no period-level (user / team / repo) summary functions here.
+//! The model is anything that implements
+//! [`NoteModel`](crate::summaries::NoteModel).
+//! [`BedrockNoteModel`](crate::summaries::BedrockNoteModel) calls Amazon
+//! Bedrock's Converse API with a named AWS profile and model, the way the CLI
+//! does; an application with its own model settings implements `NoteModel`
+//! instead. Bedrock and `mixtape-core` are public dependencies, so this
+//! feature adds no vendor-internal coupling.
 
-pub mod pr_summary;
-pub mod tools;
+mod model;
+mod summarize;
 
-pub use pr_summary::{
-    PrSummaryData, PrSummaryResult, get_pr_summary, has_pr_summary, summarize_pr,
-};
-pub use tools::{
-    NotableAspect, PROMPT_VERSION, QueryDatabaseTool, WritePrSummaryTool, pr_summary_tools,
+pub use model::{BedrockNoteModel, NoteFuture, NoteModel, NoteRequest};
+pub use summarize::{
+    BATCH, CONFIG_AWS_PROFILE, CONFIG_MODEL, CONFIG_REGION, PARALLEL, SummarizeOptions,
+    SummarizeReport, summarize_changes,
 };

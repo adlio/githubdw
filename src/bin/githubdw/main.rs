@@ -5,6 +5,7 @@
 
 mod admin;
 mod cli;
+mod notes;
 mod report;
 mod sync;
 
@@ -88,6 +89,7 @@ fn run(command_line: CommandLine) -> githubdw::Result<ExitCode> {
         Command::Diffs {
             command: cli::DiffsCommand::Purge { dry_run, vacuum },
         } => admin::purge_diffs(open_warehouse(db)?, dry_run, vacuum).map(ok),
+        Command::Notes { command } => notes::run(open_warehouse(db)?, command).map(ok),
         Command::Query(arguments) => report::query(open_warehouse(db)?, *arguments).map(ok),
         Command::Metrics { command } => report::metrics(open_warehouse(db)?, command).map(ok),
         Command::Search(arguments) => report::search(open_warehouse(db)?, arguments).map(ok),

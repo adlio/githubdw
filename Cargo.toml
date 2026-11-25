@@ -32,16 +32,17 @@ sha2 = "0.10"
 # stays lean and resolvable from vendored/mirrored registries. Bedrock and
 # mixtape-core are PUBLIC dependencies with no Amazon-internal coupling, so
 # this keeps the crate GitHub-only in the sense the hard rule cares about.
-mixtape-core = { version = "0.4", features = ["bedrock"], optional = true }
+mixtape-core = { version = "0.6", features = ["bedrock"], optional = true }
 aws-config = { version = "1", optional = true }
+aws-sdk-bedrockruntime = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile = "3.20"
 
 [features]
 default = []
-# AI summaries of pull requests (Bedrock via mixtape-core). Opt-in.
-summaries = ["dep:mixtape-core", "dep:aws-config"]
+# Change notes written by a model (Bedrock via mixtape-core). Opt-in.
+summaries = ["dep:mixtape-core", "dep:aws-config", "dep:aws-sdk-bedrockruntime"]
 
 [[bin]]
 name = "githubdw"

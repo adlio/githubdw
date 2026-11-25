@@ -51,6 +51,15 @@ pub fn init(conn: &mut Connection) -> Result<()> {
     ensure_collector_tables(conn)?;
     ensure_sort_indexes(conn)?;
     ensure_lock_holder_column(conn)?;
+    ensure_change_notes_table(conn)?;
+    Ok(())
+}
+
+/// Create the `change_notes` table when missing. Not a numbered migration,
+/// for the same reason as [`ensure_collection_tables`]: `user_version` stays
+/// at 8, so older binaries keep opening the warehouse and ignore the table.
+pub fn ensure_change_notes_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(include_str!("change_notes.sql"))?;
     Ok(())
 }
 
@@ -190,6 +199,22 @@ mod tests {
             plan.contains("COVERING INDEX idx_pr_state_draft_comments"),
             "{plan}"
         );
+    }
+
+    #[test]
+    fn change_notes_table_is_additive_and_keeps_the_version() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        init(&mut conn).expect("first init");
+        init(&mut conn).expect("second init");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'change_notes'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count table");
+        assert_eq!(n, 1);
+        assert_eq!(schema_version(&conn).expect("version"), 8);
     }
 
     #[test]
