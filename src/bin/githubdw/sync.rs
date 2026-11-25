@@ -51,9 +51,26 @@ fn capped_client(
     Ok(client)
 }
 
+/// The diff retention for this run: `--diff-retention`, else the warehouse's
+/// `diff_retention` config value, else [`githubdw::retention::DEFAULT`].
+pub fn resolve_retention(
+    warehouse: &GithubDW,
+    flag: Option<&str>,
+) -> githubdw::Result<githubdw::retention::DiffRetention> {
+    use githubdw::retention::{CONFIG_KEY, DEFAULT, DiffRetention};
+    let configured = match flag {
+        Some(text) => Some(text.to_string()),
+        None => githubdw::storage::config_repository::get(warehouse.connection(), CONFIG_KEY)?,
+    };
+    configured
+        .as_deref()
+        .map_or(Ok(DEFAULT), DiffRetention::parse_setting)
+}
+
 pub fn run(
     db: Option<PathBuf>,
     max_rate_use: Option<&str>,
+    diff_retention: Option<&str>,
     command: SyncCommand,
 ) -> githubdw::Result<ExitCode> {
     // Plans only read: open without migrating or taking write locks.
@@ -66,6 +83,7 @@ pub fn run(
     } else {
         open_warehouse(db)?
     };
+    let retention = resolve_retention(&warehouse, diff_retention)?;
     match command {
         SyncCommand::Repo {
             repository,
@@ -82,7 +100,8 @@ pub fn run(
                 pull_requests_only,
                 issues_only,
             };
-            let mut syncer = githubdw::sync::Syncer::new(warehouse.connection(), &mut client);
+            let mut syncer =
+                githubdw::sync::Syncer::new(warehouse.connection(), &mut client, retention);
             if let Some(config) = git_recovery_for(&warehouse) {
                 syncer = syncer.with_git_recovery(config);
             }
@@ -119,7 +138,8 @@ pub fn run(
                 pull_requests_only: true,
                 issues_only: false,
             };
-            let mut syncer = githubdw::sync::Syncer::new(warehouse.connection(), &mut client);
+            let mut syncer =
+                githubdw::sync::Syncer::new(warehouse.connection(), &mut client, retention);
             if let Some(config) = git_recovery_for(&warehouse) {
                 syncer = syncer.with_git_recovery(config);
             }
@@ -165,6 +185,7 @@ pub fn run(
                 history_from,
                 force_reconcile: reconcile,
                 skip_diffs,
+                diff_retention: retention,
                 git_recovery: git_recovery_for(&warehouse),
                 ..TickPolicy::default()
             };
@@ -203,7 +224,8 @@ pub fn run(
             let targets = githubdw::refresh::validate_targets(targets)?;
             let mut client = capped_client(&warehouse, max_rate_use)?;
             client.preflight()?;
-            let mut syncer = githubdw::sync::Syncer::new(warehouse.connection(), &mut client);
+            let mut syncer =
+                githubdw::sync::Syncer::new(warehouse.connection(), &mut client, retention);
             if let Some(config) = git_recovery_for(&warehouse) {
                 syncer = syncer.with_git_recovery(config);
             }
@@ -503,6 +525,17 @@ fn print_tick(report: &githubdw::collect::TickReport) {
             backfill.remaining
         );
     }
+    let fill = &report.diff_fill;
+    if let Some(why) = &fill.skipped {
+        println!("diff fill: {why} ({} pull request(s) owed)", fill.remaining);
+    } else if !fill.filled.is_empty() || !fill.failed.is_empty() {
+        println!(
+            "diff fill: stored diffs for {} pull request(s), {} failed; {} still owed",
+            fill.filled.len(),
+            fill.failed.len(),
+            fill.remaining
+        );
+    }
     for note in &report.notes {
         println!("  {note}");
     }
@@ -578,6 +611,11 @@ mod exit_code_tests {
                 backfill: BackfillSummary {
                     skipped: (index % 2 == 0).then(|| "budget".to_string()),
                     windows_covered: vec!["alice 2026-10".into()],
+                    ..Default::default()
+                },
+                diff_fill: githubdw::collect::diff_fill::DiffFillSummary {
+                    filled: vec!["acme/app#1".into()],
+                    skipped: (index % 3 == 0).then(|| "budget".to_string()),
                     ..Default::default()
                 },
                 blocked: vec![BlockedSource {

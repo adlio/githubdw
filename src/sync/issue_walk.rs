@@ -115,7 +115,6 @@ impl Syncer<'_> {
         issues::hydrate_issue(self.client, &mut issue)?;
         let issue = &issue;
         let conn = self.connection;
-        let preserve = self.gate.decide().app_mode;
 
         let author_key = match issue.author.as_ref() {
             Some(actor) => Some(repository::ensure_entity(conn, actor, bot_suffix)?),
@@ -132,44 +131,28 @@ impl Syncer<'_> {
             issue_repository::upsert_milestone(conn, repo_key, milestone)?;
         }
 
-        if preserve {
-            issue_repository::upsert_issue_preserving(
-                conn,
-                repo_key,
-                issue,
-                author_key.as_deref(),
-                Some(&created_keys.date_key),
-            )?;
-        } else {
-            issue_repository::upsert_issue(
-                conn,
-                repo_key,
-                issue,
-                author_key.as_deref(),
-                Some(&created_keys.date_key),
-            )?;
-        }
+        // Every write preserves: no stored title, body or comment is blanked,
+        // and labels and assignees are only ever added.
+        issue_repository::upsert_issue_preserving(
+            conn,
+            repo_key,
+            issue,
+            author_key.as_deref(),
+            Some(&created_keys.date_key),
+        )?;
 
         let mut label_ids = Vec::new();
         for label in &issue.labels {
             issue_repository::upsert_label(conn, repo_key, label)?;
             label_ids.push(label.id.clone());
         }
-        if preserve {
-            issue_repository::add_issue_labels(conn, &issue.id, &label_ids)?;
-        } else {
-            issue_repository::replace_issue_labels(conn, &issue.id, &label_ids)?;
-        }
+        issue_repository::add_issue_labels(conn, &issue.id, &label_ids)?;
 
         let mut assignee_keys = Vec::new();
         for assignee in &issue.assignees {
             assignee_keys.push(repository::ensure_entity(conn, assignee, bot_suffix)?);
         }
-        if preserve {
-            issue_repository::add_issue_assignees(conn, &issue.id, &assignee_keys)?;
-        } else {
-            issue_repository::replace_issue_assignees(conn, &issue.id, &assignee_keys)?;
-        }
+        issue_repository::add_issue_assignees(conn, &issue.id, &assignee_keys)?;
 
         for comment in &issue.comments {
             let comment_author = match comment.author.as_ref() {
@@ -182,12 +165,7 @@ impl Syncer<'_> {
                 timezone,
                 core_hours,
             )?;
-            let write_comment = if preserve {
-                repository::upsert_issue_comment_preserving
-            } else {
-                repository::upsert_issue_comment
-            };
-            write_comment(
+            repository::upsert_issue_comment_preserving(
                 conn,
                 &comment.id,
                 "issue",

@@ -30,7 +30,12 @@ fn syncs_a_user_across_repositories() {
         Ok(search_page("other/thing", &[3])),
     ]);
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant());
     let summary = syncer
         .sync_user("octocat", &fast_user_options(Some(1)))
         .unwrap();
@@ -130,7 +135,12 @@ fn each_role_keeps_its_own_watermark() {
         )),
     ]);
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant());
     syncer
         .sync_user("octocat", &fast_user_options(Some(1)))
         .unwrap();
@@ -182,7 +192,12 @@ fn user_rerun_stops_at_the_watermark() {
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
 
     {
-        let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+        let mut syncer = Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        )
+        .as_of(evening_instant());
         let first = syncer
             .sync_user("octocat", &fast_user_options(Some(1)))
             .unwrap();
@@ -191,7 +206,12 @@ fn user_rerun_stops_at_the_watermark() {
     {
         // No --days: coverage exists and both cursors are set, so this run
         // is incremental — one unwindowed search per role.
-        let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+        let mut syncer = Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        )
+        .as_of(evening_instant());
         let second = syncer
             .sync_user("octocat", &fast_user_options(None))
             .unwrap();
@@ -229,7 +249,12 @@ fn user_cursor_does_not_advance_past_a_failed_upsert() {
         Ok(search_response(0, vec![])),
     ]);
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant());
     let summary = syncer
         .sync_user("octocat", &fast_user_options(Some(1)))
         .unwrap();
@@ -278,7 +303,12 @@ fn a_window_over_the_result_cap_is_split() {
 
     let warehouse = los_angeles_warehouse();
     let mut client = fake.client();
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant());
     let summary = syncer
         .sync_user("octocat", &fast_user_options(Some(3)))
         .unwrap();
@@ -336,7 +366,12 @@ fn an_unsplittable_over_cap_window_is_reported() {
         Ok(search_response(0, vec![])),
     ]);
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant());
     let summary = syncer
         .sync_user("octocat", &fast_user_options(Some(1)))
         .unwrap();
@@ -371,7 +406,12 @@ fn issues_only_on_a_user_reports_instead_of_no_opping() {
     let warehouse = los_angeles_warehouse();
     let transport = FixtureTransport::new(vec![]);
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant());
     let summary = syncer
         .sync_user(
             "octocat",
@@ -397,7 +437,12 @@ fn user_sync_accepts_a_namespaced_login() {
         Ok(search_response(0, vec![])),
     ]);
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant());
     syncer
         .sync_user("user:OctoCat", &fast_user_options(Some(1)))
         .unwrap();
@@ -450,12 +495,22 @@ fn an_incremental_walk_that_reaches_its_watermark_reports_nothing() {
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
 
     {
-        let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+        let mut syncer = Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        )
+        .as_of(evening_instant());
         syncer
             .sync_user("octocat", &fast_user_options(Some(1)))
             .unwrap();
     }
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant());
     let second = syncer
         .sync_user("octocat", &fast_user_options(None))
         .unwrap();
@@ -505,7 +560,7 @@ fn large_user_walk_resumes_time_windows_without_search_offsets() {
         Ok(leaf(2, &search_timestamp(now.timestamp()).unwrap())),
         Ok(search_response(0, vec![])),
     ]);
-    let first = Syncer::new(conn, &mut client)
+    let first = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(now)
         .with_item_budget(1)
         .sync_user("octocat", &fast_user_options(None))
@@ -534,7 +589,7 @@ fn large_user_walk_resumes_time_windows_without_search_offsets() {
     );
     // Even when the process starts later, the frozen bound stays fixed and
     // freshness does not claim the intervening minute was fetched.
-    let second = Syncer::new(conn, &mut client)
+    let second = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(now + Duration::minutes(1))
         .with_item_budget(1)
         .sync_user("octocat", &fast_user_options(None))

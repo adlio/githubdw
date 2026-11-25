@@ -7,6 +7,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-25
+
+### Changed
+
+- **Breaking:** diff retention is an explicit argument instead of a shared
+  file. `Syncer::new(conn, client, retention)` takes a
+  `retention::DiffRetention`; `TickPolicy::diff_retention` is a plain value
+  (default `Retain`); `collection::fetch_pull_request_detail` loses its
+  policy-source argument; `mcp::serve_stdio` takes the retention for
+  `trigger_sync`. `DiffRetention::Never` is now spelled `never` (`none` is
+  still accepted).
+- Every write preserves stored payloads, whatever the retention: no stored
+  title, body, review, comment or patch is blanked, labels and assignees are
+  only added, and no stored file row is deleted. Before, only a warehouse
+  with a policy file worked this way; without one, a sync mirrored the
+  provider and pruned file rows a force push removed.
+- Git recovery of capped file listings runs only under `Retain`.
+
+### Added
+
+- `--diff-retention <never|transient|retain>` and the `diff_retention`
+  config key (`githubdw config set diff_retention transient`, validated on
+  set). The flag wins over the config value; the default is `retain`.
+- Diff fill: a `Retain` tick fetches patch text missing for pull requests
+  already stored (for example ones a `Transient` caller synced), at most
+  `TickPolicy::diff_fill_per_tick` (25) per tick and only while less than
+  `backfill_share` of the hourly REST budget is used. A failed attempt waits
+  a day. Reported in `TickReport::diff_fill`; state in the additive
+  `collector_diff_fill` table.
+
+### Removed
+
+- The shared policy file `$XDG_CONFIG_HOME/adlio-collection/policy.json` and
+  everything that read it: `retention::{PolicyFile, PolicyState,
+  PolicySource, RetentionGate, GateDecision, CollectionMode, read_policy,
+  write_policy, default_policy_path}`, `Syncer::with_diff_retention`,
+  `Syncer::with_policy_source` and `TickPolicy::policy_source`. An existing
+  file is ignored and can be deleted.
+- The non-preserving writers no sync uses any more:
+  `storage::repository::{upsert_pull_request, upsert_review,
+  set_file_diff_patch, delete_file_diffs}`. Their `_preserving` forms stay.
+
 ## [0.6.1] - 2026-11-25
 
 ### Changed

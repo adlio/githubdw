@@ -56,7 +56,7 @@ fn refresh_pr5_recovering(
     fixture: &test_repo::FixtureRepo,
 ) -> RefreshReport {
     let (mut client, _) = routing_client(pages, vec![]);
-    Syncer::new(conn, &mut client)
+    Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .with_git_recovery(fixture.config.clone())
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
@@ -66,14 +66,14 @@ fn refresh_pr5_recovering(
 }
 
 #[test]
-fn capped_listing_is_completed_from_git_and_stale_rows_pruned_atomically() {
+fn capped_listing_is_completed_from_git_and_stale_rows_kept() {
     let fixture = test_repo::build();
     let git = fixture.records();
     assert_eq!(git.len() as i64, test_repo::TOTAL_FILES);
     let warehouse = warehouse_with_abc_and_unrelated();
     let conn = warehouse.connection();
-    // A prior revision stored the rename source as its own file. It must
-    // disappear as a record when the complete set contains only the target.
+    // A prior revision stored the rename source as its own file. Stored rows
+    // are never deleted, so it stays alongside the complete set.
     repository::upsert_file_diff(
         conn,
         "octocat/hello#5",
@@ -91,12 +91,13 @@ fn capped_listing_is_completed_from_git_and_stale_rows_pruned_atomically() {
     assert_eq!(outcome.status, TargetStatus::Refreshed, "{outcome:?}");
     assert!(outcome.caveats.is_empty(), "{:?}", outcome.caveats);
     let stored = stored_paths(conn, "octocat/hello#5");
-    assert_eq!(
-        stored.len(),
-        git.len(),
-        "every record, and the stale a/b/c pruned"
+    for record in &git {
+        assert!(stored.contains(&record.path), "{} landed", record.path);
+    }
+    assert!(
+        stored.iter().any(|p| p == "a.rs") && stored.iter().any(|p| p == "old name/basename.rs"),
+        "stale rows kept"
     );
-    assert!(!stored.iter().any(|p| p == "a.rs"));
     assert_eq!(stored_paths(conn, "octocat/hello#6"), ["z.rs"]);
     let (changed, previous, tail_patch): (i64, Option<String>, Option<String>) = conn
         .query_row(

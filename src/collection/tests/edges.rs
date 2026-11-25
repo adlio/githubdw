@@ -492,7 +492,6 @@ fn detail_without_a_policy_file_still_preserves_payloads() {
             "acme/app",
             2,
             DiffRetention::Never,
-            PolicySource::Standalone,
             &CollectionControl::default(),
         )
         .unwrap()
@@ -517,7 +516,7 @@ fn detail_without_a_policy_file_still_preserves_payloads() {
             "SELECT COUNT(*) FROM fact_pull_requests WHERE pr_key = 'acme/app#2' AND title = 'Title 2' AND body = 'Body 2'"
         ),
         1,
-        "a missing file is still app mode for detail writes"
+        "detail writes preserve stored payloads"
     );
 }
 

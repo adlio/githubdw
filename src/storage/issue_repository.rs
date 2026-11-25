@@ -95,7 +95,7 @@ pub fn upsert_issue(
     Ok(())
 }
 
-/// App-mode issue upsert: a NULL or empty incoming title or body never
+/// Preserving issue upsert: a NULL or empty incoming title or body never
 /// replaces a stored one.
 pub fn upsert_issue_preserving(
     conn: &Connection,
@@ -140,7 +140,7 @@ pub fn upsert_issue_preserving(
     Ok(())
 }
 
-/// App-mode label bridge write: adds links, never deletes one.
+/// Preserving label bridge write: adds links, never deletes one.
 pub fn add_issue_labels(conn: &Connection, issue_id: &str, label_ids: &[String]) -> Result<()> {
     for label_id in label_ids {
         conn.execute(
@@ -151,7 +151,7 @@ pub fn add_issue_labels(conn: &Connection, issue_id: &str, label_ids: &[String])
     Ok(())
 }
 
-/// App-mode assignee bridge write: adds links, never deletes one.
+/// Preserving assignee bridge write: adds links, never deletes one.
 pub fn add_issue_assignees(
     conn: &Connection,
     issue_id: &str,

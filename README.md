@@ -116,6 +116,35 @@ budget's reset instead of spending the rest. Change the share per run with
 `githubdw config set max_rate_use 0.8`; library callers use
 `GhClient::set_max_rate_use`.
 
+### Diff retention
+
+Whether a sync stores the per-file diff (patch) text it fetches is one
+setting with three values:
+
+| Value | What a sync does |
+|---|---|
+| `retain` (default) | Fetches and stores patch text. `sync all` also fills in patch text missing for pull requests already stored, up to 25 per run, while less than half of the hourly REST budget is used. |
+| `transient` | Fetches no patch text and stores none. Meant for a caller that reads diffs live when it needs them. |
+| `never` | The same as `transient` for a sync. |
+
+Set it per run with `--diff-retention transient`, or for every run with
+`githubdw config set diff_retention transient`; the flag wins over the
+config value. `--skip-diffs` is `never` for that run. Library callers pass
+it to `Syncer::new` and `TickPolicy::diff_retention`.
+
+No setting removes anything. Every write keeps what is stored: a title,
+body, review, comment or patch is never replaced by an empty value, and no
+stored file row is deleted, even one a force push removed from the pull
+request. So two callers with different settings sharing one warehouse
+accumulate: a `transient` run leaves stored diffs alone, and later `retain`
+runs fill in the diffs it skipped. A pull request whose diff was stored and
+then cleared with `githubdw diffs purge` is not fetched again.
+
+Releases 0.4 to 0.6 also read a shared policy file,
+`$XDG_CONFIG_HOME/adlio-collection/policy.json`, which capped every caller's
+retention. That file is obsolete: 0.7 neither reads nor writes it, and it
+can be deleted.
+
 Manage what `sync all` covers:
 
 ```bash
@@ -289,6 +318,7 @@ githubdw config get timezone
 githubdw config set timezone America/New_York   # IANA timezone for date bucketing
 githubdw config set core_hours_start 8
 githubdw config set max_rate_use 0.8              # share of each GitHub budget sync may use
+githubdw config set diff_retention transient      # never | transient | retain (default)
 ```
 
 Timestamps are stored as UTC; date/time dimension keys are derived in the

@@ -13,7 +13,6 @@ use rusqlite::Connection;
 
 use super::*;
 use crate::GithubDW;
-use crate::retention::{CollectionMode, PolicyFile, PolicySource, PolicyState, write_policy};
 use crate::sync::{SyncOptions, Syncer};
 use fake::{FakeGitHub, FakePr};
 
@@ -132,22 +131,6 @@ fn dashboard_counts(conn: &Connection, login: &str, d: &str) -> (i64, i64, i64, 
             "SELECT COUNT(DISTINCT pr_key) FROM fact_reviews WHERE reviewer_key = ?1 AND submitted_date_key = ?2",
         ),
     )
-}
-
-fn policy(dir: &Path, mode: CollectionMode, retention: DiffRetention) -> PathBuf {
-    let path = dir.join("xdg").join("adlio-collection").join("policy.json");
-    write_policy(
-        &path,
-        &PolicyFile {
-            version: 1,
-            mode,
-            ai: mode != CollectionMode::Counts,
-            diff_retention: retention,
-            updated_at: Some("2026-11-03T13:00:00Z".into()),
-        },
-    )
-    .unwrap();
-    path
 }
 
 /// Payload size actually stored, in bytes of text.
@@ -270,7 +253,12 @@ fn counts_match_the_detailed_collection_on_the_same_world() {
     let detailed = warehouse(dir.path(), "detailed.db");
     let mut client = github.client();
     {
-        let mut syncer = Syncer::new(detailed.connection(), &mut client).as_of(now());
+        let mut syncer = Syncer::new(
+            detailed.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        )
+        .as_of(now());
         let summary = syncer
             .sync_user(
                 "alice",
@@ -808,7 +796,7 @@ fn day_bounds_follow_the_local_calendar_across_dst() {
 // --------------------------------------------- retention and preservation
 
 /// Seed sentinel payloads through a Full (retain) detail fetch.
-fn seed_full(conn: &Connection, github: &FakeGitHub, policy_path: &Path, number: i64) {
+fn seed_full(conn: &Connection, github: &FakeGitHub, number: i64) {
     let mut client = github.client();
     let outcome = fetch_pull_request_detail(
         conn,
@@ -816,7 +804,6 @@ fn seed_full(conn: &Connection, github: &FakeGitHub, policy_path: &Path, number:
         "acme/app",
         number,
         DiffRetention::Retain,
-        PolicySource::File(policy_path.into()),
         &CollectionControl::default(),
     )
     .unwrap();
@@ -856,29 +843,26 @@ fn snapshot(conn: &Connection) -> Vec<String> {
 }
 
 #[test]
-fn full_retains_new_diffs_and_basic_or_counts_never_write_new_ones() {
-    for (mode, retention, expect_patch) in [
-        (CollectionMode::Full, DiffRetention::Retain, true),
-        (CollectionMode::Basic, DiffRetention::Transient, false),
-        (CollectionMode::Counts, DiffRetention::Never, false),
+fn retain_stores_new_diffs_and_transient_or_never_write_none() {
+    for (retention, expect_patch) in [
+        (DiffRetention::Retain, true),
+        (DiffRetention::Transient, false),
+        (DiffRetention::Never, false),
     ] {
         let dir = tempfile::tempdir().unwrap();
-        let path = policy(dir.path(), mode, retention);
-        let dw = warehouse(dir.path(), "policy.db");
+        let dw = warehouse(dir.path(), "retention.db");
         let github = FakeGitHub::new(pinned_world());
         let mut client = github.client();
-        // The caller asks for Retain; the file is the ceiling.
         let outcome = fetch_pull_request_detail(
             dw.connection(),
             &mut client,
             "acme/app",
             2,
-            DiffRetention::Retain,
-            PolicySource::File(path),
+            retention,
             &CollectionControl::default(),
         )
         .unwrap();
-        assert_eq!(outcome.allowed, retention.min(DiffRetention::Retain));
+        assert_eq!(outcome.allowed, retention);
         let conn = dw.connection();
         // Title, body, and comments are stored in every mode.
         assert_eq!(
@@ -899,131 +883,15 @@ fn full_retains_new_diffs_and_basic_or_counts_never_write_new_ones() {
             conn,
             "SELECT COUNT(*) FROM fact_file_diffs WHERE patch IS NOT NULL",
         );
-        assert_eq!(patches > 0, expect_patch, "{mode:?}");
+        assert_eq!(patches > 0, expect_patch, "{retention:?}");
         assert_eq!(outcome.diff_stored, expect_patch);
         assert_eq!(
             github.requests().rest_files > 0,
             expect_patch,
-            "{mode:?}: patch walk only when retained"
+            "{retention:?}: patch walk only when retained"
         );
         assert!(outcome.revision.is_some());
     }
-}
-
-#[test]
-fn missing_policy_is_legacy_and_invalid_policy_fails_closed() {
-    let dir = tempfile::tempdir().unwrap();
-    let missing = dir.path().join("none").join("policy.json");
-    assert_eq!(
-        crate::retention::read_policy(&missing),
-        PolicyState::Missing
-    );
-    let dw = warehouse(dir.path(), "m.db");
-    let github = FakeGitHub::new(pinned_world());
-    let mut client = github.client();
-    // Legacy repository-less path: a plain Syncer with no file retains.
-    {
-        let mut syncer = Syncer::new(dw.connection(), &mut client)
-            .with_policy_source(PolicySource::File(missing.clone()));
-        syncer
-            .refresh_targets(
-                &[crate::refresh::RefreshTarget {
-                    kind: crate::refresh::TargetKind::PullRequest,
-                    repository: "acme/app".into(),
-                    number: 1,
-                }],
-                &crate::refresh::RefreshOptions { skip_diffs: false },
-            )
-            .unwrap();
-    }
-    assert!(
-        scalar(
-            dw.connection(),
-            "SELECT COUNT(*) FROM fact_file_diffs WHERE patch IS NOT NULL"
-        ) > 0
-    );
-
-    let invalid = dir.path().join("bad.json");
-    std::fs::write(&invalid, b"{\"version\":1,\"mode\":\"full\"").unwrap();
-    let dw = warehouse(dir.path(), "i.db");
-    github.reset_requests();
-    {
-        let mut syncer = Syncer::new(dw.connection(), &mut client)
-            .with_policy_source(PolicySource::File(invalid));
-        syncer
-            .refresh_targets(
-                &[crate::refresh::RefreshTarget {
-                    kind: crate::refresh::TargetKind::PullRequest,
-                    repository: "acme/app".into(),
-                    number: 1,
-                }],
-                &crate::refresh::RefreshOptions { skip_diffs: false },
-            )
-            .unwrap();
-    }
-    assert_eq!(
-        scalar(
-            dw.connection(),
-            "SELECT COUNT(*) FROM fact_file_diffs WHERE patch IS NOT NULL"
-        ),
-        0
-    );
-    assert_eq!(github.requests().rest_files, 0);
-}
-
-/// A diff fetched while the ceiling allowed retention is dropped, unwritten,
-/// when the ceiling falls before the write.
-#[test]
-fn a_mid_flight_policy_change_stops_the_diff_write() {
-    let dir = tempfile::tempdir().unwrap();
-    let dw = warehouse(dir.path(), "flight.db");
-    let github = FakeGitHub::new(pinned_world());
-    let mut client = github.client();
-    let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let counter = reads.clone();
-    let source = PolicySource::Custom(Arc::new(move || {
-        let n = counter.fetch_add(1, Ordering::SeqCst);
-        let retention = if n == 0 {
-            DiffRetention::Retain
-        } else {
-            DiffRetention::Transient
-        };
-        PolicyState::Present(PolicyFile {
-            version: 1,
-            mode: CollectionMode::Full,
-            ai: true,
-            diff_retention: retention,
-            updated_at: None,
-        })
-    }));
-    let mut syncer = Syncer::new(dw.connection(), &mut client)
-        .with_diff_retention(DiffRetention::Retain)
-        .with_policy_source(source);
-    let report = syncer
-        .refresh_targets(
-            &[crate::refresh::RefreshTarget {
-                kind: crate::refresh::TargetKind::PullRequest,
-                repository: "acme/app".into(),
-                number: 2,
-            }],
-            &crate::refresh::RefreshOptions { skip_diffs: false },
-        )
-        .unwrap();
-    assert_eq!(report.failed(), 0);
-    drop(syncer);
-    assert!(github.requests().rest_files > 0, "fetched while allowed");
-    assert!(
-        reads.load(Ordering::SeqCst) >= 2,
-        "re-read at the write boundary"
-    );
-    assert_eq!(
-        scalar(
-            dw.connection(),
-            "SELECT COUNT(*) FROM fact_file_diffs WHERE patch IS NOT NULL"
-        ),
-        0
-    );
-    assert_no_sentinel_on_disk(&dir.path().join("flight.db"), "PATCH-SENTINEL-2");
 }
 
 fn assert_no_sentinel_on_disk(db: &Path, sentinel: &str) {
@@ -1041,17 +909,17 @@ fn assert_no_sentinel_on_disk(db: &Path, sentinel: &str) {
     }
 }
 
-/// Full -> Basic -> Counts -> Full: every stored row and payload survives,
-/// including stored diffs, and lightweight or sparse updates never blank them.
+/// Retain, then Transient, Never and Retain again: every stored row and
+/// payload survives, including stored diffs, and lightweight or sparse
+/// updates never blank them.
 #[test]
-fn every_policy_transition_preserves_existing_payloads() {
+fn transient_or_never_after_retain_keeps_every_stored_payload() {
     let dir = tempfile::tempdir().unwrap();
-    let path = policy(dir.path(), CollectionMode::Full, DiffRetention::Retain);
     let dw = warehouse(dir.path(), "transitions.db");
     let github = FakeGitHub::new(pinned_world());
     let conn = dw.connection();
-    seed_full(conn, &github, &path, 2);
-    seed_full(conn, &github, &path, 1);
+    seed_full(conn, &github, 2);
+    seed_full(conn, &github, 1);
     let baseline = snapshot(conn);
     assert!(baseline.iter().any(|r| r.contains("PATCH-SENTINEL-2")));
 
@@ -1069,12 +937,11 @@ fn every_policy_transition_preserves_existing_payloads() {
             }
         }
     });
-    for (mode, retention) in [
-        (CollectionMode::Basic, DiffRetention::Transient),
-        (CollectionMode::Counts, DiffRetention::Never),
-        (CollectionMode::Full, DiffRetention::Retain),
+    for retention in [
+        DiffRetention::Transient,
+        DiffRetention::Never,
+        DiffRetention::Retain,
     ] {
-        policy(dir.path(), mode, retention);
         let mut client = github.client();
         for number in [1, 2] {
             fetch_pull_request_detail(
@@ -1082,17 +949,14 @@ fn every_policy_transition_preserves_existing_payloads() {
                 &mut client,
                 "acme/app",
                 number,
-                DiffRetention::Retain,
-                PolicySource::File(path.clone()),
+                retention,
                 &CollectionControl::default(),
             )
             .unwrap();
         }
-        // The scheduled legacy path, in app mode, through the same file.
+        // The scheduled walk path, at the same retention.
         {
-            let mut syncer = Syncer::new(conn, &mut client)
-                .as_of(now())
-                .with_policy_source(PolicySource::File(path.clone()));
+            let mut syncer = Syncer::new(conn, &mut client, retention).as_of(now());
             syncer
                 .sync_user(
                     "alice",
@@ -1119,7 +983,7 @@ fn every_policy_transition_preserves_existing_payloads() {
         }
         let after = snapshot(conn);
         for row in &baseline {
-            assert!(after.contains(row), "{mode:?} lost or changed {row}");
+            assert!(after.contains(row), "{retention:?} lost or changed {row}");
         }
         // Stored diffs stay readable in every mode.
         let stored = stored_pull_request_diff(conn, "acme/app#2").unwrap();
@@ -1131,9 +995,10 @@ fn every_policy_transition_preserves_existing_payloads() {
     }
 }
 
-/// The legacy (no-policy-file) path keeps its documented behaviour.
+/// A plain syncer preserves too: a provider that now serves a blank body
+/// does not blank the stored one.
 #[test]
-fn without_a_policy_file_the_legacy_writes_are_unchanged() {
+fn a_plain_syncer_never_blanks_a_stored_body() {
     let dir = tempfile::tempdir().unwrap();
     let dw = warehouse(dir.path(), "legacy.db");
     let github = FakeGitHub::new(pinned_world());
@@ -1143,33 +1008,40 @@ fn without_a_policy_file_the_legacy_writes_are_unchanged() {
         repository: "acme/app".into(),
         number: 2,
     }];
-    Syncer::new(dw.connection(), &mut client)
-        .refresh_targets(
-            &target,
-            &crate::refresh::RefreshOptions { skip_diffs: true },
-        )
-        .unwrap();
+    Syncer::new(
+        dw.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .refresh_targets(
+        &target,
+        &crate::refresh::RefreshOptions { skip_diffs: true },
+    )
+    .unwrap();
     github.with(|w| w.prs.iter_mut().for_each(|p| p.body = String::new()));
-    Syncer::new(dw.connection(), &mut client)
-        .refresh_targets(
-            &target,
-            &crate::refresh::RefreshOptions { skip_diffs: true },
-        )
-        .unwrap();
+    Syncer::new(
+        dw.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .refresh_targets(
+        &target,
+        &crate::refresh::RefreshOptions { skip_diffs: true },
+    )
+    .unwrap();
     assert_eq!(
         scalar(
             dw.connection(),
-            "SELECT COUNT(*) FROM fact_pull_requests WHERE pr_key='acme/app#2' AND body = ''"
+            "SELECT COUNT(*) FROM fact_pull_requests WHERE pr_key='acme/app#2' AND body = 'Body 2'"
         ),
         1,
-        "standalone mode mirrors the provider exactly as before"
+        "the stored body survives a blank provider body"
     );
 }
 
 #[test]
 fn a_live_diff_is_returned_in_memory_and_written_nowhere() {
     let dir = tempfile::tempdir().unwrap();
-    let path = policy(dir.path(), CollectionMode::Counts, DiffRetention::Never);
     let dw = warehouse(dir.path(), "live.db");
     let github = FakeGitHub::new(pinned_world());
     let conn = dw.connection();
@@ -1180,7 +1052,6 @@ fn a_live_diff_is_returned_in_memory_and_written_nowhere() {
         "acme/app",
         2,
         DiffRetention::Transient,
-        PolicySource::File(path),
         &CollectionControl::default(),
     )
     .unwrap();
@@ -1239,11 +1110,10 @@ fn a_live_diff_is_returned_in_memory_and_written_nowhere() {
 #[test]
 fn light_upserts_cannot_blank_detail_payloads_or_counters() {
     let dir = tempfile::tempdir().unwrap();
-    let path = policy(dir.path(), CollectionMode::Full, DiffRetention::Retain);
     let dw = warehouse(dir.path(), "sparse.db");
     let github = FakeGitHub::new(pinned_world());
     let conn = dw.connection();
-    seed_full(conn, &github, &path, 2);
+    seed_full(conn, &github, 2);
     let counters: (i64, i64) = conn
         .query_row(
             "SELECT comment_count, review_count FROM fact_pull_requests WHERE pr_key='acme/app#2'",
@@ -1318,17 +1188,21 @@ fn heavy_world_counts_match_and_cost_is_measured() {
     let github = FakeGitHub::new(prs);
     let detailed = warehouse(dir.path(), "heavy-detailed.db");
     let mut client = github.client();
-    Syncer::new(detailed.connection(), &mut client)
-        .as_of(now())
-        .sync_user(
-            "alice",
-            &SyncOptions {
-                days: Some(5),
-                pull_requests_only: true,
-                ..Default::default()
-            },
-        )
-        .unwrap();
+    Syncer::new(
+        detailed.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(now())
+    .sync_user(
+        "alice",
+        &SyncOptions {
+            days: Some(5),
+            pull_requests_only: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
     let detailed_cost = (client.requests_issued(), client.bytes_received());
     let light = warehouse(dir.path(), "heavy-light.db");
     let mut client = github.client();

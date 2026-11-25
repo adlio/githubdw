@@ -13,6 +13,12 @@ pub fn config(warehouse: GithubDW, command: ConfigCommand) -> githubdw::Result<(
             None => return Err(githubdw::Error::NotFound(format!("config key '{key}'"))),
         },
         ConfigCommand::Set { key, value } => {
+            // Refuse a value the sync would reject later.
+            let value = if key == githubdw::retention::CONFIG_KEY {
+                githubdw::retention::DiffRetention::parse_setting(&value)?.to_string()
+            } else {
+                value
+            };
             config_repository::set(connection, &key, &value)?;
             println!("{key} = {value}");
         }

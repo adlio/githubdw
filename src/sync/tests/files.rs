@@ -40,7 +40,7 @@ fn assert_patch_failure_rolls_back_prune(walk: bool) {
         pull_requests_only: true,
         ..Default::default()
     };
-    let summary = Syncer::new(conn, &mut client)
+    let summary = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .sync_repository("octocat/hello", &options)
         .unwrap();
     assert!(summary.failed.is_empty(), "{:?}", summary.failed);
@@ -68,7 +68,7 @@ fn assert_patch_failure_rolls_back_prune(walk: bool) {
             ],
             vec![],
         );
-        let summary = Syncer::new(conn, &mut client)
+        let summary = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
             .sync_repository("octocat/hello", &options)
             .unwrap();
         assert_eq!(summary.failed.len(), 1, "{summary:?}");
@@ -115,7 +115,7 @@ fn assert_patch_failure_rolls_back_prune(walk: bool) {
 }
 
 #[test]
-fn complete_refresh_prunes_files_that_left_the_pull_request() {
+fn complete_refresh_keeps_files_that_left_the_pull_request() {
     let warehouse = warehouse_with_abc_and_unrelated();
     let conn = warehouse.connection();
     conn.execute(
@@ -137,8 +137,11 @@ fn complete_refresh_prunes_files_that_left_the_pull_request() {
     assert_eq!(outcome.status, TargetStatus::Refreshed, "{outcome:?}");
     assert!(outcome.caveats.is_empty(), "{:?}", outcome.caveats);
     assert_eq!(outcome.before.files, 3);
-    assert_eq!(outcome.after.files, 2);
-    assert_eq!(stored_paths(conn, "octocat/hello#5"), ["a.rs", "b.rs"]);
+    assert_eq!(outcome.after.files, 3);
+    assert_eq!(
+        stored_paths(conn, "octocat/hello#5"),
+        ["a.rs", "b.rs", "c.rs"]
+    );
     let patch: Option<String> = conn
         .query_row(
             "SELECT patch FROM fact_file_diffs WHERE file_diff_key = 'octocat/hello#5:a.rs'",
@@ -159,7 +162,7 @@ fn complete_refresh_prunes_files_that_left_the_pull_request() {
 }
 
 #[test]
-fn complete_walk_prunes_files_that_left_the_pull_request() {
+fn complete_walk_keeps_files_that_left_the_pull_request() {
     let warehouse = warehouse_with_abc_and_unrelated();
     let conn = warehouse.connection();
     let (mut client, _) = routing_client(
@@ -175,17 +178,20 @@ fn complete_walk_prunes_files_that_left_the_pull_request() {
         )],
         vec![],
     );
-    let summary = Syncer::new(conn, &mut client)
+    let summary = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .sync_repository("octocat/hello", &fast_pr_options())
         .unwrap();
     assert!(summary.failed.is_empty(), "{:?}", summary.failed);
     assert_eq!(summary.pull_requests_synced, 1);
-    assert_eq!(stored_paths(conn, "octocat/hello#5"), ["a.rs", "d.rs"]);
+    assert_eq!(
+        stored_paths(conn, "octocat/hello#5"),
+        ["a.rs", "b.rs", "c.rs", "d.rs"]
+    );
     assert_eq!(stored_paths(conn, "octocat/hello#6"), ["z.rs"]);
 }
 
 #[test]
-fn complete_empty_file_set_prunes_every_stored_file() {
+fn complete_empty_file_set_keeps_every_stored_file() {
     let warehouse = warehouse_with_abc_and_unrelated();
     let conn = warehouse.connection();
     let report = refresh_pr5(
@@ -201,7 +207,10 @@ fn complete_empty_file_set_prunes_every_stored_file() {
     let outcome = &report.outcomes[0];
     assert_eq!(outcome.status, TargetStatus::Refreshed, "{outcome:?}");
     assert!(outcome.caveats.is_empty(), "{:?}", outcome.caveats);
-    assert!(stored_paths(conn, "octocat/hello#5").is_empty());
+    assert_eq!(
+        stored_paths(conn, "octocat/hello#5"),
+        ["a.rs", "b.rs", "c.rs"]
+    );
     assert_eq!(stored_paths(conn, "octocat/hello#6"), ["z.rs"]);
 }
 
@@ -364,7 +373,7 @@ fn refresh_completes_an_issue_with_paged_comments_labels_and_assignees() {
             ),
         ],
     );
-    let report = Syncer::new(conn, &mut client)
+    let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[target(TargetKind::Issue, "octocat/hello#9")],
             &RefreshOptions::default(),
@@ -448,9 +457,13 @@ fn repair_plan_flags_items_stopped_at_a_first_slice() {
 fn walk_fails_closed_on_an_empty_page_that_claims_more() {
     let warehouse = GithubDW::open_in_memory().unwrap();
     let (mut client, _) = routing_client(vec![page_of(true, Some("C1"), vec![])], vec![]);
-    let error = Syncer::new(warehouse.connection(), &mut client)
-        .sync_repository("octocat/hello", &fast_pr_options())
-        .unwrap_err();
+    let error = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .sync_repository("octocat/hello", &fast_pr_options())
+    .unwrap_err();
     assert!(error.to_string().contains("holds none"), "{error}");
     assert!(pr_cursor(warehouse.connection()).is_none());
 }
@@ -466,9 +479,13 @@ fn walk_fails_closed_on_a_repeated_page_cursor() {
         ],
         vec![],
     );
-    let error = Syncer::new(warehouse.connection(), &mut client)
-        .sync_repository("octocat/hello", &fast_pr_options())
-        .unwrap_err();
+    let error = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .sync_repository("octocat/hello", &fast_pr_options())
+    .unwrap_err();
     assert!(error.to_string().contains("repeated"), "{error}");
     assert!(pr_cursor(warehouse.connection()).is_none());
 }
@@ -483,8 +500,12 @@ fn walk_fails_closed_on_missing_page_metadata() {
         .unwrap()
         .remove("pageInfo");
     let (mut client, _) = routing_client(vec![page.to_string(); 6], vec![]);
-    let result = Syncer::new(warehouse.connection(), &mut client)
-        .sync_repository("octocat/hello", &fast_pr_options());
+    let result = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .sync_repository("octocat/hello", &fast_pr_options());
     assert!(result.is_err());
     assert!(pr_cursor(warehouse.connection()).is_none());
 }

@@ -28,6 +28,47 @@ fn config_values_round_trip() {
 }
 
 #[test]
+fn diff_retention_config_is_validated_and_normalised() {
+    let cli = Cli::new();
+    let set = cli
+        .run(&["config", "set", "diff_retention", " Transient "])
+        .ok();
+    assert_eq!(set.stdout.trim(), "diff_retention = transient");
+    assert_eq!(
+        cli.run(&["config", "get", "diff_retention"])
+            .ok()
+            .stdout
+            .trim(),
+        "transient"
+    );
+    let bad = cli
+        .run(&["config", "set", "diff_retention", "forever"])
+        .failed();
+    assert!(
+        bad.stderr.contains("never, transient or retain"),
+        "{}",
+        bad.stderr
+    );
+    // The stored value is unchanged.
+    assert_eq!(
+        cli.run(&["config", "get", "diff_retention"])
+            .ok()
+            .stdout
+            .trim(),
+        "transient"
+    );
+    // A bad flag fails before any GitHub call.
+    let flag = cli
+        .run(&["--diff-retention", "forever", "sync", "all"])
+        .failed();
+    assert!(
+        flag.stderr.contains("never, transient or retain"),
+        "{}",
+        flag.stderr
+    );
+}
+
+#[test]
 fn missing_config_key_fails_with_a_message() {
     let cli = Cli::new();
     let run = cli.run(&["config", "get", "no-such-key"]).failed();

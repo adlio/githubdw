@@ -112,103 +112,6 @@ pub struct PullRequestRow<'a> {
     pub deletions: i64,
 }
 
-pub fn upsert_pull_request(conn: &Connection, row: &PullRequestRow<'_>) -> Result<()> {
-    conn.execute(
-        "INSERT INTO fact_pull_requests (
-            pr_key, number, repo_key, author_key, state, is_draft, title, body,
-            base_ref, head_ref, created_at, updated_at, merged_at, closed_at,
-            merged_by_key, created_date_key, created_time_key, updated_date_key,
-            updated_time_key, merged_date_key, comment_count, review_count,
-            changed_files, additions, deletions
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                  ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25)
-        ON CONFLICT (pr_key) DO UPDATE SET
-            state = excluded.state,
-            is_draft = excluded.is_draft,
-            title = excluded.title,
-            body = excluded.body,
-            base_ref = excluded.base_ref,
-            head_ref = excluded.head_ref,
-            updated_at = excluded.updated_at,
-            merged_at = excluded.merged_at,
-            closed_at = excluded.closed_at,
-            merged_by_key = excluded.merged_by_key,
-            updated_date_key = excluded.updated_date_key,
-            updated_time_key = excluded.updated_time_key,
-            merged_date_key = excluded.merged_date_key,
-            comment_count = excluded.comment_count,
-            review_count = excluded.review_count,
-            changed_files = excluded.changed_files,
-            additions = excluded.additions,
-            deletions = excluded.deletions",
-        params![
-            row.pr_key,
-            row.number,
-            row.repo_key,
-            row.author_key,
-            row.state,
-            row.is_draft as i64,
-            row.title,
-            row.body,
-            row.base_ref,
-            row.head_ref,
-            row.created_at,
-            row.updated_at,
-            row.merged_at,
-            row.closed_at,
-            row.merged_by_key,
-            row.created_date_key,
-            row.created_time_key,
-            row.updated_date_key,
-            row.updated_time_key,
-            row.merged_date_key,
-            row.comment_count,
-            row.review_count,
-            row.changed_files,
-            row.additions,
-            row.deletions,
-        ],
-    )?;
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn upsert_review(
-    conn: &Connection,
-    review_key: &str,
-    pr_key: &str,
-    reviewer_key: &str,
-    state: &str,
-    body: Option<&str>,
-    submitted_at: &str,
-    submitted_date_key: &str,
-    submitted_time_key: &str,
-) -> Result<()> {
-    conn.execute(
-        "INSERT INTO fact_reviews (
-            review_key, pr_key, reviewer_key, state, body, submitted_at,
-            submitted_date_key, submitted_time_key
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
-        ON CONFLICT (review_key) DO UPDATE SET
-            state = excluded.state,
-            body = excluded.body,
-            submitted_at = excluded.submitted_at,
-            submitted_date_key = excluded.submitted_date_key,
-            submitted_time_key = excluded.submitted_time_key",
-        params![
-            review_key,
-            pr_key,
-            reviewer_key,
-            state,
-            body,
-            submitted_at,
-            submitted_date_key,
-            submitted_time_key,
-        ],
-    )?;
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn upsert_review_comment(
     conn: &Connection,
@@ -464,22 +367,6 @@ pub fn upsert_file_diff(
     Ok(())
 }
 
-/// Set the patch text for an existing file diff (REST backfill path).
-pub fn set_file_diff_patch(
-    conn: &Connection,
-    pr_key: &str,
-    file_path: &str,
-    previous_path: Option<&str>,
-    patch: Option<&str>,
-) -> Result<()> {
-    conn.execute(
-        "UPDATE fact_file_diffs SET patch = ?1, previous_path = COALESCE(?2, previous_path)
-         WHERE file_diff_key = ?3",
-        params![patch, previous_path, format!("{pr_key}:{file_path}")],
-    )?;
-    Ok(())
-}
-
 /// Stored file paths of one pull request that are absent from `keep`.
 pub fn file_diffs_absent_from(
     conn: &Connection,
@@ -497,22 +384,10 @@ pub fn file_diffs_absent_from(
         .collect())
 }
 
-/// Delete the named file rows of one pull request. Only call this with paths
-/// from [`file_diffs_absent_from`] against a provably complete file set.
-pub fn delete_file_diffs(conn: &Connection, pr_key: &str, paths: &[String]) -> Result<usize> {
-    let mut statement =
-        conn.prepare("DELETE FROM fact_file_diffs WHERE pr_key = ?1 AND file_path = ?2")?;
-    let mut deleted = 0;
-    for path in paths {
-        deleted += statement.execute(params![pr_key, path])?;
-    }
-    Ok(deleted)
-}
-
-// ---- Preserving writes (app mode) ------------------------------------
+// ---- Preserving writes ----------------------------------------------
 //
-// Used whenever a collection policy file is present, and by every
-// counts-only (light) write. They differ from the legacy upserts in one
+// Used by every sync write, detail and
+// counts-only (light). They differ from the plain upserts in one
 // respect: a NULL or empty incoming value never replaces a stored non-empty
 // title, body, comment, or patch, and nothing is ever deleted. Provider
 // facts that are not payload (state, timestamps, sizes) still update.

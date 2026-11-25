@@ -67,9 +67,9 @@ pub(super) fn without_superseded_notes(note: Option<String>, recovered: &Recover
 }
 
 /// Git recovery writes repository objects to disk, so it runs only when the
-/// run may retain diffs or no policy file governs the warehouse.
-pub(super) fn recovery_allowed(decision: &crate::retention::GateDecision) -> bool {
-    !decision.app_mode || decision.allowed == crate::retention::DiffRetention::Retain
+/// run retains diffs.
+pub(super) fn recovery_allowed(retention: crate::retention::DiffRetention) -> bool {
+    retention == crate::retention::DiffRetention::Retain
 }
 
 impl Syncer<'_> {
@@ -320,13 +320,13 @@ impl Syncer<'_> {
         // Fetch patch text BEFORE any write, then land every write for this
         // item in one savepoint: a failure part-way (including a patch write)
         // leaves the previously stored rows exactly as they were.
-        let decision = self.decide(options.skip_diffs);
-        let want_patches = decision.allowed == crate::retention::DiffRetention::Retain;
+        let retention = self.decide(options.skip_diffs);
+        let want_patches = retention == crate::retention::DiffRetention::Retain;
         let patches = (want_patches && !pull_request.files.is_empty())
             .then(|| pull_requests::fetch_file_patches(self.client, repo_key, pull_request.number));
         let recovered = recover_files(
             self.client,
-            if recovery_allowed(&decision) {
+            if recovery_allowed(retention) {
                 self.git_recovery.as_ref()
             } else {
                 None
@@ -355,12 +355,13 @@ impl Syncer<'_> {
 
     /// Write one hydrated pull request and everything nested under it.
     ///
-    /// Performs no network calls; callers wrap it in a savepoint. When the
-    /// incoming file list is provably complete
-    /// ([`pull_requests::authoritative_file_paths`]) it is authoritative and
-    /// stored file rows absent from it are deleted; otherwise every stored row
-    /// is kept and a caveat says so. Patch text, when supplied, is written
-    /// after the file set settles. Returns the caveats.
+    /// Performs no network calls; callers wrap it in a savepoint. Every write
+    /// preserves stored payloads: no stored title, body, review, comment or
+    /// patch is blanked, and no stored file row is deleted, even one the
+    /// provider no longer lists. When the incoming file list is not provably
+    /// complete a caveat says how many stored rows it did not list. Patch
+    /// text, when supplied, is written after the file set settles. Returns
+    /// the caveats.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn store_pull_request(
         &self,
@@ -374,16 +375,6 @@ impl Syncer<'_> {
         recovered: Recovery,
     ) -> Result<Vec<String>> {
         let conn = self.connection;
-        // Write-time recheck: the policy may have changed since the fetch.
-        // Patch text fetched under Retain is dropped, unwritten, if the
-        // ceiling no longer allows it; app mode turns on payload preservation.
-        let now = self.decide(false);
-        let preserve = now.app_mode;
-        let patches = if now.allowed == crate::retention::DiffRetention::Retain {
-            patches
-        } else {
-            None
-        };
         let (changed_files, additions, deletions) = match &recovered {
             Some(Ok(set)) => (set.changed_files, set.additions, set.deletions),
             Some(Err(reason)) => return Err(crate::Error::GitRecovery(reason.clone())),
@@ -447,15 +438,7 @@ impl Syncer<'_> {
             additions,
             deletions,
         };
-        if preserve {
-            repository::upsert_pull_request_preserving(
-                conn,
-                &row,
-                repository::CounterSource::Detail,
-            )?;
-        } else {
-            repository::upsert_pull_request(conn, &row)?;
-        }
+        repository::upsert_pull_request_preserving(conn, &row, repository::CounterSource::Detail)?;
         crate::collection::mark_detail_fetched(conn, pr_key, pull_request, patches.is_some())?;
 
         for review in &pull_request.reviews {
@@ -469,12 +452,7 @@ impl Syncer<'_> {
                 timezone,
                 core_hours,
             )?;
-            let write_review = if preserve {
-                repository::upsert_review_preserving
-            } else {
-                repository::upsert_review
-            };
-            write_review(
+            repository::upsert_review_preserving(
                 conn,
                 &review.id,
                 pr_key,
@@ -495,12 +473,7 @@ impl Syncer<'_> {
                 timezone,
                 core_hours,
             )?;
-            let write_comment = if preserve {
-                repository::upsert_review_comment_preserving
-            } else {
-                repository::upsert_review_comment
-            };
-            write_comment(
+            repository::upsert_review_comment_preserving(
                 conn,
                 &comment.id,
                 pr_key,
@@ -523,12 +496,7 @@ impl Syncer<'_> {
                 timezone,
                 core_hours,
             )?;
-            let write_comment = if preserve {
-                repository::upsert_issue_comment_preserving
-            } else {
-                repository::upsert_issue_comment
-            };
-            write_comment(
+            repository::upsert_issue_comment_preserving(
                 conn,
                 &comment.id,
                 "pull_request",
@@ -567,7 +535,6 @@ impl Syncer<'_> {
                     pull_request.number,
                     &set,
                     patches.is_some(),
-                    preserve,
                 );
             }
             Some(Err(reason)) => return Err(crate::Error::GitRecovery(reason)),
@@ -575,41 +542,23 @@ impl Syncer<'_> {
         }
 
         for file in &pull_request.files {
-            if preserve {
-                repository::upsert_file_diff_preserving(
-                    conn,
-                    pr_key,
-                    repo_key,
-                    &file.path,
-                    None,
-                    &file.change_type,
-                    file.additions,
-                    file.deletions,
-                )?;
-            } else {
-                repository::upsert_file_diff(
-                    conn,
-                    pr_key,
-                    repo_key,
-                    &file.path,
-                    None,
-                    &file.change_type,
-                    None,
-                    file.additions,
-                    file.deletions,
-                )?;
-            }
+            repository::upsert_file_diff_preserving(
+                conn,
+                pr_key,
+                repo_key,
+                &file.path,
+                None,
+                &file.change_type,
+                file.additions,
+                file.deletions,
+            )?;
         }
 
         let mut caveats = Vec::new();
         match pull_requests::authoritative_file_paths(pull_request) {
-            // App mode never deletes a stored row, even one the provider no
-            // longer lists (for example after a force push).
-            Ok(_) if preserve => {}
-            Ok(current) => {
-                let stale = repository::file_diffs_absent_from(conn, pr_key, &current)?;
-                repository::delete_file_diffs(conn, pr_key, &stale)?;
-            }
+            // A stored row the provider no longer lists (for example after a
+            // force push) is kept.
+            Ok(_) => {}
             Err(gap) => {
                 let kept = repository::file_diffs_absent_from(
                     conn,
@@ -639,15 +588,15 @@ impl Syncer<'_> {
                 pr_key,
                 pull_request,
                 listing,
-                preserve,
             )?);
         }
         Ok(caveats)
     }
 
     /// Land a git-proven complete file set: every record (with GitHub's served
-    /// rename pairs and patches, git's tail), then prune rows outside the set.
-    /// Runs inside the caller's savepoint, so any failure rolls everything back.
+    /// rename pairs and patches, git's tail). Stored rows outside the set are
+    /// kept. Runs inside the caller's savepoint, so any failure rolls
+    /// everything back.
     pub(super) fn store_recovered_files(
         conn: &Connection,
         repo_key: &str,
@@ -655,57 +604,27 @@ impl Syncer<'_> {
         number: i64,
         set: &RecoveredFileSet,
         write_patches: bool,
-        preserve: bool,
     ) -> Result<Vec<String>> {
         for file in &set.files {
-            if preserve {
-                repository::upsert_file_diff_preserving(
-                    conn,
-                    pr_key,
-                    repo_key,
-                    &file.path,
-                    file.previous_path.as_deref(),
-                    &file.change_type,
-                    file.additions,
-                    file.deletions,
-                )?;
-            } else {
-                repository::upsert_file_diff(
-                    conn,
-                    pr_key,
-                    repo_key,
-                    &file.path,
-                    file.previous_path.as_deref(),
-                    &file.change_type,
-                    None,
-                    file.additions,
-                    file.deletions,
-                )?;
-            }
+            repository::upsert_file_diff_preserving(
+                conn,
+                pr_key,
+                repo_key,
+                &file.path,
+                file.previous_path.as_deref(),
+                &file.change_type,
+                file.additions,
+                file.deletions,
+            )?;
             if write_patches {
-                if preserve {
-                    repository::set_file_diff_patch_preserving(
-                        conn,
-                        pr_key,
-                        &file.path,
-                        file.previous_path.as_deref(),
-                        file.patch.as_deref(),
-                    )?;
-                } else {
-                    repository::set_file_diff_patch(
-                        conn,
-                        pr_key,
-                        &file.path,
-                        file.previous_path.as_deref(),
-                        file.patch.as_deref(),
-                    )?;
-                }
+                repository::set_file_diff_patch_preserving(
+                    conn,
+                    pr_key,
+                    &file.path,
+                    file.previous_path.as_deref(),
+                    file.patch.as_deref(),
+                )?;
             }
-        }
-        let keep: std::collections::HashSet<&str> = set.keep.iter().map(String::as_str).collect();
-        if !preserve {
-            let stale = repository::file_diffs_absent_from(conn, pr_key, &keep)?;
-            repository::delete_file_diffs(conn, pr_key, &stale)?;
         }
         let records: std::collections::HashSet<&str> =
             set.files.iter().map(|file| file.path.as_str()).collect();
@@ -715,12 +634,9 @@ impl Syncer<'_> {
             .iter()
             .filter(|path| records.contains(path.as_str()))
             .count();
-        // In app mode older rows outside the set are kept, so only the
-        // records themselves must have landed.
-        if landed != set.files.len()
-            || (!preserve && stored.len() != set.files.len())
-            || set.files.len() as i64 != set.changed_files
-        {
+        // Older rows outside the set are kept, so only the records
+        // themselves must have landed.
+        if landed != set.files.len() || set.files.len() as i64 != set.changed_files {
             return Err(crate::Error::GitRecovery(format!(
                 "PR #{number}: {landed} of {} recovered records landed for {} changed files",
                 set.files.len(),
@@ -741,24 +657,19 @@ impl Syncer<'_> {
     ///
     /// The endpoint pages at 100 files; every page is walked, and a failed or
     /// capped walk is returned as a caveat rather than passed off as the
-    /// complete listing. Only UPDATEs existing file rows.
+    /// complete listing. Only UPDATEs existing file rows, and never blanks a
+    /// stored patch.
     pub(super) fn store_patch_listing(
         conn: &Connection,
         pr_key: &str,
         pull_request: &PullRequestData,
         listing: Result<pull_requests::PatchListing>,
-        preserve: bool,
     ) -> Result<Vec<String>> {
         let mut caveats = Vec::new();
         match listing {
             Ok(listing) => {
                 for (file_path, previous_path, patch) in &listing.files {
-                    let write_patch = if preserve {
-                        repository::set_file_diff_patch_preserving
-                    } else {
-                        repository::set_file_diff_patch
-                    };
-                    write_patch(
+                    repository::set_file_diff_patch_preserving(
                         conn,
                         pr_key,
                         file_path,

@@ -51,6 +51,8 @@ pub struct GithubDwServer {
     /// Builds the GitHub client for each sync. Replaceable in tests.
     client_factory: Arc<dyn Fn() -> crate::fetch::GhClient + Send + Sync>,
     sync_item_budget: i64,
+    /// Whether `trigger_sync` stores the patch text it fetches.
+    diff_retention: crate::retention::DiffRetention,
     /// When true, `trigger_sync` is hidden from `tools/list` and refused if
     /// called directly; `manage_monitors` keeps listing but refuses `add`
     /// and `remove`. `list` always stays available in both modes.
@@ -148,12 +150,20 @@ impl GithubDwServer {
         Self::with_mode(warehouse, true)
     }
 
+    /// Set whether `trigger_sync` stores the patch text it fetches
+    /// (default [`crate::retention::DEFAULT`]).
+    pub fn with_diff_retention(mut self, retention: crate::retention::DiffRetention) -> Self {
+        self.diff_retention = retention;
+        self
+    }
+
     fn with_mode(warehouse: GithubDW, read_only: bool) -> Self {
         Self {
             database_path: warehouse.database_path().to_path_buf(),
             warehouse: Arc::new(Mutex::new(warehouse)),
             client_factory: Arc::new(crate::fetch::GhClient::new),
             sync_item_budget: SYNC_ITEM_BUDGET,
+            diff_retention: crate::retention::DEFAULT,
             read_only,
             tool_router: Self::build_tool_router(),
         }
@@ -466,6 +476,7 @@ impl GithubDwServer {
             database_path: self.database_path.clone(),
             client_factory: Arc::clone(&self.client_factory),
             item_budget: self.sync_item_budget,
+            diff_retention: self.diff_retention,
         })
     }
 }
@@ -476,6 +487,7 @@ struct SyncJob {
     database_path: std::path::PathBuf,
     client_factory: Arc<dyn Fn() -> crate::fetch::GhClient + Send + Sync>,
     item_budget: i64,
+    diff_retention: crate::retention::DiffRetention,
 }
 
 impl SyncJob {
@@ -497,8 +509,9 @@ impl SyncJob {
             days: Some(self.params.days.unwrap_or(30)),
             ..Default::default()
         };
-        let mut syncer = crate::sync::Syncer::new(warehouse.connection(), &mut client)
-            .with_item_budget(self.item_budget);
+        let mut syncer =
+            crate::sync::Syncer::new(warehouse.connection(), &mut client, self.diff_retention)
+                .with_item_budget(self.item_budget);
         let summary = match syncer.sync_repository(&self.params.name, &options) {
             Ok(summary) => summary,
             Err(crate::Error::RateLimited { wake_at, .. }) => {
@@ -575,14 +588,20 @@ impl ServerHandler for GithubDwServer {
 
 /// Run the stdio MCP server until the client disconnects. `read_only` hides
 /// `trigger_sync` and refuses monitor writes; see [`GithubDwServer::new_read_only`].
-pub async fn serve_stdio(warehouse: GithubDW, read_only: bool) -> crate::Result<()> {
+/// `diff_retention` governs `trigger_sync`, as in [`crate::sync::Syncer::new`].
+pub async fn serve_stdio(
+    warehouse: GithubDW,
+    read_only: bool,
+    diff_retention: crate::retention::DiffRetention,
+) -> crate::Result<()> {
     use rmcp::ServiceExt;
 
     let server = if read_only {
         GithubDwServer::new_read_only(warehouse)
     } else {
         GithubDwServer::new(warehouse)
-    };
+    }
+    .with_diff_retention(diff_retention);
     let service = server
         .serve(rmcp::transport::stdio())
         .await

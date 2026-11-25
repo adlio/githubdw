@@ -16,7 +16,12 @@ fn user_path_follows_nested_connection_cursors() {
         vec![search_response(1, vec![node]), search_response(0, vec![])],
         heavy_pr_continuations(),
     );
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(evening_instant());
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant());
     let summary = syncer
         .sync_user("octocat", &fast_user_options(Some(1)))
         .unwrap();
@@ -43,7 +48,11 @@ fn continuation_without_cursor_fails_the_record_instead_of_truncating() {
         "nodes": [conversation_comment("IC1")]
     });
     let (mut client, _) = routing_client(vec![page_of(false, None, vec![node])], vec![]);
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    );
     let summary = syncer
         .sync_repository("octocat/hello", &fast_pr_options())
         .unwrap();
@@ -68,7 +77,11 @@ fn failed_continuation_page_fails_the_record() {
         vec![page_of(false, None, vec![heavy_pr_node(7)])],
         continuations,
     );
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    );
     let summary = syncer
         .sync_repository("octocat/hello", &fast_pr_options())
         .unwrap();
@@ -87,7 +100,11 @@ fn provider_file_cap_is_reported_as_truncation() {
     node["id"] = json!("PR_8");
     node["changedFiles"] = json!(4443);
     let (mut client, _) = routing_client(vec![page_of(false, None, vec![node])], vec![]);
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    );
     let summary = syncer
         .sync_repository("octocat/hello", &fast_pr_options())
         .unwrap();
@@ -124,7 +141,11 @@ fn issue_comments_follow_their_cursor() {
         issues_only: true,
         ..Default::default()
     };
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    );
     let summary = syncer.sync_repository("octocat/hello", &options).unwrap();
     assert!(summary.failed.is_empty(), "{:?}", summary.failed);
     assert_eq!(
@@ -152,7 +173,7 @@ fn failed_page_three_resumes_durably_instead_of_restarting() {
         Ok(page_response(true, Some("C1"), &[10, 9])),
         Ok(page_response(true, Some("C2"), &[8, 7])),
     ]);
-    let error = Syncer::new(conn, &mut client)
+    let error = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .sync_repository("octocat/hello", &options)
         .unwrap_err();
     assert!(error.to_string().contains("no more fixture responses"));
@@ -174,7 +195,7 @@ fn failed_page_three_resumes_durably_instead_of_restarting() {
 
     // Run 2: resumes after C2 and finishes.
     let (mut client, transport) = shared_client(vec![Ok(page_response(false, None, &[6]))]);
-    let summary = Syncer::new(conn, &mut client)
+    let summary = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .sync_repository("octocat/hello", &options)
         .unwrap();
     assert_eq!(

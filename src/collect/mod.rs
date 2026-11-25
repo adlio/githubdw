@@ -19,6 +19,11 @@
 //!   [`TickPolicy::backfill_share`] and for at most
 //!   [`TickPolicy::backfill_points`] per tick. Months already covered are
 //!   skipped, so a backfill an older version started resumes.
+//! * **Diff fill** (only when [`TickPolicy::diff_retention`] is `Retain`).
+//!   Patch text missing for pull requests already stored, for example ones
+//!   another caller synced with `Transient`, is fetched for at most
+//!   [`TickPolicy::diff_fill_per_tick`] pull requests, under the same budget
+//!   share as backfill. See [`diff_fill`].
 //!
 //! A tick never sleeps through a long rate-limit wait while holding a lease:
 //! a wait longer than [`MAX_WAIT_INSIDE_LEASE`] ends the tick with
@@ -43,11 +48,12 @@ use crate::error::{Error, Result};
 use crate::fetch::GhClient;
 use crate::fetch::git_files::GitRecoveryConfig;
 use crate::fetch::user_search::UserRole;
-use crate::retention::{DiffRetention, PolicySource};
+use crate::retention::DiffRetention;
 use crate::storage::{monitor_repository, sync_state_repository as sync_state, time_dimension};
 use crate::sync::{SyncOptions, SyncSummary, Syncer};
 
 mod detect;
+pub mod diff_fill;
 mod lease;
 mod queue;
 mod state;
@@ -72,6 +78,10 @@ const LEASE_TTL_MINUTES: i64 = 15;
 /// Lane names in `collector_leases`.
 pub const DETECT_LANE: &str = "detect";
 pub const BACKFILL_LANE: &str = "backfill";
+pub const DIFF_FILL_LANE: &str = "diff_fill";
+
+/// Default [`TickPolicy::diff_fill_per_tick`].
+pub const DEFAULT_DIFF_FILL_PER_TICK: usize = 25;
 
 /// Logins per batched search. 1,320 were measured to work; 200 keeps each
 /// query well short of any length limit.
@@ -120,12 +130,15 @@ pub struct TickPolicy {
     pub backfill_share: f64,
     /// Most GraphQL points one tick spends on backfill.
     pub backfill_points: i64,
-    /// Skip the per-file patch text (fast mode).
+    /// Skip the per-file patch text (fast mode); the same as
+    /// `diff_retention: Never` for this tick.
     pub skip_diffs: bool,
-    /// Explicit diff-retention request, as [`Syncer::with_diff_retention`].
-    pub diff_retention: Option<DiffRetention>,
-    /// Collection policy source, as [`Syncer::with_policy_source`].
-    pub policy_source: Option<PolicySource>,
+    /// Whether this tick stores the patch text it fetches, as in
+    /// [`Syncer::new`]. Default `Retain`, matching the CLI's default.
+    pub diff_retention: DiffRetention,
+    /// Most already-stored pull requests whose missing patch text one
+    /// `Retain` tick fetches ([`diff_fill`]). 0 turns the lane off.
+    pub diff_fill_per_tick: usize,
     /// Complete capped file listings from git, as [`Syncer::with_git_recovery`].
     pub git_recovery: Option<GitRecoveryConfig>,
     /// Also detect changes in monitored repositories.
@@ -143,6 +156,8 @@ impl std::fmt::Debug for TickPolicy {
             .field("max_rate_use", &self.max_rate_use)
             .field("backfill_share", &self.backfill_share)
             .field("backfill_points", &self.backfill_points)
+            .field("diff_retention", &self.diff_retention)
+            .field("diff_fill_per_tick", &self.diff_fill_per_tick)
             .finish_non_exhaustive()
     }
 }
@@ -160,8 +175,8 @@ impl Default for TickPolicy {
             backfill_share: 0.5,
             backfill_points: 1_000,
             skip_diffs: false,
-            diff_retention: None,
-            policy_source: None,
+            diff_retention: crate::retention::DEFAULT,
+            diff_fill_per_tick: DEFAULT_DIFF_FILL_PER_TICK,
             git_recovery: None,
             repositories: true,
             force_reconcile: false,
@@ -241,6 +256,7 @@ pub struct TickReport {
     pub queued: i64,
     pub fetch: FetchSummary,
     pub backfill: BackfillSummary,
+    pub diff_fill: diff_fill::DiffFillSummary,
     /// Repositories GitHub refuses (SAML, forbidden), retried once a day.
     pub blocked: Vec<BlockedSource>,
     /// Pull requests parked after repeated failures, retried once a day.
@@ -339,6 +355,7 @@ pub fn tick(
         queued: 0,
         fetch: FetchSummary::default(),
         backfill: BackfillSummary::default(),
+        diff_fill: diff_fill::DiffFillSummary::default(),
         blocked: Vec::new(),
         parked: Vec::new(),
         unresolved_logins: Vec::new(),
@@ -424,13 +441,7 @@ fn new_syncer<'a>(
     client: &'a mut GhClient,
     policy: &TickPolicy,
 ) -> Syncer<'a> {
-    let mut syncer = Syncer::new(conn, client);
-    if let Some(retention) = policy.diff_retention {
-        syncer = syncer.with_diff_retention(retention);
-    }
-    if let Some(source) = policy.policy_source.clone() {
-        syncer = syncer.with_policy_source(source);
-    }
+    let mut syncer = Syncer::new(conn, client, policy.diff_retention);
     if let Some(config) = policy.git_recovery.clone() {
         syncer = syncer.with_git_recovery(config);
     }
@@ -460,7 +471,81 @@ fn run(
     ) && !matches!(report.outcome, TickOutcome::CapPaused { .. })
     {
         backfill_lane(conn, client, policy, control, report)?;
+        diff_fill_lane(conn, client, policy, control, report)?;
     }
+    Ok(())
+}
+
+// ---- Diff fill lane -------------------------------------------------------
+
+fn diff_fill_lane(
+    conn: &Connection,
+    client: &mut GhClient,
+    policy: &TickPolicy,
+    control: &CollectionControl,
+    report: &mut TickReport,
+) -> Result<()> {
+    if policy.skip_diffs
+        || policy.diff_retention != DiffRetention::Retain
+        || policy.diff_fill_per_tick == 0
+    {
+        return Ok(());
+    }
+    report.diff_fill.remaining = diff_fill::owed_count(conn)?;
+    if report.diff_fill.remaining == 0 {
+        return Ok(());
+    }
+    let lease = match lease::Lease::acquire(
+        conn,
+        DIFF_FILL_LANE,
+        &policy.program,
+        Duration::minutes(LEASE_TTL_MINUTES),
+    )? {
+        Ok(lease) => lease,
+        Err(holder) => {
+            report.diff_fill.skipped = Some(format!(
+                "{} (pid {}) is filling diffs",
+                holder.program, holder.pid
+            ));
+            return Ok(());
+        }
+    };
+    let share = policy.backfill_share;
+    let result = diff_fill::fill(
+        conn,
+        client,
+        policy.diff_fill_per_tick,
+        |client| {
+            if stopped(control) {
+                return Some("stopped".into());
+            }
+            if let Some(used) = client.used_share("core").filter(|used| *used >= share) {
+                return Some(format!(
+                    "{:.0}% of the hourly REST budget is used; diff fill waits below {:.0}%",
+                    used * 100.0,
+                    share * 100.0
+                ));
+            }
+            match lease.renew() {
+                Ok(true) => None,
+                Ok(false) => Some("the diff-fill lease was taken over".into()),
+                Err(error) => Some(format!("could not renew the diff-fill lease: {error}")),
+            }
+        },
+        &mut report.diff_fill,
+    );
+    lease.release()?;
+    if let Err(error) = result {
+        match lane_outcome(error)? {
+            TickOutcome::CapPaused { wake_at, .. } => {
+                report.diff_fill.skipped =
+                    Some(format!("paused at the budget cap until {}", text(wake_at)));
+            }
+            TickOutcome::Stopped => report.diff_fill.skipped = Some("stopped".into()),
+            other => report.notes.push(format!("diff fill: {other:?}")),
+        }
+    }
+    report.diff_fill.remaining = diff_fill::owed_count(conn)?;
     Ok(())
 }
 

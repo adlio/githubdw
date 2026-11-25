@@ -78,7 +78,7 @@ fn a_forbidden_node_is_skipped_and_the_rest_of_the_page_is_stored() {
         empty(),
     ]);
 
-    let first = Syncer::new(conn, &mut client)
+    let first = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(evening_instant())
         .sync_user("octocat", &fast_user_options(Some(1)))
         .unwrap();
@@ -108,7 +108,7 @@ fn a_forbidden_node_is_skipped_and_the_rest_of_the_page_is_stored() {
 
     // Second run: same search result. Nothing new is stored, nothing fails,
     // and the hidden node is not a retry that blocks the cursor.
-    let second = Syncer::new(conn, &mut client)
+    let second = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(evening_instant())
         .sync_user("octocat", &fast_user_options(None))
         .unwrap();
@@ -142,9 +142,13 @@ fn an_error_that_is_not_forbidden_still_fails_the_page() {
             errors,
         );
         let mut client = gh_like(vec![page]);
-        let result = Syncer::new(warehouse.connection(), &mut client)
-            .as_of(evening_instant())
-            .sync_user("octocat", &fast_user_options(Some(1)));
+        let result = Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        )
+        .as_of(evening_instant())
+        .sync_user("octocat", &fast_user_options(Some(1)));
         assert!(result.is_err());
         assert_eq!(
             count(
@@ -168,19 +172,27 @@ fn a_saml_message_without_a_type_is_skipped_but_a_null_node_without_an_error_fai
         ),
         empty(),
     ]);
-    let summary = Syncer::new(warehouse.connection(), &mut client)
-        .as_of(evening_instant())
-        .sync_user("octocat", &fast_user_options(Some(1)))
-        .unwrap();
+    let summary = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant())
+    .sync_user("octocat", &fast_user_options(Some(1)))
+    .unwrap();
     assert_eq!((summary.pull_requests_synced, summary.skipped), (1, 1));
 
     let warehouse = los_angeles_warehouse();
     let mut client = gh_like(vec![body(1, vec![serde_json::Value::Null], vec![])]);
     assert!(
-        Syncer::new(warehouse.connection(), &mut client)
-            .as_of(evening_instant())
-            .sync_user("octocat", &fast_user_options(Some(1)))
-            .is_err(),
+        Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain
+        )
+        .as_of(evening_instant())
+        .sync_user("octocat", &fast_user_options(Some(1)))
+        .is_err(),
         "a null node nobody explained is a malformed page"
     );
 }
@@ -200,10 +212,14 @@ fn a_page_of_only_hidden_nodes_still_reaches_the_next_page() {
         body(2, vec![node(2, "2026-08-14T09:00:00Z")], vec![]),
         empty(),
     ]);
-    let summary = Syncer::new(warehouse.connection(), &mut client)
-        .as_of(evening_instant())
-        .sync_user("octocat", &fast_user_options(Some(1)))
-        .unwrap();
+    let summary = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant())
+    .sync_user("octocat", &fast_user_options(Some(1)))
+    .unwrap();
     assert_eq!((summary.pull_requests_synced, summary.skipped), (1, 1));
     assert_eq!(summary.pages_fetched, 3);
 }
@@ -222,7 +238,7 @@ fn the_catch_up_walk_skips_a_forbidden_node_and_still_closes_its_window() {
     );
     let mut client = gh_like(vec![page]);
     let mut summary = SyncSummary::default();
-    Syncer::new(conn, &mut client)
+    Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(now)
         .walk_user_update_windows(
             "octocat",

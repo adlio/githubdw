@@ -7,7 +7,6 @@ use serde_json::json;
 mod support;
 use support::*;
 
-mod app_mode;
 mod continuation;
 mod fatal_errors;
 mod files;
@@ -15,6 +14,7 @@ mod git_recovery;
 mod issues;
 mod lock;
 mod plan;
+mod preservation;
 mod repo_walk;
 mod targets;
 mod user_saml;

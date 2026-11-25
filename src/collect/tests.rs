@@ -54,6 +54,8 @@ struct World {
     nodes_error: Option<Value>,
     /// The issue walk fails outright.
     issue_fault: bool,
+    /// Errors returned once each, only to REST patch listings.
+    fail_rest: Vec<Error>,
     /// The check rollup state served, whatever the runs say.
     rollup: Option<&'static str>,
     /// Per node id: the older `updatedAt` search filters on (index lag).
@@ -384,6 +386,9 @@ impl GhTransport for Fake {
         }
         if path != "graphql" {
             // REST patch listing: repos/o/n/pulls/N/files?per_page=100&page=P
+            if !world.fail_rest.is_empty() {
+                return Err(world.fail_rest.remove(0));
+            }
             let parts: Vec<&str> = path.split(['/', '?']).collect();
             let number: i64 = parts[4].parse().unwrap();
             let page: usize = path.rsplit("page=").next().unwrap().parse().unwrap();
@@ -1782,8 +1787,7 @@ fn imported_failures_whose_lookup_fails_count_an_attempt() {
     });
     let policy = TickPolicy {
         max_rate_use: Some(0.9),
-        diff_retention: Some(DiffRetention::Never),
-        policy_source: Some(PolicySource::Standalone),
+        diff_retention: DiffRetention::Never,
         ..eager()
     };
     let report = run_tick(&dw, &fake, &policy);
@@ -1985,4 +1989,271 @@ fn a_stale_unfinished_run_costs_one_refetch_per_head() {
         0,
         "not fetched again for the same head"
     );
+}
+
+// ---- Retention: callers that disagree accumulate --------------------------
+
+fn three_prs() -> Vec<FakePr> {
+    (1..=3)
+        .map(|n| FakePr::new("acme/app", n, "alice", &ago(300), &ago(20 + n)))
+        .collect()
+}
+
+fn stored_patches(dw: &GithubDW) -> i64 {
+    count(
+        dw,
+        "SELECT COUNT(*) FROM fact_file_diffs WHERE patch LIKE '%PATCH-SENTINEL-%'",
+    )
+}
+
+fn at(retention: DiffRetention, fill: usize) -> TickPolicy {
+    TickPolicy {
+        skip_diffs: false,
+        diff_retention: retention,
+        diff_fill_per_tick: fill,
+        ..eager()
+    }
+}
+
+#[test]
+fn transient_after_retain_keeps_diffs() {
+    let dw = warehouse(&["alice"]);
+    let fake = Fake::new(three_prs());
+    run_tick(&dw, &fake, &at(DiffRetention::Retain, 0));
+    assert_eq!(stored_patches(&dw), 3);
+    // The provider now serves blank text and no files; every pull request
+    // is newer, so transient and never ticks fetch all three again.
+    for (step, retention) in [DiffRetention::Transient, DiffRetention::Never]
+        .into_iter()
+        .enumerate()
+    {
+        fake.with(|w| {
+            for pr in &mut w.prs {
+                pr.updated_at = ago(10 - step as i64);
+                pr.title.clear();
+                pr.body.clear();
+                pr.files.clear();
+            }
+        });
+        let report = run_tick(&dw, &fake, &at(retention, 5));
+        assert_eq!(report.fetch.landed, 3, "{retention:?}: {report:?}");
+        assert!(report.diff_fill.filled.is_empty(), "no fill below retain");
+        assert_eq!(stored_patches(&dw), 3, "{retention:?} kept every diff");
+        assert_eq!(
+            count(&dw, "SELECT COUNT(*) FROM fact_file_diffs"),
+            3,
+            "{retention:?} deleted no file row"
+        );
+        assert_eq!(
+            count(
+                &dw,
+                "SELECT COUNT(*) FROM fact_pull_requests WHERE title = '' OR body = ''"
+            ),
+            0,
+            "{retention:?} blanked no title or body"
+        );
+    }
+}
+
+#[test]
+fn never_retention_deletes_no_stored_row() {
+    let dw = warehouse(&["alice"]);
+    let fake = Fake::new(three_prs());
+    run_tick(&dw, &fake, &at(DiffRetention::Retain, 0));
+    let rows = |dw: &GithubDW| {
+        [
+            "SELECT COUNT(*) FROM fact_pull_requests",
+            "SELECT COUNT(*) FROM fact_reviews",
+            "SELECT COUNT(*) FROM fact_issue_comments",
+            "SELECT COUNT(*) FROM fact_review_comments",
+            "SELECT COUNT(*) FROM fact_file_diffs",
+            "SELECT COUNT(*) FROM fact_file_diffs WHERE patch IS NOT NULL",
+        ]
+        .map(|sql| count(dw, sql))
+    };
+    let before = rows(&dw);
+    fake.with(|w| {
+        for pr in &mut w.prs {
+            pr.updated_at = ago(5);
+            pr.files.clear();
+        }
+    });
+    run_tick(&dw, &fake, &at(DiffRetention::Never, 5));
+    assert_eq!(rows(&dw), before);
+}
+
+#[test]
+fn retain_after_transient_fills_in_diffs_over_runs() {
+    let dw = warehouse(&["alice"]);
+    let fake = Fake::new(three_prs());
+    run_tick(&dw, &fake, &at(DiffRetention::Transient, 5));
+    assert_eq!(stored_patches(&dw), 0);
+    assert_eq!(count(&dw, "SELECT COUNT(*) FROM fact_file_diffs"), 3);
+
+    // Nothing changed upstream, so detection fetches nothing; the fill
+    // lane stores two diffs per tick, newest first.
+    let first = run_tick(&dw, &fake, &at(DiffRetention::Retain, 2));
+    assert_eq!(first.fetch.landed, 0, "{first:?}");
+    assert_eq!(
+        first.diff_fill.filled,
+        ["acme/app#1", "acme/app#2"],
+        "{first:?}"
+    );
+    assert_eq!(first.diff_fill.remaining, 1);
+    assert_eq!(stored_patches(&dw), 2);
+
+    let second = run_tick(&dw, &fake, &at(DiffRetention::Retain, 2));
+    assert_eq!(second.diff_fill.filled, ["acme/app#3"], "{second:?}");
+    assert_eq!(second.diff_fill.remaining, 0);
+    assert_eq!(stored_patches(&dw), 3);
+
+    // A filled pull request is not fetched again.
+    let third = run_tick(&dw, &fake, &at(DiffRetention::Retain, 2));
+    assert!(third.diff_fill.filled.is_empty(), "{third:?}");
+    assert_eq!(third.rest_calls, 0, "{third:?}");
+}
+
+#[test]
+fn a_failed_fill_waits_a_day_and_the_budget_share_holds_the_lane() {
+    let dw = warehouse(&["alice"]);
+    let fake = Fake::new(three_prs());
+    run_tick(&dw, &fake, &at(DiffRetention::Transient, 5));
+    // The first attempt fails; that pull request waits while the others fill.
+    fake.with(|w| w.fail_rest = vec![Error::GitHubApi("HTTP 404: Not Found".into())]);
+    let report = run_tick(&dw, &fake, &at(DiffRetention::Retain, 1));
+    assert_eq!(
+        report
+            .diff_fill
+            .failed
+            .iter()
+            .map(|(k, _)| k.as_str())
+            .collect::<Vec<_>>(),
+        ["acme/app#1"],
+        "{report:?}"
+    );
+    assert_eq!(report.diff_fill.remaining, 3, "a failed one is still owed");
+    let again = run_tick(&dw, &fake, &at(DiffRetention::Retain, 5));
+    assert_eq!(
+        again.diff_fill.filled,
+        ["acme/app#2", "acme/app#3"],
+        "{again:?}"
+    );
+    assert_eq!(again.diff_fill.remaining, 1);
+    assert_eq!(
+        count(
+            &dw,
+            "SELECT attempts FROM collector_diff_fill WHERE pr_key = 'acme/app#1' AND last_error LIKE '%404%'"
+        ),
+        1
+    );
+
+    // Over the share, the lane waits.
+    let dw = warehouse(&["alice"]);
+    let fake = Fake::new(three_prs());
+    run_tick(&dw, &fake, &at(DiffRetention::Transient, 5));
+    let held = run_tick(
+        &dw,
+        &fake,
+        &TickPolicy {
+            backfill_share: 0.0,
+            ..at(DiffRetention::Retain, 5)
+        },
+    );
+    assert!(held.diff_fill.filled.is_empty(), "{held:?}");
+    assert!(
+        held.diff_fill
+            .skipped
+            .as_deref()
+            .is_some_and(|why| why.contains("REST budget")),
+        "{held:?}"
+    );
+    assert_eq!(held.diff_fill.remaining, 3);
+}
+
+#[test]
+fn a_held_diff_fill_lease_waits_and_a_run_fatal_error_ends_the_lane() {
+    let dw = warehouse(&["alice"]);
+    let fake = Fake::new(three_prs());
+    run_tick(&dw, &fake, &at(DiffRetention::Transient, 5));
+
+    // Another process holds the lane.
+    dw.connection()
+        .execute(
+            "INSERT INTO collector_leases VALUES ('diff_fill', 't', ?1, ?2, ?3, 'engdash', ?4, ?5)",
+            rusqlite::params![
+                i64::from(std::process::id()),
+                lease::process_start(std::process::id()),
+                lease::host_name(),
+                ago(1),
+                text(Utc::now() + Duration::minutes(10))
+            ],
+        )
+        .unwrap();
+    let held = run_tick(&dw, &fake, &at(DiffRetention::Retain, 5));
+    assert!(
+        held.diff_fill
+            .skipped
+            .as_deref()
+            .is_some_and(|why| why.contains("engdash") && why.contains("filling diffs")),
+        "{held:?}"
+    );
+    assert!(held.diff_fill.filled.is_empty());
+    dw.connection()
+        .execute("DELETE FROM collector_leases", [])
+        .unwrap();
+
+    // A spent budget pauses the lane; nothing is recorded against the PR.
+    fake.with(|w| w.fail_rest = vec![Error::QuotaReserve("core quota at reserve".into())]);
+    let paused = run_tick(&dw, &fake, &at(DiffRetention::Retain, 5));
+    assert!(
+        paused
+            .diff_fill
+            .skipped
+            .as_deref()
+            .is_some_and(|why| why.starts_with("paused at the budget cap")),
+        "{paused:?}"
+    );
+    assert_eq!(count(&dw, "SELECT COUNT(*) FROM collector_diff_fill"), 0);
+
+    // A signed-out gh ends the lane with a note.
+    fake.with(|w| w.fail_rest = vec![Error::GhUnavailable("gh auth login".into())]);
+    let signed_out = run_tick(&dw, &fake, &at(DiffRetention::Retain, 5));
+    assert!(
+        signed_out.notes.iter().any(|n| n.starts_with("diff fill:")),
+        "{signed_out:?}"
+    );
+    assert_eq!(signed_out.diff_fill.remaining, 3);
+}
+
+#[test]
+fn a_failed_patch_write_rolls_back_and_is_retried_later() {
+    let dw = warehouse(&["alice"]);
+    let fake = Fake::new(three_prs());
+    run_tick(&dw, &fake, &at(DiffRetention::Transient, 5));
+    dw.connection()
+        .execute_batch(
+            "CREATE TRIGGER refuse_patch BEFORE UPDATE OF patch ON fact_file_diffs
+             WHEN NEW.pr_key = 'acme/app#1'
+             BEGIN SELECT RAISE(ABORT, 'injected patch'); END;",
+        )
+        .unwrap();
+    let report = run_tick(&dw, &fake, &at(DiffRetention::Retain, 5));
+    assert_eq!(
+        report.diff_fill.filled,
+        ["acme/app#2", "acme/app#3"],
+        "{report:?}"
+    );
+    assert!(
+        report.diff_fill.failed[0].1.contains("injected patch"),
+        "{report:?}"
+    );
+    assert_eq!(
+        count(
+            &dw,
+            "SELECT COUNT(*) FROM pr_detail_state WHERE pr_key = 'acme/app#1' AND diff_stored_at IS NOT NULL"
+        ),
+        0,
+        "rolled back"
+    );
+    assert_eq!(report.diff_fill.remaining, 1);
 }

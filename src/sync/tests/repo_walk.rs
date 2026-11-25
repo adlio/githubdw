@@ -9,7 +9,11 @@ fn syncs_two_pages_and_records_state() {
     ]);
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
     let options = fast_pr_options();
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    );
     let summary = syncer.sync_repository("octocat/hello", &options).unwrap();
 
     assert_eq!(summary.pull_requests_synced, 3);
@@ -59,12 +63,20 @@ fn incremental_rerun_stops_at_cursor() {
     let options = fast_pr_options();
 
     {
-        let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+        let mut syncer = Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        );
         let first = syncer.sync_repository("octocat/hello", &options).unwrap();
         assert_eq!(first.pull_requests_synced, 2);
     }
     {
-        let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+        let mut syncer = Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        );
         let second = syncer.sync_repository("octocat/hello", &options).unwrap();
         assert_eq!(second.pull_requests_synced, 0, "no-op on unchanged data");
         assert!(second.up_to_date);
@@ -103,11 +115,19 @@ fn same_second_late_update_is_not_lost() {
     let options = fast_pr_options();
 
     {
-        let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+        let mut syncer = Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        );
         syncer.sync_repository("octocat/hello", &options).unwrap();
     }
     {
-        let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+        let mut syncer = Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        );
         syncer.sync_repository("octocat/hello", &options).unwrap();
     }
 
@@ -145,7 +165,11 @@ fn cursor_does_not_advance_past_a_failed_upsert() {
     ))]);
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
     let options = fast_pr_options();
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    );
     let summary = syncer.sync_repository("octocat/hello", &options).unwrap();
 
     assert_eq!(summary.pull_requests_synced, 1);
@@ -167,7 +191,11 @@ fn repository_path_follows_nested_connection_cursors() {
         vec![page_of(false, None, vec![heavy_pr_node(5)])],
         heavy_pr_continuations(),
     );
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    );
     let summary = syncer
         .sync_repository("octocat/hello", &fast_pr_options())
         .unwrap();
@@ -211,13 +239,13 @@ fn failed_middle_item_caps_the_committed_cursor() {
         )),
     ]);
     let options = fast_pr_options();
-    let first = Syncer::new(conn, &mut client)
+    let first = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .sync_repository("octocat/hello", &options)
         .unwrap();
     assert_eq!(first.failed.len(), 1);
     assert_eq!(pr_cursor(conn).as_deref(), Some("2026-01-19T10:00:00Z"));
 
-    Syncer::new(conn, &mut client)
+    Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .sync_repository("octocat/hello", &options)
         .unwrap();
     assert_eq!(
@@ -243,7 +271,7 @@ fn budgeted_walk_yields_resumes_and_catches_items_that_moved() {
     let options = fast_pr_options();
 
     let (mut client, _) = shared_client(vec![Ok(page_response(true, Some("C1"), &[10, 9]))]);
-    let first = Syncer::new(conn, &mut client)
+    let first = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .with_item_budget(2)
         .sync_repository("octocat/hello", &options)
         .unwrap();
@@ -264,7 +292,7 @@ fn budgeted_walk_yields_resumes_and_catches_items_that_moved() {
     // Between runs PR 7 is edited and moves to the front, so the resumed
     // page no longer contains it.
     let (mut client, transport) = shared_client(vec![Ok(page_response(false, None, &[8]))]);
-    let second = Syncer::new(conn, &mut client)
+    let second = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .with_item_budget(2)
         .sync_repository("octocat/hello", &options)
         .unwrap();
@@ -285,7 +313,7 @@ fn budgeted_walk_yields_resumes_and_catches_items_that_moved() {
             pr_node(9, "2026-01-05T18:00:00Z", "2026-01-14T09:00:00Z"),
         ],
     ))]);
-    let third = Syncer::new(conn, &mut client)
+    let third = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .sync_repository("octocat/hello", &options)
         .unwrap();
     assert_eq!(third.pull_requests_synced, 2);
@@ -309,7 +337,7 @@ fn rejected_saved_cursor_restarts_the_walk_once() {
     let conn = warehouse.connection();
     let options = fast_pr_options();
     let (mut client, _) = shared_client(vec![Ok(page_response(true, Some("C1"), &[10, 9]))]);
-    Syncer::new(conn, &mut client)
+    Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .with_item_budget(1)
         .sync_repository("octocat/hello", &options)
         .unwrap();
@@ -322,7 +350,7 @@ fn rejected_saved_cursor_restarts_the_walk_once() {
         Ok(invalid),
         Ok(page_response(false, None, &[10, 9, 8])),
     ]);
-    let summary = Syncer::new(conn, &mut client)
+    let summary = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .sync_repository("octocat/hello", &options)
         .unwrap();
     assert_eq!(
@@ -357,7 +385,7 @@ fn foreign_or_corrupt_checkpoint_is_discarded() {
     ] {
         sync_state::save_checkpoint(conn, REPO_PR_CHECKPOINT, "octocat/hello", &stale).unwrap();
         let (mut client, transport) = shared_client(vec![Ok(page_response(false, None, &[10]))]);
-        Syncer::new(conn, &mut client)
+        Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
             .sync_repository("octocat/hello", &options)
             .unwrap();
         assert_eq!(requested_cursors(&transport), vec![None]);
@@ -398,7 +426,12 @@ fn recorded_coverage_stops_at_the_last_complete_local_day() {
 
     // 2026-08-16 20:00 PDT.
     let instant = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 8, 17, 3, 0, 0).unwrap();
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client).as_of(instant);
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(instant);
     syncer.sync_repository("octocat/hello", &options).unwrap();
 
     let (start, end): (String, String) = warehouse
