@@ -79,3 +79,12 @@ CREATE TABLE IF NOT EXISTS collector_backoff (
     last_attempt_at TEXT NOT NULL,
     retry_after     TEXT NOT NULL
 );
+
+-- Diff fill (`collect::diff_fill`): the last attempt to store patch text
+-- for a pull request synced without it. A failed attempt waits a day.
+CREATE TABLE IF NOT EXISTS collector_diff_fill (
+    pr_key       TEXT PRIMARY KEY,
+    attempted_at TEXT NOT NULL,
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT
+);

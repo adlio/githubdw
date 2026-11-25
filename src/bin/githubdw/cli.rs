@@ -22,6 +22,13 @@ pub struct CommandLine {
     #[arg(long, global = true, value_name = "FRACTION")]
     pub max_rate_use: Option<String>,
 
+    /// Whether a sync stores the diff (patch) text it fetches: `retain`
+    /// stores it and fills in diffs missing for stored pull requests,
+    /// `transient` and `never` fetch none. No setting deletes stored diffs.
+    /// Default: the `diff_retention` config value, else retain
+    #[arg(long, global = true, value_name = "never|transient|retain")]
+    pub diff_retention: Option<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }

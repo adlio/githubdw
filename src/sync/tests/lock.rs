@@ -11,7 +11,7 @@ fn failing_user_sync(conn: &rusqlite::Connection) -> Result<SyncSummary> {
     // No canned responses: the first search fails with "no more fixture responses".
     let transport = FixtureTransport::new(vec![]);
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
-    Syncer::new(conn, &mut client)
+    Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(evening_instant())
         .sync_user("octocat", &fast_user_options(Some(1)))
 }
@@ -41,7 +41,7 @@ fn a_failing_completion_record_releases_the_lock_and_is_reported() {
         Ok(search_response(0, vec![])),
     ]);
     let mut client = GhClient::with_transport(Box::new(transport)).without_sleeping();
-    let error = Syncer::new(conn, &mut client)
+    let error = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(evening_instant())
         .sync_user("octocat", &fast_user_options(Some(1)))
         .unwrap_err()

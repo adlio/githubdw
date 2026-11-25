@@ -509,10 +509,10 @@ pub fn delete_file_diffs(conn: &Connection, pr_key: &str, paths: &[String]) -> R
     Ok(deleted)
 }
 
-// ---- Preserving writes (app mode) ------------------------------------
+// ---- Preserving writes ----------------------------------------------
 //
-// Used whenever a collection policy file is present, and by every
-// counts-only (light) write. They differ from the legacy upserts in one
+// Used by every sync write, detail and
+// counts-only (light). They differ from the plain upserts in one
 // respect: a NULL or empty incoming value never replaces a stored non-empty
 // title, body, comment, or patch, and nothing is ever deleted. Provider
 // facts that are not payload (state, timestamps, sizes) still update.

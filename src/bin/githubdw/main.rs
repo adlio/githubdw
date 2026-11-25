@@ -74,11 +74,17 @@ pub(crate) const EXIT_PARTIAL_FAILURE: u8 = 3;
 fn run(command_line: CommandLine) -> githubdw::Result<ExitCode> {
     let db = command_line.db;
     let max_rate_use = command_line.max_rate_use;
+    let diff_retention = command_line.diff_retention;
     match command_line.command {
         Command::Config { command } => admin::config(open_warehouse(db)?, command).map(ok),
         Command::Monitor { command } => admin::monitor(open_warehouse(db)?, command).map(ok),
         Command::Group { command } => admin::group(open_warehouse(db)?, command).map(ok),
-        Command::Sync { command } => sync::run(db, max_rate_use.as_deref(), command),
+        Command::Sync { command } => sync::run(
+            db,
+            max_rate_use.as_deref(),
+            diff_retention.as_deref(),
+            command,
+        ),
         Command::Diffs {
             command: cli::DiffsCommand::Purge { dry_run, vacuum },
         } => admin::purge_diffs(open_warehouse(db)?, dry_run, vacuum).map(ok),
@@ -87,9 +93,10 @@ fn run(command_line: CommandLine) -> githubdw::Result<ExitCode> {
         Command::Search(arguments) => report::search(open_warehouse(db)?, arguments).map(ok),
         Command::Mcp { read_only } => {
             let warehouse = open_warehouse(db)?;
+            let retention = sync::resolve_retention(&warehouse, diff_retention.as_deref())?;
             let runtime = tokio::runtime::Runtime::new()?;
             runtime
-                .block_on(githubdw::mcp::serve_stdio(warehouse, read_only))
+                .block_on(githubdw::mcp::serve_stdio(warehouse, read_only, retention))
                 .map(ok)
         }
     }

@@ -47,7 +47,8 @@ fn a_run_level_error_on_item_two_stops_the_repo_walk_and_resumes() {
 
         let (mut client, transport) =
             shared_client(vec![Ok(five_prs_second_is_heavy()), Err(error)]);
-        let result = Syncer::new(conn, &mut client).sync_repository("octocat/hello", &options);
+        let result = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
+            .sync_repository("octocat/hello", &options);
         let failure = result.expect_err(&label);
         assert!(failure.is_run_fatal(), "{label}: {failure}");
         assert_eq!(
@@ -68,7 +69,7 @@ fn a_run_level_error_on_item_two_stops_the_repo_walk_and_resumes() {
         );
 
         let (mut client, _) = shared_client(vec![Ok(five_light_prs())]);
-        let summary = Syncer::new(conn, &mut client)
+        let summary = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
             .sync_repository("octocat/hello", &options)
             .unwrap();
         assert!(summary.failed.is_empty(), "{label}: {:?}", summary.failed);
@@ -90,7 +91,7 @@ fn a_run_level_error_on_page_two_keeps_the_page_one_checkpoint() {
         Ok(page_response(true, Some("C1"), &[10, 9])),
         Err(crate::Error::Cancelled),
     ]);
-    let error = Syncer::new(conn, &mut client)
+    let error = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .sync_repository("octocat/hello", &fast_pr_options())
         .unwrap_err();
     assert!(matches!(error, crate::Error::Cancelled), "{error}");
@@ -107,10 +108,14 @@ fn an_empty_json_body_halves_the_user_search_page() {
     let mut responses = vec![Err(gh("unexpected end of JSON input\n"))];
     responses.extend((0..16).map(|_| Ok(search_response(0, vec![]))));
     let (mut client, transport) = shared_client(responses);
-    let summary = Syncer::new(warehouse.connection(), &mut client)
-        .as_of(evening_instant())
-        .sync_user("octocat", &fast_user_options(Some(1)))
-        .unwrap();
+    let summary = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .as_of(evening_instant())
+    .sync_user("octocat", &fast_user_options(Some(1)))
+    .unwrap();
     assert!(summary.failed.is_empty(), "{:?}", summary.failed);
     let sizes: Vec<String> = transport
         .calls
@@ -145,9 +150,13 @@ fn a_run_level_error_stops_the_user_walk() {
         });
         let (mut client, transport) =
             shared_client(vec![Ok(search_response(1, vec![heavy])), Err(error)]);
-        let result = Syncer::new(warehouse.connection(), &mut client)
-            .as_of(evening_instant())
-            .sync_user("octocat", &fast_user_options(Some(1)));
+        let result = Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        )
+        .as_of(evening_instant())
+        .sync_user("octocat", &fast_user_options(Some(1)));
         let failure = result.expect_err(&label);
         assert!(failure.is_run_fatal(), "{label}: {failure}");
         assert_eq!(transport.calls.lock().unwrap().len(), 2, "{label}");
@@ -214,9 +223,13 @@ fn page_size_halves_only_for_size_symptoms() {
         let mut responses: Vec<_> = (0..attempts).map(|_| Err(clone_error(&error))).collect();
         responses.push(Ok(page_response(false, None, &[1])));
         let (mut client, transport) = shared_client(responses);
-        let summary = Syncer::new(warehouse.connection(), &mut client)
-            .sync_repository("octocat/hello", &fast_pr_options())
-            .unwrap();
+        let summary = Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        )
+        .sync_repository("octocat/hello", &fast_pr_options())
+        .unwrap();
         assert_eq!(summary.pull_requests_synced, 1, "{label}");
         let mut sizes = page_query_sizes(&transport);
         sizes.dedup();
@@ -231,9 +244,13 @@ fn page_size_halves_only_for_size_symptoms() {
         let label = error.to_string();
         let warehouse = GithubDW::open_in_memory().unwrap();
         let (mut client, transport) = shared_client(vec![Err(error)]);
-        Syncer::new(warehouse.connection(), &mut client)
-            .sync_repository("octocat/hello", &fast_pr_options())
-            .expect_err(&label);
+        Syncer::new(
+            warehouse.connection(),
+            &mut client,
+            crate::retention::DiffRetention::Retain,
+        )
+        .sync_repository("octocat/hello", &fast_pr_options())
+        .expect_err(&label);
         assert_eq!(page_query_sizes(&transport), ["25"], "{label}: no halving");
     }
 }

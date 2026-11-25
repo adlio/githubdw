@@ -9,8 +9,8 @@
 //! today for every member before going further back for anyone.
 //!
 //! Detail (review bodies, comments, files) and diff text are separate stages:
-//! [`fetch_pull_request_detail`] stores everything a full fetch returns except
-//! new patch text unless the policy allows retention, and
+//! [`fetch_pull_request_detail`] stores everything a full fetch returns, and
+//! new patch text only when the caller asks for retention, and
 //! [`fetch_pull_request_diff_live`] returns diff text in memory only.
 
 use std::sync::Arc;
@@ -27,7 +27,7 @@ use crate::error::{Error, Result};
 use crate::fetch::GhClient;
 use crate::fetch::pull_requests::{self, ActorReference, PullRequestData};
 use crate::fetch::user_search::SEARCH_RESULT_CAP;
-use crate::retention::{DiffRetention, PolicySource};
+use crate::retention::DiffRetention;
 use crate::storage::repository::{self, CounterSource, PullRequestRow};
 use crate::storage::time_dimension;
 
@@ -1079,7 +1079,7 @@ pub fn day_counts(
 #[derive(Debug, Clone, Serialize)]
 pub struct DetailOutcome {
     pub outcome: crate::refresh::TargetOutcome,
-    /// The retention the write boundary actually allowed.
+    /// The retention the caller asked for.
     pub allowed: DiffRetention,
     /// True when new patch text was written by this call.
     pub diff_stored: bool,
@@ -1090,14 +1090,13 @@ pub struct DetailOutcome {
 /// Fetch one pull request in full (reviews with bodies, review threads,
 /// conversation comments, file list, checks) and store it with preserving
 /// writes. New patch text is fetched and written only when `requested` is
-/// `Retain` AND the policy at `source` allows it at the write boundary.
+/// `Retain`.
 pub fn fetch_pull_request_detail(
     conn: &Connection,
     client: &mut GhClient,
     repository: &str,
     number: i64,
     requested: DiffRetention,
-    source: PolicySource,
     control: &CollectionControl,
 ) -> Result<DetailOutcome> {
     let target = crate::refresh::RefreshTarget {
@@ -1117,16 +1116,8 @@ pub fn fetch_pull_request_detail(
         )
         .optional()?
         .flatten();
-    // Detail writes always preserve: this is an app-level primitive, so a
-    // missing policy file must not re-enable legacy blanking or pruning.
-    let source = always_app_mode(source);
-    let allowed = crate::retention::RetentionGate::new(requested, source.clone())
-        .decide()
-        .allowed;
     let report = {
-        let mut syncer = crate::sync::Syncer::new(conn, client)
-            .with_diff_retention(requested)
-            .with_policy_source(source);
+        let mut syncer = crate::sync::Syncer::new(conn, client, requested);
         syncer.refresh_targets(
             std::slice::from_ref(&target),
             &crate::refresh::RefreshOptions {
@@ -1152,27 +1143,10 @@ pub fn fetch_pull_request_detail(
         .ok_or_else(|| Error::GitHubApi("refresh returned no outcome".into()))?;
     Ok(DetailOutcome {
         outcome,
-        allowed,
+        allowed: requested,
         diff_stored: stored_at.is_some() && stored_at != before,
         revision: revision_identity(&target.repository, number, base.as_deref(), head.as_deref()),
     })
-}
-
-/// Wrap a source so a missing file reads as app mode with the caller's
-/// request as the ceiling (preserving writes, no pruning).
-fn always_app_mode(source: PolicySource) -> PolicySource {
-    PolicySource::Custom(Arc::new(move || match source.current() {
-        crate::retention::PolicyState::Missing => {
-            crate::retention::PolicyState::Present(crate::retention::PolicyFile {
-                version: 1,
-                mode: crate::retention::CollectionMode::Full,
-                ai: false,
-                diff_retention: DiffRetention::Retain,
-                updated_at: None,
-            })
-        }
-        other => other,
-    }))
 }
 
 /// `github:v1:<repo>#<n>:<base>..<head>`, or `None` without both oids.

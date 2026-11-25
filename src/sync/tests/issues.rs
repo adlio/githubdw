@@ -12,7 +12,11 @@ fn syncs_issues_with_labels_and_comments() {
         issues_only: true,
         ..Default::default()
     };
-    let mut syncer = Syncer::new(warehouse.connection(), &mut client);
+    let mut syncer = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    );
     let summary = syncer.sync_repository("octocat/hello", &options).unwrap();
 
     assert_eq!(summary.issues_synced, 3);

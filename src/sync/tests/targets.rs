@@ -41,7 +41,7 @@ fn refresh_completes_an_old_shipped_pr_without_moving_any_sync_state() {
         )],
         vec![],
     );
-    let summary = Syncer::new(conn, &mut client)
+    let summary = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .sync_repository("octocat/hello", &fast_pr_options())
         .unwrap();
     assert_eq!(summary.pull_requests_synced, 0);
@@ -50,7 +50,7 @@ fn refresh_completes_an_old_shipped_pr_without_moving_any_sync_state() {
     let mut node = heavy_pr_node(5);
     node["title"] = json!("Refreshed title");
     let (mut client, _) = routing_client(vec![single_pr_response(node)], heavy_pr_continuations());
-    let report = Syncer::new(conn, &mut client)
+    let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
             &RefreshOptions { skip_diffs: true },
@@ -85,7 +85,7 @@ fn failed_refresh_preserves_stored_rows_and_state() {
     let mut continuations = heavy_pr_continuations();
     continuations.retain(|(field, cursor, _)| !(*field == "comments" && *cursor == "COM2"));
     let (mut client, _) = routing_client(vec![single_pr_response(heavy_pr_node(5))], continuations);
-    let report = Syncer::new(conn, &mut client)
+    let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
             &RefreshOptions { skip_diffs: true },
@@ -101,7 +101,7 @@ fn failed_refresh_preserves_stored_rows_and_state() {
     node["title"] = json!("must not land");
     node["reviews"]["nodes"][0]["submittedAt"] = json!("not a timestamp");
     let (mut client, _) = routing_client(vec![single_pr_response(node)], vec![]);
-    let report = Syncer::new(conn, &mut client)
+    let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
             &RefreshOptions { skip_diffs: true },
@@ -120,7 +120,7 @@ fn refresh_honours_a_running_sync_lock_and_leaves_it_in_place() {
     let state_before = state_snapshot(conn);
     let (mut client, transport) =
         routing_client(vec![single_pr_response(heavy_pr_node(5))], vec![]);
-    let report = Syncer::new(conn, &mut client)
+    let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
             &RefreshOptions::default(),
@@ -166,7 +166,7 @@ fn each_target_fails_or_lands_on_its_own() {
         ],
         vec![],
     );
-    let report = Syncer::new(conn, &mut client)
+    let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[
                 target(TargetKind::PullRequest, "octocat/hello#7"),
@@ -239,7 +239,7 @@ fn transport_failure_fails_only_its_target() {
         }),
         Ok(single_pr_response(node)),
     ]);
-    let report = Syncer::new(conn, &mut client)
+    let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[
                 target(TargetKind::PullRequest, "octocat/hello#2"),
@@ -264,7 +264,7 @@ fn refresh_walks_rest_patch_pages_and_reports_a_failed_page() {
         ],
         second_file_page(),
     );
-    let report = Syncer::new(conn, &mut client)
+    let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#4")],
             &RefreshOptions::default(),
@@ -287,7 +287,7 @@ fn refresh_walks_rest_patch_pages_and_reports_a_failed_page() {
         ],
         second_file_page(),
     );
-    let report = Syncer::new(conn, &mut client)
+    let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#4")],
             &RefreshOptions::default(),
@@ -316,7 +316,7 @@ fn refresh_patch_write_failure_rolls_back_the_entire_target() {
         ],
         second_file_page(),
     );
-    let initial = Syncer::new(conn, &mut client)
+    let initial = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(std::slice::from_ref(&selected), &RefreshOptions::default())
         .unwrap();
     assert_eq!(initial.failed(), 0);
@@ -339,7 +339,7 @@ fn refresh_patch_write_failure_rolls_back_the_entire_target() {
         ],
         second_file_page(),
     );
-    let report = Syncer::new(conn, &mut client)
+    let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(&[selected], &RefreshOptions::default())
         .unwrap();
     assert_eq!(report.failed(), 1);

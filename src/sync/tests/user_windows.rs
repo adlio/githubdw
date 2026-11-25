@@ -12,7 +12,7 @@ fn user_update_window_failure_retains_checkpoint_and_cursor() {
         vec![search_node(1, "acme/widgets", "bad-created-date", &base)],
     ))]);
     let mut summary = SyncSummary::default();
-    Syncer::new(conn, &mut client)
+    Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(now)
         .walk_user_update_windows(
             "octocat",
@@ -55,7 +55,7 @@ fn user_update_windows_ingest_complete_search_results_with_newer_node_timestamps
         ],
     ))]);
     let mut summary = SyncSummary::default();
-    Syncer::new(conn, &mut client)
+    Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(now)
         .walk_user_update_windows(
             "octocat",
@@ -90,7 +90,7 @@ fn user_update_windows_keep_unsplittable_ties_and_incomplete_responses_open() {
         let base = search_timestamp(now.timestamp()).unwrap();
         let (mut client, _) = shared_client(vec![Ok(response)]);
         let mut summary = SyncSummary::default();
-        Syncer::new(conn, &mut client)
+        Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
             .as_of(now)
             .walk_user_update_windows(
                 "octocat",
@@ -135,7 +135,7 @@ fn user_incremental_success_covers_days_missed_between_runs() {
         Ok(search_response(0, vec![])),
         Ok(search_response(0, vec![])),
     ]);
-    let summary = Syncer::new(conn, &mut client)
+    let summary = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(now + Duration::days(3))
         .sync_user("octocat", &fast_user_options(None))
         .unwrap();
@@ -176,7 +176,7 @@ fn user_update_checkpoint_survives_transport_failure_and_restarts_invalid_state(
     let (mut client, _) = shared_client(vec![]);
     let mut summary = SyncSummary::default();
     assert!(
-        Syncer::new(conn, &mut client)
+        Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
             .as_of(now)
             .walk_user_update_windows(
                 "octocat",
@@ -213,7 +213,7 @@ fn user_update_checkpoint_survives_transport_failure_and_restarts_invalid_state(
     )
     .unwrap();
     let (mut client, transport) = shared_client(vec![Ok(search_response(0, vec![]))]);
-    Syncer::new(conn, &mut client)
+    Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(now)
         .walk_user_update_windows(
             "octocat",
@@ -283,7 +283,7 @@ fn a_stopped_user_backfill_keeps_finished_months_and_resumes() {
 
     // August (author, reviewer), then July's first request fails.
     let (mut client, _) = shared_client(vec![empty(), empty(), Err(stop)]);
-    Syncer::new(conn, &mut client)
+    Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(now)
         .sync_user("octocat", &fast_user_options(Some(60)))
         .expect_err("the run stops in July");
@@ -311,7 +311,7 @@ fn a_stopped_user_backfill_keeps_finished_months_and_resumes() {
 
     // The rerun asks only for July and June (two roles each).
     let (mut client, transport) = shared_client(vec![empty(), empty(), empty(), empty()]);
-    let summary = Syncer::new(conn, &mut client)
+    let summary = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .as_of(now)
         .sync_user("octocat", &fast_user_options(Some(60)))
         .unwrap();

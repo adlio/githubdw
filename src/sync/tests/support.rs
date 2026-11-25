@@ -506,9 +506,13 @@ pub(super) fn warehouse_with_shipped_pr() -> GithubDW {
     node["files"] =
         json!({"pageInfo": {"hasNextPage": false, "endCursor": null}, "nodes": [file("a.rs")]});
     let (mut client, _) = routing_client(vec![page_of(false, None, vec![node])], vec![]);
-    let summary = Syncer::new(warehouse.connection(), &mut client)
-        .sync_repository("octocat/hello", &fast_pr_options())
-        .unwrap();
+    let summary = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .sync_repository("octocat/hello", &fast_pr_options())
+    .unwrap();
     assert!(summary.failed.is_empty());
     warehouse
 }
@@ -585,9 +589,13 @@ pub(super) fn warehouse_with_abc_and_unrelated() -> GithubDW {
         )],
         vec![],
     );
-    let summary = Syncer::new(warehouse.connection(), &mut client)
-        .sync_repository("octocat/hello", &fast_pr_options())
-        .unwrap();
+    let summary = Syncer::new(
+        warehouse.connection(),
+        &mut client,
+        crate::retention::DiffRetention::Retain,
+    )
+    .sync_repository("octocat/hello", &fast_pr_options())
+    .unwrap();
     assert!(summary.failed.is_empty(), "{:?}", summary.failed);
     let conn = warehouse.connection();
     assert_eq!(
@@ -603,7 +611,7 @@ pub(super) fn refresh_pr5(
     skip_diffs: bool,
 ) -> RefreshReport {
     let (mut client, _) = routing_client(pages, vec![]);
-    Syncer::new(conn, &mut client)
+    Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
             &RefreshOptions { skip_diffs },

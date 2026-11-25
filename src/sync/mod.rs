@@ -96,23 +96,9 @@ pub struct Syncer<'a> {
     /// When set, a pull request whose API file listing is capped, short, or
     /// contradictory is completed from git (see [`git_files`]).
     git_recovery: Option<GitRecoveryConfig>,
-    /// Collection policy gate, re-read at every write boundary. Its
-    /// `requested` value is derived from `SyncOptions::skip_diffs` unless the
-    /// caller sets one explicitly with [`Syncer::with_diff_retention`].
-    gate: crate::retention::RetentionGate,
-    /// True once the caller chose an explicit retention request.
-    explicit_retention: bool,
-}
-
-/// The policy source a new [`Syncer`] reads: the shared policy file, except
-/// in this crate's own unit tests, which must not observe a developer's real
-/// file.
-fn default_policy_source() -> crate::retention::PolicySource {
-    if cfg!(test) {
-        crate::retention::PolicySource::Standalone
-    } else {
-        crate::retention::PolicySource::DefaultFile
-    }
+    /// Whether patch text fetched by this run is stored. Set by the caller
+    /// in [`Syncer::new`]; `SyncOptions::skip_diffs` lowers it to `Never`.
+    retention: crate::retention::DiffRetention,
 }
 
 pub(crate) fn search_timestamp(seconds: i64) -> Result<String> {
@@ -130,45 +116,32 @@ fn is_invalid_cursor_error(error: &crate::Error) -> bool {
 }
 
 impl<'a> Syncer<'a> {
-    pub fn new(connection: &'a Connection, client: &'a mut GhClient) -> Self {
+    /// A syncer that stores fetched patch text only when `retention` is
+    /// [`DiffRetention::Retain`](crate::retention::DiffRetention::Retain).
+    /// Every write preserves stored payloads whatever the retention.
+    pub fn new(
+        connection: &'a Connection,
+        client: &'a mut GhClient,
+        retention: crate::retention::DiffRetention,
+    ) -> Self {
         Self {
             connection,
             client,
             now: Utc::now(),
             item_budget: None,
             git_recovery: None,
-            gate: crate::retention::RetentionGate::new(
-                crate::retention::DiffRetention::Retain,
-                default_policy_source(),
-            ),
-            explicit_retention: false,
+            retention,
         }
     }
 
-    /// Ask for a diff-retention level explicitly. It is a request: a present
-    /// policy file still caps it at every write.
-    pub fn with_diff_retention(mut self, requested: crate::retention::DiffRetention) -> Self {
-        self.gate.requested = requested;
-        self.explicit_retention = true;
-        self
-    }
-
-    /// Read the collection policy from `source` instead of the shared file.
-    pub fn with_policy_source(mut self, source: crate::retention::PolicySource) -> Self {
-        self.gate.source = source;
-        self
-    }
-
-    /// The retention this run may use for an item fetched now, given the
+    /// The retention this run uses for an item fetched now, given the
     /// legacy `skip_diffs` flag.
-    pub(crate) fn decide(&self, skip_diffs: bool) -> crate::retention::GateDecision {
-        let mut gate = self.gate.clone();
-        if !self.explicit_retention && skip_diffs {
-            gate.requested = crate::retention::DiffRetention::Never;
-        } else if skip_diffs {
-            gate.requested = gate.requested.min(crate::retention::DiffRetention::Never);
+    pub(crate) fn decide(&self, skip_diffs: bool) -> crate::retention::DiffRetention {
+        if skip_diffs {
+            crate::retention::DiffRetention::Never
+        } else {
+            self.retention
         }
-        gate.decide()
     }
 
     /// Complete capped or contradictory pull-request file listings from git.
