@@ -2169,3 +2169,91 @@ fn a_failed_fill_waits_a_day_and_the_budget_share_holds_the_lane() {
     );
     assert_eq!(held.diff_fill.remaining, 3);
 }
+
+#[test]
+fn a_held_diff_fill_lease_waits_and_a_run_fatal_error_ends_the_lane() {
+    let dw = warehouse(&["alice"]);
+    let fake = Fake::new(three_prs());
+    run_tick(&dw, &fake, &at(DiffRetention::Transient, 5));
+
+    // Another process holds the lane.
+    dw.connection()
+        .execute(
+            "INSERT INTO collector_leases VALUES ('diff_fill', 't', ?1, ?2, ?3, 'engdash', ?4, ?5)",
+            rusqlite::params![
+                i64::from(std::process::id()),
+                lease::process_start(std::process::id()),
+                lease::host_name(),
+                ago(1),
+                text(Utc::now() + Duration::minutes(10))
+            ],
+        )
+        .unwrap();
+    let held = run_tick(&dw, &fake, &at(DiffRetention::Retain, 5));
+    assert!(
+        held.diff_fill
+            .skipped
+            .as_deref()
+            .is_some_and(|why| why.contains("engdash") && why.contains("filling diffs")),
+        "{held:?}"
+    );
+    assert!(held.diff_fill.filled.is_empty());
+    dw.connection()
+        .execute("DELETE FROM collector_leases", [])
+        .unwrap();
+
+    // A spent budget pauses the lane; nothing is recorded against the PR.
+    fake.with(|w| w.fail_rest = vec![Error::QuotaReserve("core quota at reserve".into())]);
+    let paused = run_tick(&dw, &fake, &at(DiffRetention::Retain, 5));
+    assert!(
+        paused
+            .diff_fill
+            .skipped
+            .as_deref()
+            .is_some_and(|why| why.starts_with("paused at the budget cap")),
+        "{paused:?}"
+    );
+    assert_eq!(count(&dw, "SELECT COUNT(*) FROM collector_diff_fill"), 0);
+
+    // A signed-out gh ends the lane with a note.
+    fake.with(|w| w.fail_rest = vec![Error::GhUnavailable("gh auth login".into())]);
+    let signed_out = run_tick(&dw, &fake, &at(DiffRetention::Retain, 5));
+    assert!(
+        signed_out.notes.iter().any(|n| n.starts_with("diff fill:")),
+        "{signed_out:?}"
+    );
+    assert_eq!(signed_out.diff_fill.remaining, 3);
+}
+
+#[test]
+fn a_failed_patch_write_rolls_back_and_is_retried_later() {
+    let dw = warehouse(&["alice"]);
+    let fake = Fake::new(three_prs());
+    run_tick(&dw, &fake, &at(DiffRetention::Transient, 5));
+    dw.connection()
+        .execute_batch(
+            "CREATE TRIGGER refuse_patch BEFORE UPDATE OF patch ON fact_file_diffs
+             WHEN NEW.pr_key = 'acme/app#1'
+             BEGIN SELECT RAISE(ABORT, 'injected patch'); END;",
+        )
+        .unwrap();
+    let report = run_tick(&dw, &fake, &at(DiffRetention::Retain, 5));
+    assert_eq!(
+        report.diff_fill.filled,
+        ["acme/app#2", "acme/app#3"],
+        "{report:?}"
+    );
+    assert!(
+        report.diff_fill.failed[0].1.contains("injected patch"),
+        "{report:?}"
+    );
+    assert_eq!(
+        count(
+            &dw,
+            "SELECT COUNT(*) FROM pr_detail_state WHERE pr_key = 'acme/app#1' AND diff_stored_at IS NOT NULL"
+        ),
+        0,
+        "rolled back"
+    );
+    assert_eq!(report.diff_fill.remaining, 1);
+}
