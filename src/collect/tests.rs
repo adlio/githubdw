@@ -1472,6 +1472,32 @@ fn a_change_the_search_index_lags_is_found_inside_the_overlap() {
 }
 
 #[test]
+fn coverage_extends_only_when_it_reaches_the_detected_window() {
+    let dw = warehouse(&[]);
+    let conn = dw.connection();
+    let lower = Utc::now() - Duration::hours(DEFAULT_DETECT_OVERLAP_HOURS);
+    let end_of = |key: &str| sync_state::coverage_extent(conn, key).unwrap().unwrap().1;
+    // Ends long before the window: a gap the backfill owns, left alone.
+    sync_state::record_range(conn, "user:old", "2026-01-01", "2026-01-31", 1).unwrap();
+    extend_coverage(conn, "user:old", lower).unwrap();
+    assert_eq!(end_of("user:old"), "2026-01-31");
+    // Ends a day before the window: extended through yesterday.
+    let end = lower.date_naive() - Duration::days(1);
+    let start = end - Duration::days(5);
+    sync_state::record_range(conn, "user:new", &start.to_string(), &end.to_string(), 1).unwrap();
+    extend_coverage(conn, "user:new", lower).unwrap();
+    let today = time_dimension::today_as_of(conn, Utc::now()).unwrap();
+    assert_eq!(end_of("user:new"), (today - Duration::days(1)).to_string());
+    // No coverage at all: nothing recorded.
+    extend_coverage(conn, "user:none", lower).unwrap();
+    assert!(
+        sync_state::coverage_extent(conn, "user:none")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
 fn repository_listings_page_down_to_the_cursor_and_report_bad_answers() {
     let dw = warehouse(&[]);
     monitor_repository::add_repo(dw.connection(), "acme/app").unwrap();
