@@ -45,6 +45,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   write_policy, default_policy_path}`, `Syncer::with_diff_retention`,
   `Syncer::with_policy_source` and `TickPolicy::policy_source`. An existing
   file is ignored and can be deleted.
+- The non-preserving writers no sync uses any more:
+  `storage::repository::{upsert_pull_request, upsert_review,
+  set_file_diff_patch, delete_file_diffs}`. Their `_preserving` forms stay.
 
 ## [0.6.1] - 2026-11-25
 
