@@ -327,6 +327,10 @@ pub async fn summarize_changes(
     report.unclear = notes.iter().filter(|n| n.unclear).count();
     {
         let warehouse = GithubDW::open(db)?;
+        // A sync may hold the write lock for a while; the notes are worth the wait.
+        warehouse
+            .connection()
+            .busy_timeout(std::time::Duration::from_secs(60))?;
         report.written = save_notes(warehouse.connection(), &notes)?;
     }
     report.missing = todo
