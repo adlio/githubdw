@@ -813,6 +813,210 @@ fn a_refused_repository_is_backed_off_for_a_day() {
         "{last}"
     );
     assert!(!second.report_due, "reported once a day");
+
+    // Access comes back: the reconcile-day retry says so and from where.
+    fake.with(|w| w.saml_repos.clear());
+    let back = run_tick(
+        &dw,
+        &fake,
+        &TickPolicy {
+            force_reconcile: true,
+            ..with_repos
+        },
+    );
+    assert!(back.blocked.is_empty(), "{back:?}");
+    assert!(
+        back.notes
+            .iter()
+            .any(|n| n == "1 repos came back, catching up from their first listing (corp/secret)"),
+        "{:?}",
+        back.notes
+    );
+}
+
+/// Pretend the sweep last ran `hours` ago.
+fn sweep_owed_since(dw: &GithubDW, hours: i64) {
+    dw.connection()
+        .execute(
+            "UPDATE collector_state SET last_sweep_at = ?1 WHERE id = 1",
+            [text(Utc::now() - Duration::hours(hours))],
+        )
+        .unwrap();
+}
+
+#[test]
+fn the_sweep_queues_a_change_every_index_files_under_a_stale_time() {
+    let dw = warehouse(&["alice", "bob"]);
+    let fake = Fake::new(two_people());
+    let first = run_tick(&dw, &fake, &eager());
+    assert_eq!(first.fetch.landed, 2, "{first:?}");
+    // Alice's pull request changes now, but search keeps filtering it on a
+    // time three days old: outside the overlap and the reconcile window.
+    let changed = ago(0);
+    fake.with(|w| {
+        w.prs[0].updated_at = changed.clone();
+        let id = w.prs[0].node_id();
+        w.index_at.insert(id, ago(3 * 24 * 60));
+    });
+    let without = TickPolicy {
+        sweep_slices: 0,
+        force_reconcile: true,
+        ..eager()
+    };
+    let missed = run_tick(&dw, &fake, &without);
+    assert_eq!(missed.queued, 0, "even the reconcile misses it: {missed:?}");
+    assert_eq!(missed.points.sweep, 0);
+
+    sweep_owed_since(&dw, 1);
+    fake.with(|w| w.by_id = 0);
+    let swept = run_tick(
+        &dw,
+        &fake,
+        &TickPolicy {
+            sweep_slices: 1,
+            ..eager()
+        },
+    );
+    assert_eq!(swept.outcome, TickOutcome::Detected, "{swept:?}");
+    assert_eq!(swept.detected, 1, "search returns only Bob's, unchanged");
+    assert_eq!((swept.swept, swept.sweep_queued), (2, 1), "{swept:?}");
+    assert_eq!(swept.points.sweep, 1, "one aliased read of both");
+    assert!(
+        swept.cost_line().contains("sweep 1"),
+        "{}",
+        swept.cost_line()
+    );
+    assert_eq!(swept.fetch.landed, 1);
+    assert_eq!(fake.with(|w| w.by_id), 1, "one full fetch, for Alice's");
+    let stored: String = dw
+        .connection()
+        .query_row(
+            "SELECT updated_at FROM fact_pull_requests WHERE number = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(secs(&stored), secs(&changed));
+}
+
+#[test]
+fn a_failed_sweep_slice_is_a_note_and_is_read_again() {
+    let dw = warehouse(&["alice", "bob"]);
+    let fake = Fake::new(two_people());
+    run_tick(&dw, &fake, &eager());
+    let policy = TickPolicy {
+        sweep_slices: 1,
+        ..eager()
+    };
+    sweep_owed_since(&dw, 1);
+    let (_, owed_before) = state::sweep_position(dw.connection()).unwrap();
+    fake.with(|w| w.alias_error = Some("Something went wrong".into()));
+    let failed = run_tick(&dw, &fake, &policy);
+    assert_eq!(failed.outcome, TickOutcome::Detected, "{failed:?}");
+    assert!(
+        failed
+            .notes
+            .iter()
+            .any(|n| n.starts_with("sweep slice 0 failed")),
+        "{:?}",
+        failed.notes
+    );
+    assert_eq!(
+        state::sweep_position(dw.connection()).unwrap().1,
+        owed_before
+    );
+
+    fake.with(|w| w.alias_error = None);
+    let retried = run_tick(&dw, &fake, &policy);
+    assert_eq!(retried.swept, 2, "{retried:?}");
+}
+
+#[test]
+fn the_sweep_rotates_through_its_slices_and_skips_out_of_scope_pull_requests() {
+    let mut prs: Vec<FakePr> = (1..=40)
+        .map(|n| FakePr::new("acme/app", n, "alice", &ago(600), &ago(300)))
+        .collect();
+    // Merged a month ago, and by someone no longer monitored: neither is
+    // swept.
+    let mut old = FakePr::new(
+        "acme/app",
+        41,
+        "alice",
+        &ago(40 * 24 * 60),
+        &ago(30 * 24 * 60),
+    );
+    old.merged_at = Some(ago(30 * 24 * 60));
+    prs.push(old);
+    prs.push(FakePr::new("other/lib", 1, "mallory", &ago(600), &ago(300)));
+    let dw = warehouse(&["alice", "mallory"]);
+    let fake = Fake::new(prs);
+    let mut landed = run_tick(&dw, &fake, &eager()).fetch.landed;
+    // The merged one is older than the first window: let the backfill land it.
+    for _ in 0..3 {
+        landed += run_tick(
+            &dw,
+            &fake,
+            &TickPolicy {
+                backfill_points: 1_000,
+                history_from: Some((Utc::now() - Duration::days(60)).date_naive()),
+                ..eager()
+            },
+        )
+        .backfill
+        .fetch
+        .landed;
+    }
+    assert_eq!(
+        count(&dw, "SELECT COUNT(*) FROM fact_pull_requests"),
+        42,
+        "{landed}"
+    );
+    monitor_repository::remove(dw.connection(), "mallory").unwrap();
+
+    let slices = 3;
+    let policy = TickPolicy {
+        sweep_slices: slices,
+        ..eager()
+    };
+    let expected = |slice: u32| {
+        (1..=40)
+            .filter(|n| queue::sweep_slice_of(&format!("acme/app#{n}"), slices) == slice)
+            .count() as i64
+    };
+    // Each hour reads the next slice, once round and back to the start.
+    let (start, _) = state::sweep_position(dw.connection()).unwrap();
+    let mut total = 0;
+    for step in 0..slices {
+        sweep_owed_since(&dw, 1);
+        let report = run_tick(&dw, &fake, &policy);
+        let slice = (start + step) % slices;
+        assert_eq!(report.swept, expected(slice), "slice {slice}: {report:?}");
+        assert_eq!(report.sweep_queued, 0, "nothing changed");
+        total += report.swept;
+    }
+    assert_eq!(total, 40, "every open or recent pull request once");
+    assert_eq!(
+        state::sweep_position(dw.connection()).unwrap().0,
+        start % slices
+    );
+
+    // Inside the hour nothing is owed.
+    let early = run_tick(&dw, &fake, &policy);
+    assert_eq!((early.swept, early.points.sweep), (0, 0), "{early:?}");
+
+    // After a long gap: one full rotation, then owed from now.
+    sweep_owed_since(&dw, 30);
+    let gap = run_tick(&dw, &fake, &policy);
+    assert_eq!(gap.swept, 40, "{gap:?}");
+    let (_, owed_from) = state::sweep_position(dw.connection()).unwrap();
+    assert!(Utc::now() - owed_from.unwrap() < Duration::minutes(1));
+    let queries = fake.with(|w| w.alias_queries.clone());
+    assert!(
+        queries
+            .iter()
+            .all(|q| !q.contains("number: 41") && !q.contains("\"lib\"")),
+        "closed-and-old and unmonitored pull requests are never swept"
+    );
 }
 
 #[test]

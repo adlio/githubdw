@@ -68,7 +68,38 @@ pub fn ensure_change_notes_table(conn: &Connection) -> Result<()> {
 /// `user_version` stays at 8, so 0.5.x binaries keep opening the warehouse.
 pub fn ensure_collector_tables(conn: &Connection) -> Result<()> {
     conn.execute_batch(include_str!("collector_tables.sql"))?;
-    Ok(())
+    // The live-`updatedAt` sweep's rotation (`collect::sweep`), added to
+    // warehouses whose `collector_state` predates it.
+    add_column_if_missing(conn, "collector_state", "sweep_slice", "INTEGER")?;
+    add_column_if_missing(conn, "collector_state", "last_sweep_at", "TEXT")
+}
+
+/// `ALTER TABLE <table> ADD COLUMN <column> <declaration>` unless the column
+/// exists. For fixed names only: nothing here is user input.
+fn add_column_if_missing(
+    conn: &Connection,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<()> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        [table, column],
+        |r| r.get(0),
+    )?;
+    if exists {
+        return Ok(());
+    }
+    match conn.execute_batch(&format!(
+        "ALTER TABLE {table} ADD COLUMN {column} {declaration}"
+    )) {
+        Ok(()) => Ok(()),
+        // Another process added it between the check and the ALTER.
+        Err(rusqlite::Error::SqliteFailure(_, Some(msg))) if msg.contains("duplicate column") => {
+            Ok(())
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// `sync_locks.holder_pid`: the process holding each lock, so a lock left by

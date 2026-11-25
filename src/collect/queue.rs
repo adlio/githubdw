@@ -693,3 +693,115 @@ pub(crate) fn probe_checks(
     }
     Ok(queued)
 }
+
+/// Aliased `pullRequest(number:) { id updatedAt }` lookups per sweep query.
+/// 100 of these were measured at 1 point on GitHub (2026-11-25), the same
+/// as `nodes(ids:)` with 100 ids, so no stored node id is needed.
+const SWEEP_BATCH: usize = 100;
+
+/// Which of `slices` slices `pr_key` belongs to: FNV-1a of the key, so a
+/// pull request stays in one slice across runs and processes.
+pub(crate) fn sweep_slice_of(pr_key: &str, slices: u32) -> u32 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in pr_key.bytes() {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    (hash % u64::from(slices.max(1))) as u32
+}
+
+/// Read the live `updatedAt` of one slice of the stored pull requests that
+/// are open or were updated since `since`, in the monitored scope (a
+/// monitored repository, or authored or reviewed by a collector member),
+/// and queue each one GitHub reports newer than the stored copy. This reads
+/// the pull request itself, so it finds a change that GitHub's search and
+/// updated-sort indexes still file under an older time: those indexes were
+/// seen to lag 15 hours, and a change older than the reconcile window
+/// before the index catches up is otherwise never found.
+///
+/// shortcut: a closed pull request quiet for longer than `since` that gets
+/// a new comment is not swept, and a brand-new pull request whose first
+/// index entry lags is found only by search; widen the window if an audit
+/// finds misses.
+///
+/// Returns (read, queued), or why GitHub did not answer a batch (the slice
+/// is then read again next run). Errors from `after_query` and run-fatal
+/// GitHub errors pass up.
+pub(crate) fn sweep_stored(
+    syncer: &mut Syncer<'_>,
+    since: DateTime<Utc>,
+    slices: u32,
+    slice: u32,
+    after_query: &mut dyn FnMut() -> Result<()>,
+) -> Result<std::result::Result<(i64, i64), String>> {
+    let conn = syncer.connection();
+    let mut statement = conn.prepare(
+        "SELECT p.pr_key, p.updated_at FROM fact_pull_requests p
+         WHERE (p.state = 'OPEN' OR p.updated_at >= ?1)
+           AND NOT EXISTS (SELECT 1 FROM collector_pr_queue q WHERE q.pr_key = p.pr_key)
+           AND (lower(p.repo_key) IN (SELECT lower(repo_key) FROM monitored_repos
+                                      WHERE sync_enabled = 1)
+                OR p.author_key IN (SELECT 'user:' || login FROM collector_members)
+                OR EXISTS (SELECT 1 FROM fact_reviews r
+                           WHERE r.pr_key = p.pr_key
+                             AND r.reviewer_key IN (SELECT 'user:' || login FROM collector_members)))
+         ORDER BY p.pr_key",
+    )?;
+    let candidates: Vec<(String, Option<String>)> = statement
+        .query_map(
+            [since.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)],
+            |r| Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?)),
+        )?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|(key, _)| sweep_slice_of(key, slices) == slice)
+        .collect();
+    let mut read = 0;
+    let mut queued = 0;
+    for chunk in candidates.chunks(SWEEP_BATCH) {
+        let pairs: Vec<(&(String, Option<String>), String)> = chunk
+            .iter()
+            .filter_map(|c| pull_request_selection(&c.0, "id updatedAt").map(|s| (c, s)))
+            .collect();
+        if pairs.is_empty() {
+            continue;
+        }
+        let selections: Vec<String> = pairs.iter().map(|(_, s)| s.clone()).collect();
+        let answers = match detect::aliased(syncer.client_mut(), &selections) {
+            Ok(answers) => answers,
+            Err(error) if error.is_run_fatal() => return Err(error),
+            Err(error) => return Ok(Err(error.to_string())),
+        };
+        after_query()?;
+        for (((pr_key, stored), _), (value, _)) in pairs.into_iter().zip(answers) {
+            // Gone, or now refused: not this sweep's to judge.
+            let Some(pr) = value.as_ref().and_then(|v| v.get("pullRequest")) else {
+                continue;
+            };
+            let (Some(id), Some(live)) = (
+                pr.get("id").and_then(Value::as_str),
+                pr.get("updatedAt").and_then(Value::as_str),
+            ) else {
+                continue;
+            };
+            read += 1;
+            let newer = match (instant(live), stored.as_deref().and_then(instant)) {
+                (Some(live), Some(stored)) => live > stored,
+                (Some(_), None) => true,
+                _ => false,
+            };
+            if newer {
+                enqueue(
+                    conn,
+                    &Found {
+                        pr_key: pr_key.clone(),
+                        node_id: id.to_string(),
+                        updated_at: live.to_string(),
+                    },
+                )?;
+                queued += 1;
+            }
+        }
+    }
+    Ok(Ok((read, queued)))
+}

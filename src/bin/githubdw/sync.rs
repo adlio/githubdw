@@ -513,6 +513,12 @@ fn print_tick(report: &githubdw::collect::TickReport) {
         TickOutcome::Stopped => println!("stopped"),
         TickOutcome::SignIn { reason } => eprintln!("GitHub sign-in needed: {reason}"),
     }
+    if report.swept > 0 || report.points.sweep > 0 {
+        println!(
+            "sweep: read {} stored pull request(s) live ({} points), {} newer than stored",
+            report.swept, report.points.sweep, report.sweep_queued
+        );
+    }
     let backfill = &report.backfill;
     if let Some(why) = &backfill.skipped {
         println!("backfill: {why} ({} login(s) owed)", backfill.remaining);
@@ -607,6 +613,8 @@ mod exit_code_tests {
                 rest_calls: 0,
                 detected: 0,
                 queued: 0,
+                swept: 3,
+                sweep_queued: 1,
                 fetch: FetchSummary::default(),
                 backfill: BackfillSummary {
                     skipped: (index % 2 == 0).then(|| "budget".to_string()),

@@ -98,6 +98,14 @@ const WALK_MARGIN_HOURS: i64 = 2;
 /// requests the window returns unchanged are skipped, not fetched again.
 pub const DEFAULT_DETECT_OVERLAP_HOURS: i64 = 12;
 
+/// Default [`TickPolicy::sweep_window`]: closed pull requests last updated
+/// longer ago than this are not swept.
+pub const DEFAULT_SWEEP_WINDOW_DAYS: i64 = 14;
+
+/// Default [`TickPolicy::sweep_slices`]: with an hourly `sweep_every`, every
+/// swept pull request is read live about every 12 hours.
+pub const DEFAULT_SWEEP_SLICES: u32 = 12;
+
 /// History a new login or repository gets when no `history_from` is set,
 /// matching the 0.5 walks' first window.
 const DEFAULT_HISTORY_DAYS: i64 = 90;
@@ -117,6 +125,17 @@ pub struct TickPolicy {
     pub reconcile_every: Duration,
     /// How far back the reconcile walk reads.
     pub reconcile_window: Duration,
+    /// The live-`updatedAt` sweep reads every stored pull request that is
+    /// open or was updated within this window, in the monitored scope
+    /// ([`DEFAULT_SWEEP_WINDOW_DAYS`] by default). It reads each pull request
+    /// itself, so a change GitHub's search and updated-sort indexes still
+    /// file under an older time is found anyway.
+    pub sweep_window: Duration,
+    /// One sweep slice is owed per `sweep_every`, read on the next detection.
+    pub sweep_every: Duration,
+    /// How many slices the sweep set is split into; each is read once per
+    /// `sweep_slices × sweep_every`. 0 turns the sweep off.
+    pub sweep_slices: u32,
     /// Oldest created date wanted for each monitored login. Remembered per
     /// login (the earliest date any caller asked for wins), so a backfill
     /// one process asked for continues in another. `None` asks for nothing
@@ -170,6 +189,9 @@ impl Default for TickPolicy {
             overlap: Duration::hours(DEFAULT_DETECT_OVERLAP_HOURS),
             reconcile_every: Duration::hours(24),
             reconcile_window: Duration::hours(48),
+            sweep_window: Duration::days(DEFAULT_SWEEP_WINDOW_DAYS),
+            sweep_every: Duration::hours(1),
+            sweep_slices: DEFAULT_SWEEP_SLICES,
             history_from: None,
             max_rate_use: None,
             backfill_share: 0.5,
@@ -221,11 +243,13 @@ pub struct PhasePoints {
     pub reconcile: i64,
     pub logins: i64,
     pub backfill: i64,
+    /// The live-`updatedAt` sweep of stored pull requests.
+    pub sweep: i64,
 }
 
 impl PhasePoints {
     pub fn total(&self) -> i64 {
-        self.detect + self.fetch + self.reconcile + self.logins + self.backfill
+        self.detect + self.fetch + self.reconcile + self.logins + self.backfill + self.sweep
     }
 }
 
@@ -254,6 +278,10 @@ pub struct TickReport {
     /// Pull requests detection returned, and how many needed a full fetch.
     pub detected: i64,
     pub queued: i64,
+    /// Stored pull requests the sweep read live, and how many of them it
+    /// queued (also counted in `queued`).
+    pub swept: i64,
+    pub sweep_queued: i64,
     pub fetch: FetchSummary,
     pub backfill: BackfillSummary,
     pub diff_fill: diff_fill::DiffFillSummary,
@@ -273,13 +301,14 @@ impl TickReport {
     pub fn cost_line(&self) -> String {
         let p = &self.points;
         format!(
-            "tick: {} points (detect {}, fetch {}, reconcile {}, logins {}, backfill {}); {} REST calls",
+            "tick: {} points (detect {}, fetch {}, reconcile {}, logins {}, backfill {}, sweep {}); {} REST calls",
             p.total(),
             p.detect,
             p.fetch,
             p.reconcile,
             p.logins,
             p.backfill,
+            p.sweep,
             self.rest_calls
         )
     }
@@ -353,6 +382,8 @@ pub fn tick(
         rest_calls: 0,
         detected: 0,
         queued: 0,
+        swept: 0,
+        sweep_queued: 0,
         fetch: FetchSummary::default(),
         backfill: BackfillSummary::default(),
         diff_fill: diff_fill::DiffFillSummary::default(),
@@ -832,6 +863,7 @@ fn detect(
             reconcile_due,
             &mut found,
             &mut gaps,
+            &mut report.notes,
             &mut renew,
         )?;
     }
@@ -843,6 +875,11 @@ fn detect(
     };
     report.queued += queue::probe_unfinished_checks(syncer, bound - window, 300, &mut renew)?;
     report.points.detect += points(syncer) - before;
+
+    // The owed slices of the live-`updatedAt` sweep (index lag).
+    let before = points(syncer);
+    sweep(syncer, policy, bound, &mut renew, report)?;
+    report.points.sweep += points(syncer) - before;
 
     // Daily: the same walk over the 48 hours before this one (index lag).
     if reconcile_due {
@@ -904,6 +941,58 @@ fn detect(
         return Ok(TickOutcome::Incomplete { gaps });
     }
     Ok(TickOutcome::Detected)
+}
+
+/// Read the slices of the live-`updatedAt` sweep owed since the last one:
+/// one per [`TickPolicy::sweep_every`], at most one full rotation. The
+/// rotation position and the time it is owed from are kept in
+/// `collector_state`, and advance only when a slice was read in full, so a
+/// failed slice is read again on the next detection. A failed slice is a
+/// note, not a gap: the searches and listings already ran, and holding the
+/// shared cursor would not help the sweep.
+fn sweep(
+    syncer: &mut Syncer<'_>,
+    policy: &TickPolicy,
+    now: DateTime<Utc>,
+    renew: &mut dyn FnMut() -> Result<()>,
+    report: &mut TickReport,
+) -> Result<()> {
+    let slices = policy.sweep_slices;
+    if slices == 0 {
+        return Ok(());
+    }
+    let every = policy.sweep_every.max(Duration::minutes(1));
+    let conn = syncer.connection();
+    let (mut slice, mut owed_from) = state::sweep_position(conn)?;
+    let owed = owed_from.map_or(1, |at| {
+        ((now - at).num_seconds() / every.num_seconds()).max(0)
+    });
+    let since = now - policy.sweep_window;
+    for _ in 0..owed.min(i64::from(slices)) {
+        slice %= slices;
+        match queue::sweep_stored(syncer, since, slices, slice, renew)? {
+            Ok((read, queued)) => {
+                report.swept += read;
+                report.sweep_queued += queued;
+                report.queued += queued;
+            }
+            Err(reason) => {
+                report.notes.push(format!(
+                    "sweep slice {slice} failed, read again next run: {reason}"
+                ));
+                break;
+            }
+        }
+        slice = (slice + 1) % slices;
+        // Owed from one interval later; after a long gap (a machine that
+        // was off), from now, so the backlog is one rotation at most.
+        owed_from = Some(match owed_from {
+            Some(at) if now - at < every * (slices as i32 + 1) => at + every,
+            _ => now,
+        });
+        state::save_sweep_position(conn, slice, owed_from.unwrap_or(now))?;
+    }
+    Ok(())
 }
 
 fn batched_expression(role: UserRole, logins: &[&String]) -> String {
@@ -1081,10 +1170,16 @@ fn repositories(
     reconcile_due: bool,
     found: &mut Vec<detect::Found>,
     gaps: &mut Vec<String>,
+    notes: &mut Vec<String>,
     renew: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
     let conn = syncer.connection();
     let now = Utc::now();
+    let was_blocked: HashSet<String> = blocked_sources(conn)?
+        .into_iter()
+        .map(|b| b.source)
+        .collect();
+    let mut came_back: Vec<String> = Vec::new();
     let mut repos: Vec<String> = monitor_repository::list(conn)?
         .into_iter()
         .filter(|s| s.source_type == "repo" && s.sync_enabled)
@@ -1110,6 +1205,9 @@ fn repositories(
         for (repo, (value, error)) in chunk.iter().zip(answers) {
             match (value, error) {
                 (Some(value), _) => {
+                    if was_blocked.contains(repo) {
+                        came_back.push(repo.clone());
+                    }
                     state::clear_backoff(conn, repo)?;
                     heads.insert(
                         repo.clone(),
@@ -1136,6 +1234,22 @@ fn repositories(
                 )),
             }
         }
+    }
+    if !came_back.is_empty() {
+        // Say why this tick may list far more than usual: each listing
+        // catches up from the cursor the repository stopped at.
+        let mut oldest: Option<String> = None;
+        for repo in &came_back {
+            if let Some(cursor) = sync_state::last_updated_cursor(conn, "repo", repo)? {
+                oldest = Some(oldest.map_or(cursor.clone(), |o| o.min(cursor)));
+            }
+        }
+        notes.push(format!(
+            "{} repos came back, catching up from {} ({})",
+            came_back.len(),
+            oldest.as_deref().unwrap_or("their first listing"),
+            came_back.join(", ")
+        ));
     }
     for (repo, (pr_head, issue_head)) in heads {
         let pr_cursor = sync_state::last_updated_cursor(conn, "repo", &repo)?;
