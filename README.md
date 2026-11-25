@@ -133,7 +133,10 @@ collectors on one warehouse never repeat each other's work:
 - **Detect** (when the last complete detection is over 30 minutes old). One
   light search per role names every monitored user at once (`is:pr
   author:a author:b … updated:<since>..<now>`) and returns only ids and
-  timestamps, for about 1 point per 100 pull requests. One aliased query reads
+  timestamps, for about 1 point per 100 pull requests. `<since>` is 12 hours
+  before the last detection, because GitHub's search index can filter on an
+  `updatedAt` several hours older than the real one (`TickPolicy::overlap`
+  changes it). One aliased query reads
   every monitored repository's newest pull-request and issue update. Only pull
   requests that are new, newer than the stored copy, stored incomplete, or
   waiting on check runs (which do not move `updatedAt`) are fetched in full, by

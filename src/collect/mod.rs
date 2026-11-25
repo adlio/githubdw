@@ -80,6 +80,14 @@ const LOGINS_PER_SEARCH: usize = 200;
 /// Window before the first detection, for a login with old per-user state.
 const WALK_MARGIN_HOURS: i64 = 2;
 
+/// Default [`TickPolicy::overlap`]: how far before the cursor each detection
+/// re-reads. GitHub's search index can filter a pull request on an
+/// `updatedAt` hours older than its real one (9 h 20 min was measured), while
+/// the results themselves carry the real value. Re-reading 12 hours catches
+/// such a change on the next tick instead of the daily reconcile; pull
+/// requests the window returns unchanged are skipped, not fetched again.
+pub const DEFAULT_DETECT_OVERLAP_HOURS: i64 = 12;
+
 /// History a new login or repository gets when no `history_from` is set,
 /// matching the 0.5 walks' first window.
 const DEFAULT_HISTORY_DAYS: i64 = 90;
@@ -91,7 +99,8 @@ pub struct TickPolicy {
     pub program: String,
     /// Detection runs when the last complete one is older than this.
     pub detect_every: Duration,
-    /// How far before the cursor each detection re-reads, for search-index lag.
+    /// How far before the cursor each detection re-reads, for search-index
+    /// lag ([`DEFAULT_DETECT_OVERLAP_HOURS`] by default).
     pub overlap: Duration,
     /// How often the wide reconcile walk, login check and refused-source
     /// retry run.
@@ -143,7 +152,7 @@ impl Default for TickPolicy {
         Self {
             program: "githubdw".into(),
             detect_every: Duration::minutes(30),
-            overlap: Duration::hours(1),
+            overlap: Duration::hours(DEFAULT_DETECT_OVERLAP_HOURS),
             reconcile_every: Duration::hours(24),
             reconcile_window: Duration::hours(48),
             history_from: None,
