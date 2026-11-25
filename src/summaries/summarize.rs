@@ -106,35 +106,38 @@ fn schema() -> Value {
 /// Ask the model about each batch, `PARALLEL` at a time. Replies are kept
 /// only for ids that were in their own batch and carry a non-empty note.
 async fn ask_all(
-    model: &Arc<dyn NoteModel>,
+    model: &dyn NoteModel,
     purpose: &'static str,
     prompt: &str,
     batches: Vec<Vec<Value>>,
     report: &mut SummarizeReport,
 ) -> Vec<Reply> {
-    let mut pending = batches.into_iter();
-    let mut running = tokio::task::JoinSet::new();
+    use futures::stream::{self, StreamExt};
+    let system = format!("{prompt}\n{NOTE_RULES}");
+    let outcomes: Vec<(HashSet<String>, Result<Value>)> = stream::iter(batches)
+        .map(|batch| {
+            let ids: HashSet<String> = batch
+                .iter()
+                .filter_map(|v| v["id"].as_str().map(str::to_string))
+                .collect();
+            let request = NoteRequest {
+                purpose,
+                system: system.clone(),
+                input: json!({"changes": batch}),
+                schema: schema(),
+            };
+            async move {
+                let outcome = model.complete(&request).await;
+                (ids, outcome)
+            }
+        })
+        .buffer_unordered(PARALLEL)
+        .collect()
+        .await;
     let mut replies = Vec::new();
-    let spawn = |running: &mut tokio::task::JoinSet<_>, batch: Vec<Value>| {
-        let model = model.clone();
-        let ids: HashSet<String> = batch
-            .iter()
-            .filter_map(|v| v["id"].as_str().map(str::to_string))
-            .collect();
-        let request = NoteRequest {
-            purpose,
-            system: format!("{prompt}\n{NOTE_RULES}"),
-            input: json!({"changes": batch}),
-            schema: schema(),
-        };
-        running.spawn(async move { (ids, model.complete(&request).await) });
-    };
-    for batch in pending.by_ref().take(PARALLEL) {
-        spawn(&mut running, batch);
-    }
-    while let Some(done) = running.join_next().await {
-        match done {
-            Ok((ids, Ok(value))) => {
+    for (ids, outcome) in outcomes {
+        match outcome {
+            Ok(value) => {
                 let batch: Vec<Reply> =
                     serde_json::from_value(value["notes"].clone()).unwrap_or_default();
                 replies.extend(batch.into_iter().filter_map(|mut r| {
@@ -142,13 +145,7 @@ async fn ask_all(
                     (ids.contains(&r.id) && !r.note.is_empty()).then_some(r)
                 }));
             }
-            Ok((_, Err(error))) => report.errors.push(format!("{purpose}: {error}")),
-            Err(error) => report
-                .errors
-                .push(format!("{purpose}: task stopped: {error}")),
-        }
-        if let Some(batch) = pending.next() {
-            spawn(&mut running, batch);
+            Err(error) => report.errors.push(format!("{purpose}: {error}")),
         }
     }
     replies
@@ -234,7 +231,7 @@ async fn live_excerpts(
 pub async fn summarize_changes(
     db: &Path,
     pr_keys: &[String],
-    model: Arc<dyn NoteModel>,
+    model: &dyn NoteModel,
     options: &SummarizeOptions,
 ) -> Result<SummarizeReport> {
     let mut report = SummarizeReport {
@@ -269,7 +266,7 @@ pub async fn summarize_changes(
         .chunks(BATCH)
         .map(|b| b.iter().map(|(_, i)| i.value.clone()).collect())
         .collect();
-    let mut replies = ask_all(&model, "change_notes", NOTE_PROMPT, batches, &mut report).await;
+    let mut replies = ask_all(model, "change_notes", NOTE_PROMPT, batches, &mut report).await;
 
     let unclear: Vec<String> = replies
         .iter()
@@ -289,7 +286,7 @@ pub async fn summarize_changes(
             .collect();
         let batches: Vec<Vec<Value>> = inputs.chunks(DIFF_BATCH).map(<[Value]>::to_vec).collect();
         let better: HashMap<String, String> = ask_all(
-            &model,
+            model,
             "change_notes_diff",
             DIFF_PROMPT,
             batches,
@@ -435,7 +432,7 @@ mod tests {
         let (_dir, path, mut keys) = warehouse(30);
         keys.push("nobody/none#9".into());
         let model = fake(false, false);
-        let report = summarize_changes(&path, &keys, model.clone(), &no_diffs())
+        let report = summarize_changes(&path, &keys, &*model, &no_diffs())
             .await
             .unwrap();
         assert_eq!(report.written, 30);
@@ -443,7 +440,7 @@ mod tests {
         let mut sizes: Vec<usize> = model.asked.lock().unwrap().iter().map(|a| a.1).collect();
         sizes.sort();
         assert_eq!(sizes, [5, 25]);
-        let again = summarize_changes(&path, &keys, model.clone(), &no_diffs())
+        let again = summarize_changes(&path, &keys, &*model, &no_diffs())
             .await
             .unwrap();
         assert_eq!((again.already_current, again.written), (30, 0));
@@ -466,13 +463,13 @@ mod tests {
     async fn a_failed_batch_is_reported_and_retried_on_the_next_call() {
         let (_dir, path, keys) = warehouse(3);
         let model = fake(false, true);
-        let first = summarize_changes(&path, &keys, model.clone(), &no_diffs())
+        let first = summarize_changes(&path, &keys, &*model, &no_diffs())
             .await
             .unwrap();
         assert_eq!(first.written, 0);
         assert_eq!(first.missing.len(), 3);
         assert_eq!(first.errors.len(), 1);
-        let second = summarize_changes(&path, &keys, model, &no_diffs())
+        let second = summarize_changes(&path, &keys, &*model, &no_diffs())
             .await
             .unwrap();
         assert_eq!(second.written, 3);
@@ -481,7 +478,7 @@ mod tests {
     #[tokio::test]
     async fn unclear_notes_without_a_diff_client_keep_the_best_guess() {
         let (_dir, path, keys) = warehouse(2);
-        let report = summarize_changes(&path, &keys, fake(true, false), &no_diffs())
+        let report = summarize_changes(&path, &keys, &*fake(true, false), &no_diffs())
             .await
             .unwrap();
         assert_eq!((report.written, report.unclear), (2, 2));

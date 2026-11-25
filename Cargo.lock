@@ -1169,6 +1169,7 @@ dependencies = [
  "chrono-tz",
  "clap",
  "dirs 6.0.0",
+ "futures",
  "mixtape-core",
  "rmcp",
  "rusqlite",

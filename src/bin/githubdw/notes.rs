@@ -108,8 +108,7 @@ fn summarize(
         if no_diffs {
             options.diff_client = None;
         }
-        githubdw::summaries::summarize_changes(&path, &keys, std::sync::Arc::new(model), &options)
-            .await
+        githubdw::summaries::summarize_changes(&path, &keys, &model, &options).await
     })?;
     println!(
         "{} written ({} unclear), {} already current, {} unknown, {} live diffs, {} missing",

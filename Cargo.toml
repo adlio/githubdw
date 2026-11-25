@@ -35,6 +35,7 @@ sha2 = "0.10"
 mixtape-core = { version = "0.6", features = ["bedrock"], optional = true }
 aws-config = { version = "1", optional = true }
 aws-sdk-bedrockruntime = { version = "1", optional = true }
+futures = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3.20"
@@ -42,7 +43,12 @@ tempfile = "3.20"
 [features]
 default = []
 # Change notes written by a model (Bedrock via mixtape-core). Opt-in.
-summaries = ["dep:mixtape-core", "dep:aws-config", "dep:aws-sdk-bedrockruntime"]
+summaries = [
+    "dep:mixtape-core",
+    "dep:aws-config",
+    "dep:aws-sdk-bedrockruntime",
+    "dep:futures",
+]
 
 [[bin]]
 name = "githubdw"
