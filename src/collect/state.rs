@@ -76,6 +76,35 @@ pub(crate) fn raw_state(conn: &Connection) -> Result<RawState> {
         .unwrap_or_default())
 }
 
+/// The sweep's next slice and the time its next slice is owed from.
+/// Kept apart from [`raw_state`] because the columns are added by
+/// [`crate::storage::schema::ensure_collector_tables`], which a read-only
+/// status reader may not have run.
+pub(crate) fn sweep_position(conn: &Connection) -> Result<(u32, Option<DateTime<Utc>>)> {
+    Ok(conn
+        .query_row(
+            "SELECT sweep_slice, last_sweep_at FROM collector_state WHERE id = 1",
+            [],
+            |r| Ok((r.get::<_, Option<u32>>(0)?.unwrap_or(0), parse(r.get(1)?))),
+        )
+        .optional()?
+        .unwrap_or_default())
+}
+
+pub(crate) fn save_sweep_position(
+    conn: &Connection,
+    slice: u32,
+    owed_from: DateTime<Utc>,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO collector_state (id, sweep_slice, last_sweep_at) VALUES (1, ?1, ?2)
+         ON CONFLICT (id) DO UPDATE SET
+             sweep_slice = excluded.sweep_slice, last_sweep_at = excluded.last_sweep_at",
+        params![slice, text(owed_from)],
+    )?;
+    Ok(())
+}
+
 pub(crate) fn detect_cursor(conn: &Connection) -> Result<Option<DateTime<Utc>>> {
     Ok(raw_state(conn)?.detect_cursor)
 }

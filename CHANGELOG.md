@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-25
+
+### Added
+
+- Live-`updatedAt` sweep in `collect::tick`: each detection reads the slices
+  owed (one per `TickPolicy::sweep_every`, default 1 hour) of the stored pull
+  requests that are open or were updated within `sweep_window` (default 14
+  days) and are in the monitored scope, with aliased `pullRequest(number:)
+  { id updatedAt }` lookups in batches of 100 (about 1 point each). The set
+  is split into `sweep_slices` (default 12) by a stable hash of the pull
+  request key, so each is read about every 12 hours. A pull request GitHub
+  reports newer than the stored copy is queued and fetched in full. This
+  finds changes that GitHub's search and updated-sort indexes keep under an
+  older time for longer than the detect overlap or the reconcile window. The
+  rotation lives in two new `collector_state` columns, added on open with no
+  `user_version` change. A slice GitHub does not answer is a tick note and is
+  read again next run.
+- `PhasePoints::sweep`, `TickReport::swept` and `TickReport::sweep_queued`;
+  the cost line gains `sweep N`, and `githubdw sync all` prints a sweep line.
+- The daily retry of refused repositories adds a note such as
+  `2 repos came back, catching up from 2026-11-19T17:23:00Z (…)`, so a large
+  catch-up tick explains itself.
+
+### Changed
+
+- Breaking: `PhasePoints` and `TickReport` have new public fields, so code
+  that builds them with struct literals must add them. `TickPolicy` has new
+  fields; `..TickPolicy::default()` keeps working.
+
 ## [0.8.0] - 2026-11-25
 
 ### Added

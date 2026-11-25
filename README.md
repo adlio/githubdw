@@ -173,6 +173,18 @@ collectors on one warehouse never repeat each other's work:
   walk also covers the previous 48 hours (search-index lag), checks that every
   monitored login still resolves, and retries repositories GitHub refused
   (SAML, IP allow list), which are otherwise asked only once a day.
+- **Sweep** (one slice an hour, inside detection). Search and the
+  updated-sort repository listings can both file a change under an older
+  time for hours, so detection alone does not promise to see it. The sweep
+  reads the live `updatedAt` of every stored pull request that is open or was
+  updated in the last 14 days and is in the monitored scope, with aliased
+  `pullRequest(number:)` lookups at about 1 point per 100. The set is split
+  into 12 slices read one per hour, so each pull request is read at least
+  every 12 hours plus one detection; any that GitHub reports newer than the
+  stored copy is fetched in full. `TickPolicy::sweep_window`, `sweep_every`
+  and `sweep_slices` change it (`sweep_slices: 0` turns it off). It cannot
+  see a pull request the warehouse has never stored, or a closed one quiet
+  for longer than the window.
 - **Backfill** (while under half the hourly budget is used, at most 1,000
   points per tick). People whose older per-user state stops short get a
   catch-up first; then history back to `--history-from` (remembered per user)
@@ -184,7 +196,7 @@ then parked after 5 attempts and retried daily, so it never holds back the
 shared cursor. Detect and backfill each take their own lease in
 `githubdw.db`; a run that finds the detect lease held reports who holds it
 and exits 0. Every run ends with one cost line, for example
-`tick: 3 points (detect 3, fetch 0, reconcile 0, logins 0, backfill 0); 0 REST calls`.
+`tick: 3 points (detect 3, fetch 0, reconcile 0, logins 0, backfill 0, sweep 0); 0 REST calls`.
 Blocked repositories, parked pull requests and unresolved logins are printed
 once a day.
 
