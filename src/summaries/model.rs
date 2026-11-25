@@ -48,10 +48,6 @@ impl BedrockNoteModel {
     /// Load AWS configuration for `aws_profile` (the SDK default chain when
     /// `None`) in `region` (the profile's own Region when `None`).
     pub async fn new(aws_profile: Option<&str>, model: &str, region: Option<&str>) -> Result<Self> {
-        let target = model.trim();
-        if target.is_empty() {
-            return Err(Error::InvalidArgument("a model is required".into()));
-        }
         let mut loader = aws_config::defaults(aws_config::BehaviorVersion::latest());
         if let Some(profile) = aws_profile.filter(|p| !p.trim().is_empty()) {
             loader = loader.profile_name(profile.trim());
@@ -59,11 +55,19 @@ impl BedrockNoteModel {
         if let Some(region) = region.filter(|r| !r.trim().is_empty()) {
             loader = loader.region(aws_config::Region::new(region.trim().to_string()));
         }
-        let sdk = loader.load().await;
+        Self::from_sdk(&loader.load().await, model)
+    }
+
+    /// Use an AWS configuration the caller has already loaded.
+    pub fn from_sdk(sdk: &aws_config::SdkConfig, model: &str) -> Result<Self> {
+        let target = model.trim();
+        if target.is_empty() {
+            return Err(Error::InvalidArgument("a model is required".into()));
+        }
         let model_id = model_id(target);
         let runtime = RuntimeBedrockModel::new(&model_id, &model_id, 200_000, 8_192)
             .map_err(|e| Error::Llm(e.to_string()))?;
-        let client_config = aws_sdk_bedrockruntime::config::Builder::from(&sdk)
+        let client_config = aws_sdk_bedrockruntime::config::Builder::from(sdk)
             .retry_config(aws_config::retry::RetryConfig::standard().with_max_attempts(1))
             .build();
         let provider = BedrockProvider::with_client(
@@ -121,7 +125,9 @@ impl NoteModel for BedrockNoteModel {
                     Ok(Err(error)) => last = error.to_string(),
                     Err(_) => last = "model request timed out".into(),
                 }
-                tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                if attempt < 2 {
+                    tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
+                }
             }
             Err(Error::Llm(format!(
                 "model call failed after 3 attempts: {last}"
@@ -174,6 +180,110 @@ mod tests {
             "anthropic.m-v1:0"
         );
         assert_eq!(model_id("moonshotai.kimi-k3"), "moonshotai.kimi-k3");
+    }
+
+    /// Answer `replies.len()` HTTP requests on a local port, one canned
+    /// Converse body each, and return the endpoint URL.
+    fn converse_server(replies: Vec<String>) -> String {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            for reply in replies {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buf = [0u8; 8192];
+                // Read headers, then the body by Content-Length.
+                loop {
+                    let n = stream.read(&mut buf).unwrap();
+                    request.extend_from_slice(&buf[..n]);
+                    let text = String::from_utf8_lossy(&request);
+                    if let Some(end) = text.find("\r\n\r\n") {
+                        let length = text[..end]
+                            .lines()
+                            .find_map(|l| {
+                                let (k, v) = l.split_once(':')?;
+                                k.eq_ignore_ascii_case("content-length")
+                                    .then(|| v.trim().parse::<usize>().ok())?
+                            })
+                            .unwrap_or(0);
+                        if request.len() >= end + 4 + length {
+                            break;
+                        }
+                    }
+                    if n == 0 {
+                        break;
+                    }
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                    reply.len()
+                );
+                stream.write_all(response.as_bytes()).unwrap();
+            }
+        });
+        url
+    }
+
+    fn converse(text: &str, stop: &str) -> String {
+        serde_json::json!({
+            "output": {"message": {"role": "assistant", "content": [{"text": text}]}},
+            "stopReason": stop,
+            "usage": {"inputTokens": 1, "outputTokens": 1, "totalTokens": 2},
+            "metrics": {"latencyMs": 1},
+        })
+        .to_string()
+    }
+
+    fn model(endpoint: &str) -> BedrockNoteModel {
+        use aws_sdk_bedrockruntime::config::{Credentials, SharedCredentialsProvider};
+        let sdk = aws_config::SdkConfig::builder()
+            .behavior_version(aws_config::BehaviorVersion::latest())
+            .region(aws_config::Region::new("us-west-2"))
+            .endpoint_url(endpoint)
+            .credentials_provider(SharedCredentialsProvider::new(Credentials::new(
+                "AKIDTEST", "secret", None, None, "test",
+            )))
+            .build();
+        BedrockNoteModel::from_sdk(&sdk, "us.anthropic.claude-test-v1:0").unwrap()
+    }
+
+    fn request() -> NoteRequest {
+        NoteRequest {
+            purpose: "change_notes",
+            system: "Write notes.".into(),
+            input: serde_json::json!({"changes": []}),
+            schema: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_converse_reply_is_read_as_its_json_object() {
+        let url = converse_server(vec![converse("Here:\n{\"notes\": []}", "end_turn")]);
+        let model = model(&url);
+        assert_eq!(model.label(), "us.anthropic.claude-test-v1:0");
+        let value = model.complete(&request()).await.unwrap();
+        assert_eq!(value, serde_json::json!({"notes": []}));
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_json_or_cut_off_is_retried_then_refused() {
+        let url = converse_server(vec![
+            converse("no json here", "end_turn"),
+            converse("{\"notes\": [", "max_tokens"),
+            converse("still none", "end_turn"),
+        ]);
+        let error = model(&url).complete(&request()).await.unwrap_err();
+        assert!(error.to_string().contains("after 3 attempts"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_empty_model_is_refused() {
+        let error = BedrockNoteModel::new(None, "  ", Some("us-west-2"))
+            .await
+            .err()
+            .unwrap();
+        assert!(error.to_string().contains("a model is required"), "{error}");
     }
 
     #[test]

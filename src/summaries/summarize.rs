@@ -371,12 +371,20 @@ mod tests {
                 if std::mem::take(&mut *self.fail_first.lock().unwrap()) {
                     return Err(Error::Llm("synthetic failure".into()));
                 }
+                let diff = request.purpose == "change_notes_diff";
                 let notes: Vec<Value> = changes
                     .iter()
                     .map(|c| {
-                        json!({"id": c["id"], "note": format!("Adds {}.", c["title"].as_str().unwrap_or("")), "unclear": self.unclear})
+                        let note = if diff {
+                            format!("Changes {}.", c["diff"][0]["path"].as_str().unwrap_or(""))
+                        } else {
+                            format!("Adds {}.", c["title"].as_str().unwrap_or(""))
+                        };
+                        json!({"id": c["id"], "note": note, "unclear": self.unclear && !diff})
                     })
-                    .chain([json!({"id": "someone/else#1", "note": "Not asked.", "unclear": false})])
+                    .chain([
+                        json!({"id": "someone/else#1", "note": "Not asked.", "unclear": false}),
+                    ])
                     .collect();
                 Ok(json!({"notes": notes}))
             })
@@ -486,5 +494,115 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((report.written, report.unclear), (2, 2));
+    }
+
+    /// The fake GitHub, answering `gh auth status` as signed in.
+    struct SignedIn(crate::collection::tests::fake::FakeGitHub);
+
+    impl crate::fetch::GhTransport for SignedIn {
+        fn run(&self, arguments: &[String]) -> Result<String> {
+            if arguments.first().map(String::as_str) == Some("auth") {
+                return Ok(String::new());
+            }
+            self.0.run(arguments)
+        }
+    }
+
+    fn github(numbers: &[i64]) -> (crate::collection::tests::fake::FakeGitHub, ClientFactory) {
+        use crate::collection::tests::fake::{FakeGitHub, FakePr};
+        let world = FakeGitHub::new(
+            numbers
+                .iter()
+                .map(|&n| {
+                    FakePr::new(
+                        "octocat/hello",
+                        n,
+                        "octocat",
+                        "2026-01-05T18:00:00Z",
+                        "2026-01-05T18:00:00Z",
+                    )
+                })
+                .collect(),
+        );
+        let shared = world.clone();
+        let factory: ClientFactory = Arc::new(move || {
+            GhClient::with_transport(Box::new(SignedIn(shared.clone()))).without_sleeping()
+        });
+        (world, factory)
+    }
+
+    fn with_diffs(factory: ClientFactory) -> SummarizeOptions {
+        SummarizeOptions {
+            written_by: "test".into(),
+            diff_client: Some(factory),
+        }
+    }
+
+    #[tokio::test]
+    async fn unclear_notes_are_rewritten_from_live_diffs() {
+        let (_dir, path, keys) = warehouse(2);
+        // Only #1 exists on GitHub: #2's diff read fails and keeps its guess.
+        let (_github, factory) = github(&[1]);
+        let model = fake(true, false);
+        let report = summarize_changes(&path, &keys, &*model, &with_diffs(factory))
+            .await
+            .unwrap();
+        assert_eq!(report.diffs_fetched, 1);
+        assert_eq!((report.written, report.unclear), (2, 1));
+        assert!(
+            report.errors.iter().any(|e| e.contains("octocat/hello#2")),
+            "{:?}",
+            report.errors
+        );
+        let notes = change_notes(GithubDW::open(&path).unwrap().connection(), &keys).unwrap();
+        assert_eq!(notes["octocat/hello#1"].note, "Changes src/lib.rs.");
+        assert!(!notes["octocat/hello#1"].unclear);
+        assert!(notes["octocat/hello#2"].unclear);
+    }
+
+    #[tokio::test]
+    async fn a_spent_budget_stops_the_diff_reads() {
+        let (_dir, path, keys) = warehouse(2);
+        let (github, factory) = github(&[1, 2]);
+        github.0.lock().unwrap().fail_next.push(Error::RateLimited {
+            resource: "core".into(),
+            wake_at: chrono::Utc::now(),
+            reason: "spent".into(),
+        });
+        let report = summarize_changes(&path, &keys, &*fake(true, false), &with_diffs(factory))
+            .await
+            .unwrap();
+        assert_eq!(report.diffs_fetched, 0);
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("live diffs stopped")),
+            "{:?}",
+            report.errors
+        );
+        assert_eq!(report.written, 2, "the first-pass guesses are still stored");
+    }
+
+    #[tokio::test]
+    async fn a_signed_out_gh_skips_the_diff_pass() {
+        let (_dir, path, keys) = warehouse(1);
+        let factory: ClientFactory = Arc::new(|| {
+            GhClient::with_transport(Box::new(crate::fetch::test_support::FixtureTransport::new(
+                vec![Err(Error::GitHubApi("not signed in".into()))],
+            )))
+        });
+        let report = summarize_changes(&path, &keys, &*fake(true, false), &with_diffs(factory))
+            .await
+            .unwrap();
+        assert!(
+            report
+                .errors
+                .iter()
+                .any(|e| e.contains("live diffs skipped")),
+            "{:?}",
+            report.errors
+        );
+        assert_eq!(report.written, 1);
     }
 }
