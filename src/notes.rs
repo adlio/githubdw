@@ -3,7 +3,7 @@
 //! The notes live in the warehouse's own `change_notes` table, beside the
 //! pull requests they describe, so every caller (the CLI, or an application
 //! using this crate as a library) reads and extends the same set. Writing a
-//! note needs a model and lives in [`summaries`](crate::summaries) behind the
+//! note needs a model and lives in the `summaries` module behind the
 //! `summaries` feature; reading, hashing and importing notes do not.
 //!
 //! A note is made from the pull request's title, body and file list. Its
