@@ -64,6 +64,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Plain-English notes on pull requests (writing them needs the
+    /// `summaries` feature)
+    Notes {
+        #[command(subcommand)]
+        command: NotesCommand,
+    },
     /// Manage stored diff (patch) text
     Diffs {
         #[command(subcommand)]
@@ -75,6 +81,40 @@ pub enum Command {
         /// actions and read tools stay available
         #[arg(long)]
         read_only: bool,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum NotesCommand {
+    /// Write notes for pull requests that have no current note. The model and
+    /// AWS profile come from the flags, else the `summaries.model`,
+    /// `summaries.aws_profile` and `summaries.region` config values
+    Summarize {
+        /// Pull requests as owner/repo#number
+        pr_keys: Vec<String>,
+        /// Add every stored pull request by this author login
+        #[arg(long)]
+        author: Option<String>,
+        /// Add every stored pull request in this owner/name repository
+        #[arg(long)]
+        repo: Option<String>,
+        /// With --author or --repo: created on or after this date (YYYY-MM-DD)
+        #[arg(long)]
+        since: Option<String>,
+        /// Bedrock model ID, inference profile or ARN
+        #[arg(long)]
+        model: Option<String>,
+        /// AWS profile for Bedrock
+        #[arg(long)]
+        aws_profile: Option<String>,
+        /// Skip the live diff reads for unclear notes
+        #[arg(long)]
+        no_diffs: bool,
+    },
+    /// Print the stored notes for these pull requests
+    Show {
+        /// Pull requests as owner/repo#number
+        pr_keys: Vec<String>,
     },
 }
 

@@ -20,6 +20,7 @@ mod githubdw;
 pub mod groups;
 pub mod mcp;
 pub mod metrics;
+pub mod notes;
 pub mod period;
 pub mod purge;
 pub mod query;
@@ -29,7 +30,7 @@ pub mod search;
 pub mod storage;
 pub mod sync;
 
-/// AI summarization of pull requests (opt-in via the `summaries` feature).
+/// Model-written change notes (opt-in via the `summaries` feature).
 #[cfg(feature = "summaries")]
 pub mod summaries;
 
