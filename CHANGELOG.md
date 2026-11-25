@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-25
+
+### Changed
+
+- Each detection re-reads 12 hours before the last one instead of 1
+  (`collect::DEFAULT_DETECT_OVERLAP_HOURS`, the default for
+  `TickPolicy::overlap`). GitHub's search index can filter a pull request on
+  an `updatedAt` hours older than its real one (9 h 20 min was seen), so a
+  1-hour overlap left such a change for the daily reconcile. Pull requests the
+  wider window returns with an unchanged `updatedAt` are skipped, not fetched
+  again; the extra cost is the light search pages, a few points per tick.
+
 ## [0.6.0] - 2026-11-24
 
 ### Changed

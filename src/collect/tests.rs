@@ -56,6 +56,9 @@ struct World {
     issue_fault: bool,
     /// The check rollup state served, whatever the runs say.
     rollup: Option<&'static str>,
+    /// Per node id: the older `updatedAt` search filters on (index lag).
+    /// Results still carry the real value.
+    index_at: BTreeMap<String, String>,
 }
 
 #[derive(Clone, Default)]
@@ -139,7 +142,7 @@ impl World {
                 let at = secs(if field == "created" {
                     &pr.created_at
                 } else {
-                    &pr.updated_at
+                    self.index_at.get(&pr.node_id()).unwrap_or(&pr.updated_at)
                 });
                 *a <= at && at <= *b
             })
@@ -1215,6 +1218,7 @@ fn checks_finishing_after_the_overlap_are_found_by_the_probe() {
         w.checks
             .insert(id.clone(), vec![("CR1".into(), "IN_PROGRESS".into())]);
     });
+    // A one-hour overlap leaves the pull request (3 hours old) to the probe.
     run_tick(&dw, &fake, &eager());
     // Still running: the probe asks, and nothing is fetched.
     let still = run_tick(
@@ -1222,6 +1226,7 @@ fn checks_finishing_after_the_overlap_are_found_by_the_probe() {
         &fake,
         &TickPolicy {
             force_reconcile: false,
+            overlap: Duration::hours(1),
             ..eager()
         },
     );
@@ -1235,6 +1240,7 @@ fn checks_finishing_after_the_overlap_are_found_by_the_probe() {
         &fake,
         &TickPolicy {
             force_reconcile: false,
+            overlap: Duration::hours(1),
             ..eager()
         },
     );
@@ -1417,6 +1423,72 @@ fn a_lease_taken_over_cannot_be_renewed_and_holders_are_read() {
     assert!(
         lease_holder(conn, DETECT_LANE).unwrap().is_none(),
         "dead pid on this host"
+    );
+}
+
+#[test]
+fn a_change_the_search_index_lags_is_found_inside_the_overlap() {
+    assert_eq!(TickPolicy::default().overlap, Duration::hours(12));
+    let dw = warehouse(&["alice", "bob"]);
+    let fake = Fake::new(two_people());
+    let first = run_tick(&dw, &fake, &eager());
+    assert_eq!(first.fetch.landed, 2, "{first:?}");
+    // Alice's pull request changes now, but search still filters it on a
+    // value 9 h 20 min old, as measured on GitHub.
+    let changed = ago(0);
+    fake.with(|w| {
+        w.by_id = 0;
+        w.prs[0].updated_at = changed.clone();
+        let id = w.prs[0].node_id();
+        w.index_at.insert(id, ago(560));
+    });
+    let narrow = TickPolicy {
+        overlap: Duration::hours(1),
+        ..eager()
+    };
+    let missed = run_tick(&dw, &fake, &narrow);
+    assert_eq!((missed.detected, missed.queued), (0, 0), "{missed:?}");
+
+    let wide = run_tick(&dw, &fake, &eager());
+    assert_eq!(wide.outcome, TickOutcome::Detected, "{wide:?}");
+    assert_eq!(wide.detected, 2, "both pull requests are inside 12 hours");
+    assert_eq!(wide.queued, 1, "Bob's unchanged pull request is skipped");
+    assert_eq!(wide.fetch.landed, 1);
+    assert_eq!(fake.with(|w| w.by_id), 1, "one full fetch, for Alice's");
+    let stored: String = dw
+        .connection()
+        .query_row(
+            "SELECT updated_at FROM fact_pull_requests WHERE number = 1",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(secs(&stored), secs(&changed));
+}
+
+#[test]
+fn coverage_extends_only_when_it_reaches_the_detected_window() {
+    let dw = warehouse(&[]);
+    let conn = dw.connection();
+    let lower = Utc::now() - Duration::hours(DEFAULT_DETECT_OVERLAP_HOURS);
+    let end_of = |key: &str| sync_state::coverage_extent(conn, key).unwrap().unwrap().1;
+    // Ends long before the window: a gap the backfill owns, left alone.
+    sync_state::record_range(conn, "user:old", "2026-01-01", "2026-01-31", 1).unwrap();
+    extend_coverage(conn, "user:old", lower).unwrap();
+    assert_eq!(end_of("user:old"), "2026-01-31");
+    // Ends a day before the window: extended through yesterday.
+    let end = lower.date_naive() - Duration::days(1);
+    let start = end - Duration::days(5);
+    sync_state::record_range(conn, "user:new", &start.to_string(), &end.to_string(), 1).unwrap();
+    extend_coverage(conn, "user:new", lower).unwrap();
+    let today = time_dimension::today_as_of(conn, Utc::now()).unwrap();
+    assert_eq!(end_of("user:new"), (today - Duration::days(1)).to_string());
+    // No coverage at all: nothing recorded.
+    extend_coverage(conn, "user:none", lower).unwrap();
+    assert!(
+        sync_state::coverage_extent(conn, "user:none")
+            .unwrap()
+            .is_none()
     );
 }
 
