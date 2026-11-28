@@ -134,7 +134,14 @@ pub fn upsert_review_thread(
             OR fact_review_threads.is_outdated IS NOT excluded.is_outdated
             OR fact_review_threads.resolution_reason IS NOT excluded.resolution_reason
             OR fact_review_threads.resolved_by_key IS NOT excluded.resolved_by_key",
-        params![thread_key, pr_key, is_resolved as i64, is_outdated as i64, resolution_reason, resolved_by_key],
+        params![
+            thread_key,
+            pr_key,
+            is_resolved as i64,
+            is_outdated as i64,
+            resolution_reason,
+            resolved_by_key
+        ],
     )?;
     Ok(())
 }
