@@ -75,6 +75,7 @@ pub(crate) fn pull_request_for(
         author: None,
         merged_by: None,
         reviews: vec![],
+        review_threads: vec![],
         review_comments: vec![],
         conversation_comments: vec![],
         files,
