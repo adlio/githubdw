@@ -185,7 +185,9 @@ impl Syncer<'_> {
                 let patches = (want_patches
                     && pull_request.files_reported
                     && !pull_request.files.is_empty())
-                    .then(|| pull_requests::fetch_file_patches(self.client, &repo_key, pull_request.number));
+                .then(|| {
+                    pull_requests::fetch_file_patches(self.client, &repo_key, pull_request.number)
+                });
                 let recovered = if pull_request.files_reported {
                     recover_files(
                         self.client,
