@@ -138,7 +138,14 @@ impl Syncer<'_> {
 
         'pages: loop {
             let query = pull_requests::repository_pull_requests_query(page_size);
-            let mut variables: Vec<(&str, &str)> = vec![("owner", owner), ("name", name)];
+            let mut variables: Vec<(&str, &str)> = vec![
+                ("owner", owner),
+                ("name", name),
+                (
+                    "includeFiles",
+                    if options.skip_files { "false" } else { "true" },
+                ),
+            ];
             if let Some(cursor) = page_cursor.as_deref() {
                 variables.push(("cursor", cursor));
             }
@@ -168,7 +175,8 @@ impl Syncer<'_> {
                 }
                 Err(error) => return Err(error),
             };
-            let page = pull_requests::parse_pull_request_page(&data)?;
+            let page =
+                pull_requests::parse_pull_request_page_with_files(&data, !options.skip_files)?;
             summary.pages_fetched += 1;
 
             // Upsert the repository dimension from the page header.
@@ -322,20 +330,26 @@ impl Syncer<'_> {
         // leaves the previously stored rows exactly as they were.
         let retention = self.decide(options.skip_diffs);
         let want_patches = retention == crate::retention::DiffRetention::Retain;
-        let patches = (want_patches && !pull_request.files.is_empty())
-            .then(|| pull_requests::fetch_file_patches(self.client, repo_key, pull_request.number));
-        let recovered = recover_files(
-            self.client,
-            if recovery_allowed(retention) {
-                self.git_recovery.as_ref()
-            } else {
-                None
-            },
-            repo_key,
-            &pull_request,
-            patches.as_ref(),
-            want_patches,
-        );
+        let patches = (want_patches
+            && pull_request.files_reported
+            && !pull_request.files.is_empty())
+        .then(|| pull_requests::fetch_file_patches(self.client, repo_key, pull_request.number));
+        let recovered = if pull_request.files_reported {
+            recover_files(
+                self.client,
+                if recovery_allowed(retention) {
+                    self.git_recovery.as_ref()
+                } else {
+                    None
+                },
+                repo_key,
+                &pull_request,
+                patches.as_ref(),
+                want_patches,
+            )
+        } else {
+            None
+        };
         let connection = self.connection;
         let mut caveats = without_superseded_notes(note, &recovered);
         caveats.extend(within_savepoint(connection, || {
@@ -539,6 +553,10 @@ impl Syncer<'_> {
             }
             Some(Err(reason)) => return Err(crate::Error::GitRecovery(reason)),
             None => {}
+        }
+
+        if !pull_request.files_reported {
+            return Ok(Vec::new());
         }
 
         for file in &pull_request.files {

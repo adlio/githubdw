@@ -53,7 +53,10 @@ fn refresh_completes_an_old_shipped_pr_without_moving_any_sync_state() {
     let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
-            &RefreshOptions { skip_diffs: true },
+            &RefreshOptions {
+                skip_diffs: true,
+                skip_files: false,
+            },
         )
         .unwrap();
     assert_eq!(report.failed(), 0, "{report:?}");
@@ -88,7 +91,10 @@ fn failed_refresh_preserves_stored_rows_and_state() {
     let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
-            &RefreshOptions { skip_diffs: true },
+            &RefreshOptions {
+                skip_diffs: true,
+                skip_files: false,
+            },
         )
         .unwrap();
     assert_eq!(report.failed(), 1);
@@ -104,7 +110,10 @@ fn failed_refresh_preserves_stored_rows_and_state() {
     let report = Syncer::new(conn, &mut client, crate::retention::DiffRetention::Retain)
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
-            &RefreshOptions { skip_diffs: true },
+            &RefreshOptions {
+                skip_diffs: true,
+                skip_files: false,
+            },
         )
         .unwrap();
     assert_eq!(report.failed(), 1, "{report:?}");
@@ -175,7 +184,10 @@ fn each_target_fails_or_lands_on_its_own() {
                 target(TargetKind::PullRequest, "octocat/hello#11"),
                 target(TargetKind::PullRequest, "octocat/hello#7"),
             ],
-            &RefreshOptions { skip_diffs: true },
+            &RefreshOptions {
+                skip_diffs: true,
+                skip_files: false,
+            },
         )
         .unwrap();
     assert_eq!(report.outcomes.len(), 4, "duplicate collapsed");
@@ -245,7 +257,10 @@ fn transport_failure_fails_only_its_target() {
                 target(TargetKind::PullRequest, "octocat/hello#2"),
                 target(TargetKind::PullRequest, "octocat/hello#3"),
             ],
-            &RefreshOptions { skip_diffs: true },
+            &RefreshOptions {
+                skip_diffs: true,
+                skip_files: false,
+            },
         )
         .unwrap();
     assert_eq!(report.outcomes[0].status, TargetStatus::Failed);

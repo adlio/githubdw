@@ -73,7 +73,7 @@ pub const PULL_REQUEST_NODE_SELECTION: &str = r#"id number title body state isDr
             author { login __typename }
           }
         }
-        files(first: 100) {
+        files(first: 100) @include(if: $includeFiles) {
           pageInfo { hasNextPage endCursor }
           nodes { path changeType additions deletions }
         }
@@ -96,7 +96,7 @@ pub const PULL_REQUEST_NODE_SELECTION: &str = r#"id number title body state isDr
         }"#;
 
 const REPOSITORY_PULL_REQUESTS_QUERY_TEMPLATE: &str = r#"
-query($owner: String!, $name: String!, $cursor: String) {
+query($owner: String!, $name: String!, $cursor: String, $includeFiles: Boolean!) {
   rateLimit { limit cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     {REPOSITORY}
@@ -112,7 +112,7 @@ query($owner: String!, $name: String!, $cursor: String) {
 "#;
 
 const SINGLE_PULL_REQUEST_QUERY_TEMPLATE: &str = r#"
-query($owner: String!, $name: String!, $number: Int!) {
+query($owner: String!, $name: String!, $number: Int!, $includeFiles: Boolean!) {
   rateLimit { limit cost remaining resetAt }
   repository(owner: $owner, name: $name) {
     {REPOSITORY}
@@ -174,6 +174,9 @@ pub struct PullRequestData {
     /// field reads as 0 in `changed_files`, which must never be mistaken for
     /// an authoritative empty file set.
     pub changed_files_reported: bool,
+    /// Whether this response included the file connection. A user sync may
+    /// omit it to reduce search response size while preserving stored file rows.
+    pub files_reported: bool,
     pub author: Option<ActorReference>,
     pub merged_by: Option<ActorReference>,
     pub reviews: Vec<ReviewData>,
@@ -316,6 +319,15 @@ pub fn strict_nodes<'a>(value: &'a Value, collection: &str, label: &str) -> Resu
 /// A `null` pull request (deleted, or the number names an issue) is an error,
 /// never an empty success.
 pub fn parse_single_pull_request(data: &Value) -> Result<(RepositoryMetadata, PullRequestData)> {
+    parse_single_pull_request_with_files(data, true)
+}
+
+/// Parse a single pull request when the query may have intentionally omitted
+/// its changed-file connection.
+pub fn parse_single_pull_request_with_files(
+    data: &Value,
+    include_files: bool,
+) -> Result<(RepositoryMetadata, PullRequestData)> {
     let repository = data
         .get("repository")
         .filter(|value| !value.is_null())
@@ -325,7 +337,10 @@ pub fn parse_single_pull_request(data: &Value) -> Result<(RepositoryMetadata, Pu
         .get("pullRequest")
         .filter(|value| !value.is_null())
         .ok_or_else(|| Error::GitHubApi("pull request not found".into()))?;
-    Ok((metadata, parse_pull_request_node(node)?))
+    Ok((
+        metadata,
+        parse_pull_request_node_with_files(node, include_files)?,
+    ))
 }
 
 /// Parse a `repository { … }` selection into its dimension metadata.
@@ -360,6 +375,15 @@ pub fn parse_repository_metadata(repository: &Value) -> Result<RepositoryMetadat
 
 /// Parse one page of the repository pull-requests query response (`data` value).
 pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
+    parse_pull_request_page_with_files(data, true)
+}
+
+/// Parse a repository page when the query may have intentionally omitted
+/// changed-file connections.
+pub fn parse_pull_request_page_with_files(
+    data: &Value,
+    include_files: bool,
+) -> Result<PullRequestPage> {
     let repository = data
         .get("repository")
         .filter(|value| !value.is_null())
@@ -375,7 +399,7 @@ pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
 
     let mut pull_requests = Vec::new();
     for node in strict_nodes(repository, "pullRequests", "repository.pullRequests")? {
-        pull_requests.push(parse_pull_request_node(node)?);
+        pull_requests.push(parse_pull_request_node_with_files(node, include_files)?);
     }
 
     Ok(PullRequestPage {
@@ -391,6 +415,15 @@ pub fn parse_pull_request_page(data: &Value) -> Result<PullRequestPage> {
 /// The repository query and the user-search query select the same node shape, so
 /// a PR ingested through either path parses to the identical value.
 pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
+    parse_pull_request_node_with_files(node, true)
+}
+
+/// Parse one pull request, optionally allowing the query to omit its files
+/// connection. All other selected connections remain required.
+pub fn parse_pull_request_node_with_files(
+    node: &Value,
+    include_files: bool,
+) -> Result<PullRequestData> {
     let number = node
         .get("number")
         .and_then(Value::as_i64)
@@ -442,18 +475,23 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
         .map(parse_conversation_comment)
         .collect::<Result<Vec<_>>>()?;
 
-    let (file_nodes, more) = required_connection(
-        node,
-        "files",
-        &format!("{label} files"),
-        owner,
-        "PullRequest",
-    )?;
-    pending.extend(more);
-    let files = file_nodes
-        .into_iter()
-        .map(parse_file)
-        .collect::<Result<Vec<_>>>()?;
+    let files_reported = node.get("files").is_some();
+    let files = if include_files || files_reported {
+        let (file_nodes, more) = required_connection(
+            node,
+            "files",
+            &format!("{label} files"),
+            owner,
+            "PullRequest",
+        )?;
+        pending.extend(more);
+        file_nodes
+            .into_iter()
+            .map(parse_file)
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        Vec::new()
+    };
 
     let (head_sha, check_runs, check_runs_truncated) =
         parse_head_commit(node, &label, &mut pending)?;
@@ -477,6 +515,7 @@ pub fn parse_pull_request_node(node: &Value) -> Result<PullRequestData> {
         deletions: integer_field(node, "deletions"),
         changed_files: integer_field(node, "changedFiles"),
         changed_files_reported: node.get("changedFiles").and_then(Value::as_i64).is_some(),
+        files_reported,
         author: node.get("author").and_then(ActorReference::from_value),
         merged_by: node.get("mergedBy").and_then(ActorReference::from_value),
         reviews,
@@ -644,9 +683,11 @@ fn parse_file(file: &Value) -> Result<FileDiffData> {
 /// Fetch every nested node the page query's first slices left behind.
 ///
 /// Shared by the repository and user-search paths. On success `pending` is
-/// empty. Returns a caveat when the provider served fewer files than the pull
-/// request reports changing (GitHub stops enumerating files at 3,000), so the
-/// caller can surface the truncation instead of treating the list as complete.
+/// empty. When the file connection was requested, returns a caveat if the
+/// provider served fewer files than the pull request reports changing (GitHub
+/// stops enumerating files at 3,000), so the caller does not mistake the list
+/// for complete. No file-coverage caveat is returned when that connection was
+/// intentionally omitted.
 /// Any continuation failure is returned as an error, leaving the item to the
 /// caller's failed-record handling.
 pub fn hydrate_pull_request(
@@ -712,7 +753,7 @@ pub fn hydrate_pull_request(
     pull_request.check_runs_truncated = false;
     let mut caveats = Vec::new();
     let served = pull_request.files.len() as i64;
-    if served < pull_request.changed_files {
+    if pull_request.files_reported && served < pull_request.changed_files {
         caveats.push(format!(
             "PR #{}: provider listed {served} of {} changed files; file coverage is truncated",
             pull_request.number, pull_request.changed_files

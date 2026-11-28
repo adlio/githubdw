@@ -175,6 +175,8 @@ pub fn validate_targets(targets: Vec<RefreshTarget>) -> Result<Vec<RefreshTarget
 pub struct RefreshOptions {
     /// Skip the REST patch-text walk (fast mode).
     pub skip_diffs: bool,
+    /// Skip fetching changed-file metadata and leave stored file rows untouched.
+    pub skip_files: bool,
 }
 
 /// Row counts the warehouse holds for one item.

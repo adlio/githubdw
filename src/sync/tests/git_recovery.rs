@@ -60,7 +60,10 @@ fn refresh_pr5_recovering(
         .with_git_recovery(fixture.config.clone())
         .refresh_targets(
             &[target(TargetKind::PullRequest, "octocat/hello#5")],
-            &RefreshOptions { skip_diffs: false },
+            &RefreshOptions {
+                skip_diffs: false,
+                skip_files: false,
+            },
         )
         .unwrap()
 }

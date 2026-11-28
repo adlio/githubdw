@@ -112,6 +112,24 @@ fn parses_full_page() {
     );
 }
 
+#[test]
+fn omitted_file_connection_does_not_report_truncated_file_coverage() {
+    let mut data = sample_page();
+    data["repository"]["pullRequests"]["nodes"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("files");
+    let mut pull_request = parse_pull_request_page_with_files(&data, false)
+        .unwrap()
+        .pull_requests
+        .remove(0);
+    assert!(!pull_request.files_reported);
+
+    let mut client = rest_client(vec![]);
+    let note = hydrate_pull_request(&mut client, &mut pull_request).unwrap();
+    assert!(note.is_none(), "{note:?}");
+}
+
 fn rest_page(start: usize, count: usize) -> Result<String> {
     let files: Vec<Value> = (start..start + count)
         .map(|index| json!({"filename": format!("f{index}.rs"), "patch": "@@"}))
